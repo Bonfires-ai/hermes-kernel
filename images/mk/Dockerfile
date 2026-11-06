@@ -1,5 +1,4 @@
 # The memory-kernel service image: mk serve, with the runtime data baked in at build time.
-# The first layers match other memory-kernel images so Docker's build cache can reuse them.
 FROM python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1 \
@@ -23,14 +22,15 @@ RUN pip install "arq>=0.26.0" "pydantic>=2.13.0" "pydantic-settings>=2.6.0" "pym
 ARG MK_VERSION=2.0.0
 RUN pip install "memory-kernel[build,parser,serve,ops] @ git+https://github.com/Bonfires-ai/memory-kernel@v${MK_VERSION}"
 
-# Runtime data lives in the image, not on a volume. `mk setup --check` fails the build if anything is missing.
+# Runtime data lives in the image, not on a volume.
 ENV MK_DATA_DIR=/opt/mk
 RUN mk setup
 RUN mk setup --component spacy-model-trf
-RUN mk setup --check
 
-RUN useradd --create-home --uid 10001 kernel \
-    && chown -R kernel:kernel /opt/mk
+# The data stays root-owned and world-readable: no recursive chown, so no second copy of it in a layer.
+RUN useradd --create-home --uid 10001 kernel
 USER kernel
 WORKDIR /opt/mk
+# The last build step runs as the runtime user: a broken image fails the build.
+RUN mk setup --check
 CMD ["mk", "serve", "--host", "0.0.0.0", "--port", "8000"]
