@@ -1,0 +1,70 @@
+name: hermes-kernel
+
+services:
+  neo4j:
+    image: neo4j:5.26-community
+    hostname: neo4j
+    extra_hosts:
+      - "neo4j:127.0.0.1"
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:?set NEO4J_PASSWORD in .env}
+      NEO4J_server_config_strict__validation_enabled: "false"
+      NEO4J_server_memory_heap_initial__size: 512m
+      NEO4J_server_memory_heap_max__size: 1G
+      NEO4J_server_memory_pagecache_size: 512m
+      # One append commits in one write transaction; cap what it may take.
+      NEO4J_dbms_memory_transaction_total_max: 2g
+      NEO4J_db_memory_transaction_max: 1g
+    volumes:
+      - neo4j-data:/data
+    networks: [kernel]
+    healthcheck:
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost:7474 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  mongo:
+    image: mongo:7
+    volumes:
+      - mongo-data:/data/db
+    networks: [kernel]
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh --quiet --eval 'db.runCommand({ ping: 1 }).ok' | grep -q 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+  mk-serve:
+    image: hermes-kernel-mk:${MK_VERSION:-2.0.0}
+    build:
+      context: images/mk
+      args:
+        MK_VERSION: ${MK_VERSION:-2.0.0}
+    command: ["mk", "serve", "--host", "0.0.0.0", "--port", "8000", "--neo4j-uri", "bolt://neo4j:7687"]
+    environment:
+      MK_OPS_URI: mongodb://mongo:27017
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:?set NEO4J_PASSWORD in .env}
+      VOYAGE_API_KEY: ${VOYAGE_API_KEY:-}
+    depends_on:
+      neo4j:
+        condition: service_healthy
+      mongo:
+        condition: service_healthy
+    networks: [kernel]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+networks:
+  kernel:
+    name: kernel
+
+volumes:
+  neo4j-data:
+  mongo-data:

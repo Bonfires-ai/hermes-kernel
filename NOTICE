@@ -1,0 +1,7 @@
+hermes-kernel
+Copyright 2026 Bonfires
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+It runs and depends on memory-kernel (https://github.com/Bonfires-ai/memory-kernel),
+also licensed under the Apache License, Version 2.0.
