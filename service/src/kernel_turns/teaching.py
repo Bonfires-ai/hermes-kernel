@@ -123,6 +123,10 @@ def _competes(value: JsonValue) -> dict[str, list[Frame]]:
     return out
 
 
+#: what a person is told when they teach before the bonfire exists
+NOT_YET = "I can start learning phrases once the first conversation has been saved."
+
+
 class Teaching:
     def __init__(self, mk: KernelApi, store: TurnStore, groups: GroupFinder) -> None:
         self._mk = mk
@@ -153,7 +157,10 @@ class Teaching:
             "chat_id": req.chat,
             "replace": req.replace,
         }
-        out = await self._mk.teach(group.bonfire_id, body)
+        try:
+            out = await self._mk.teach(group.bonfire_id, body)
+        except NotFounded as exc:
+            raise Refused(NOT_YET) from exc
         draft_id = out.get("draft_id")
         if isinstance(draft_id, str) and draft_id:
             await self._follow_offer(req.turn_id, draft_id)
@@ -180,7 +187,10 @@ class Teaching:
     async def confirm(self, draft_id: str, req: ConfirmRequest) -> ConfirmView:
         found = await self._groups.find(req.platform, req.group)
         await self._afforded(req.turn_id, req.platform, req.group, CONFIRM, req.by)
-        out = await self._mk.confirm(found.bonfire_id, draft_id, req.by)  # NotTeacher for anyone but the teacher
+        try:
+            out = await self._mk.confirm(found.bonfire_id, draft_id, req.by)  # NotTeacher for anyone but the teacher
+        except NotFounded as exc:
+            raise Refused(NOT_YET) from exc
         specs = out.get("specs")
         phrases = [
             spec_id

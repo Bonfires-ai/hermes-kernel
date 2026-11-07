@@ -94,7 +94,7 @@ class FakeMk:
             raise KernelDown("mk serve unreachable (ConnectError): connection refused")
         if self.busy:
             raise KernelBusy("bonfire is teaching: call again later", retry_after=2.0)
-        if self.unborn and name in ("teach", "confirm", "put_catalogue", "context"):
+        if self.unborn and name in ("plan", "teach", "confirm", "put_catalogue", "context"):
             raise NotFounded("unknown bonfire")
 
     # -- turns ---------------------------------------------------------------------------------------------------------

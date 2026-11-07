@@ -114,3 +114,21 @@ def test_status_with_mk_down_still_answers(world: tuple[World, TestClient]) -> N
     answer = client.get("/v1/status", headers=AUTH)
     got = answer.json()
     assert (answer.status_code, got["founded"], got["spend"], got["versions"]["mk"]) == (200, False, None, None)
+
+
+def test_a_plain_turn_on_an_unborn_bonfire_is_unread_with_a_neutral_problem(world: tuple[World, TestClient]) -> None:
+    w, client = world
+    w.mk.unborn = True
+    turn = {
+        "platform": "cli",
+        "group": "s1",
+        "chat": "s1",
+        "speaker": "Ana",
+        "message_id": "1",
+        "text": "hello",
+        "at": AT.isoformat(),
+    }
+    answer = client.post("/v1/turns", json=turn, headers=AUTH)
+    got = answer.json()
+    assert (answer.status_code, got["status"]) == (200, "unread")
+    assert "no memory" in " ".join(got["problems"]) and "phrase" not in " ".join(got["problems"])

@@ -53,10 +53,10 @@ class Refused(MkError):
 
 class NotFounded(Refused):
     """The bonfire does not exist yet: it is founded when the first session is built, which can be many minutes after
-    install (mk answers 404). ``detail`` is something to say to a person; the kernel's own words follow in brackets."""
+    install (mk answers 404). ``detail`` is neutral and factual; the kernel's own words follow in brackets."""
 
     def __init__(self, kernel_detail: str = "") -> None:
-        said = "I can start learning phrases once the first conversation has been saved."
+        said = "no conversation has been saved yet, so there is no memory"
         super().__init__(f"{said} [{kernel_detail}]" if kernel_detail else said)
 
 
