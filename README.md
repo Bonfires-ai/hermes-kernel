@@ -76,7 +76,7 @@ Memory is not instant. A conversation is built into memory after its session clo
 
 1. A session that ends cleanly (you exit Hermes, or start a new session) closes at once. One that just goes quiet
    closes after **30 minutes** with no message.
-2. The writer then builds it. Measured here, in six full runs with short sessions of a few messages, recall returned a
+2. The writer then builds it. Measured here, in eight full runs with short sessions of a few messages, recall returned a
    session's content 131 to 173 seconds after it closed for the first session (which founds the memory), and 116 to
    137 seconds after for later ones; building took 110 to 183 seconds. Longer sessions take longer. Plan on a few
    minutes.
@@ -117,7 +117,7 @@ capture the stack's network traffic to prove that no library calls home.
 ## Cost
 
 Building memory costs fractions of a cent per session at these sizes: in the end-to-end run, a first session of two prompts and
-two replies was charged about $0.001, and the three short sessions of that run together $0.0025 to $0.0028; a 31-message
+two replies was charged about $0.001, and the three short sessions of that run together $0.0025 to $0.0033; a 31-message
 founding in an earlier measurement was charged about $0.012. Recall queries cost a Voyage embedding each, and they are
 not counted here. Your Hermes chat model is separate and is whatever you already pay for.
 
