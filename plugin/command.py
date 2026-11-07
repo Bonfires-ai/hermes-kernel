@@ -16,7 +16,7 @@ NOT_SET_UP = "Memory is not set up: HERMES_KERNEL_TOKEN is missing. Run `hermes 
 #: a Hermes that loaded the plugin with no token, and found one later: the client heals, what `register` wires does not
 PHRASES_OFF = (
     "Phrases are off: this Hermes loaded the plugin before it had the token. Restart its gateway to turn them on: "
-    "hermes gateway restart"
+    "hermes gateway restart --detach"
 )
 
 

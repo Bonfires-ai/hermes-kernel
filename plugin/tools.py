@@ -274,10 +274,12 @@ def think_lines(instruction: str, given: str | None, phrase: str | None, carried
 
 
 def _phrase_args(args: dict[str, Any]) -> JsonObject:
-    """`run_phrase`'s phrase arguments: `args`, or when that is absent or empty, what was given beside the tool's own
-    parameters (a model that has not read the schema puts a role there, and it must not arrive as no argument at all)."""
+    """`run_phrase`'s phrase arguments: `args`, plus what was given beside the tool's own parameters. A model that has
+    not read the schema puts a role there, and it must not arrive as no argument at all; beside a filled `args` it still
+    goes on, so that the service's check refuses a role the phrase lacks. On the same key, `args` wins."""
     raw = args.get("args")
-    given = raw if isinstance(raw, dict) and raw else {k: v for k, v in args.items() if k not in _RUN_PHRASE_OWN}
+    beside = {k: v for k, v in args.items() if k not in _RUN_PHRASE_OWN}
+    given = {**beside, **raw} if isinstance(raw, dict) else beside
     return {str(k): v for k, v in given.items()}
 
 

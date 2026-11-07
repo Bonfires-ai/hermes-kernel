@@ -63,7 +63,8 @@ Start a new Hermes session. In it, type `/kernel`: it should say `Saving.`
 **If Hermes was already running** (its background gateway stays up for ten minutes after a chat, and for good if you run
 it as a service), these steps reach it with nothing restarted. That is why `hermes plugins enable` comes last: it makes a
 running gateway reload its plugins, and by then the token is there. If you run the steps in another order, or add the
-token later, memory still starts, and `/kernel` says that phrases are off until you run `hermes gateway restart`.
+token later, memory still starts, and `/kernel` says that phrases are off until you run
+`hermes gateway restart --detach`.
 `hermes gateway stop` ends the gateway too, but if you have installed one as a service it acts on that service, and
 everything the service runs stays stopped until you start it again.
 
@@ -155,7 +156,9 @@ Type `/kernel` in a Hermes session. It says one of:
 - A session that failed to build, with its id: `/kernel retry <session id>` retries it.
 - That the spend ceiling is holding builds, with the command above.
 - `Memory is not set up`, when there is no token: run `hermes memory setup`.
-- `Phrases are off`, when this Hermes loaded the plugin before it had the token: run `hermes gateway restart`.
+- `Phrases are off`, when this Hermes loaded the plugin before it had the token: run
+  `hermes gateway restart --detach`. With an installed service it restarts the service; without one, `--detach` starts
+  the new gateway in the background, where a plain restart would take over your terminal.
 
 ## When something is down
 
@@ -178,7 +181,7 @@ docker compose logs turn-service | grep call_refused      # why a phrase call wa
 confirms and runs a phrase with a real `web_search` and a `think` step the model writes). On `openai/gpt-4o-mini` it
 did **not** work: asked to set up a phrase, that model called Hermes's own `skill_manage` tool (which failed) instead of
 `offer_phrase` and `teach_phrase`, in three tries (the last one with the instruction not to, in the skill and in the turn's prompt block), and
-then told the user that the phrase was set up when it was not. `/kernel` says nothing about phrases, so the signs are
+then told the user that the phrase was set up when it was not. `/kernel` cannot show a failed teach, so the signs are
 that Hermes never reads a draft back to you, and that the phrase does nothing when you say it. Use a model that is good
 at calling tools for teaching.
 
@@ -191,6 +194,8 @@ does itself. A step that would change something outside is refused. The plugin i
 
 ## Platforms
 
+The agent is always called `hermes` in memory, so a person whose platform name is `hermes` is read as the agent.
+
 Tested on the Hermes CLI. Other platforms (Telegram, Discord and the rest) are best effort: speakers are named as the
 platform gives them, and a Hermes that serves several people shares one memory among them (see the warning at the top).
 
@@ -201,9 +206,11 @@ git pull
 docker compose build
 docker compose up -d --wait
 hermes plugins update hermes-kernel
+hermes gateway restart --detach
 ```
 
-Your memory stays in its Docker volumes.
+The restart is what loads the new plugin: a running gateway keeps the code it started with. Your memory stays in its
+Docker volumes.
 
 ## Uninstall
 

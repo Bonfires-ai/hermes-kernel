@@ -146,7 +146,9 @@ def test_a_token_saved_after_register_reaches_a_running_hermes_without_a_restart
     monkeypatch.setattr(sh.client, "status", lambda **_: STATUS)
     said = ctx.commands["kernel"]("")
     assert "not set up" not in said and "Last built" in said
-    assert "Phrases are off" in said and "hermes gateway restart" in said  # hooks and tools came with no register
+    assert (
+        "Phrases are off" in said and "hermes gateway restart --detach" in said
+    )  # hooks and tools came with no register
     assert ctx.hooks == [] and ctx.tools == []
 
 

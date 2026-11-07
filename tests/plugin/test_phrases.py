@@ -166,11 +166,18 @@ def test_a_slot_at_the_top_level_is_folded_into_args(env):
 
 
 def test_an_empty_args_folds_too_and_a_given_one_wins(env):
-    client = Client(view(), view())
+    client = Client(view(), view(), view())
     tools, _, _, _ = build(client)
     ask(tools, "run_phrase", {"phrase": "research", "args": {}, "X": "bread"})
-    ask(tools, "run_phrase", {"phrase": "research", "args": {"X": "rye"}, "Y": "stray"})
-    assert client.called == [("m1", "research", {"X": "bread"}), ("m1", "research", {"X": "rye"})]
+    ask(tools, "run_phrase", {"phrase": "research", "args": {"X": "rye"}, "X2": "stray"})
+    ask(tools, "run_phrase", {"phrase": "research", "args": {"X": "rye"}, "X": "bread"})
+    # a role beside a filled `args` reaches the service, whose check refuses what the phrase does not have: dropped
+    # here, the phrase would run on that role's default with nobody told
+    assert client.called == [
+        ("m1", "research", {"X": "bread"}),
+        ("m1", "research", {"X": "rye", "X2": "stray"}),
+        ("m1", "research", {"X": "rye"}),
+    ]
 
 
 def test_a_top_level_slot_gets_past_the_schema_of_a_deferred_call():
