@@ -51,9 +51,15 @@ _CARDS_KEPT = 256
 _DECISIONS_KEPT = 1024
 
 
+#: The longest question a card may ask, measured on `question(plain)`. Past it the read-back would scroll off a
+#: surface's panel, so no card opens and a plain "yes" keeps the phrase.
+MAX_CARD_CHARS = 600
+
+
 def question(plain: str) -> str:
-    """The card's question. Stripped, as Hermes strips it before it reports it."""
-    return f"Keep this phrase? {plain}".strip()
+    """The card's question: one line, because a read-back is free text and a newline in it could forge a list of
+    choices above the real one. Stripped, as Hermes strips it before it reports it."""
+    return " ".join(f"Keep this phrase? {plain}".split())
 
 
 def card_lines(draft_id: str, plain: str, speaker: str | None) -> list[str]:
@@ -121,6 +127,8 @@ def read_choice(card: Card, result: Any) -> tuple[str | None, str]:
     response = mine[0]
     if response.get("choices_offered") != list(CHOICES):
         return None, "the choices are not the card's"
+    if parsed.get("outcome") != "submitted" or len(responses) != 1:
+        return None, "it was not a single submitted answer"
     if response.get("status") != "answered":
         return None, "it was not answered"
     choice = response.get("user_response")
@@ -165,7 +173,8 @@ class CardBook:
             if tool_name == "clarify" and status == "ok" and isinstance(session_id, str) and session_id:
                 self._answered(session_id, result)
         except ServiceError as exc:  # the choice stands: `confirm_phrase` sends it again
-            logger.warning("hermes-kernel: a card's keep did not reach the service: %s", exc.detail)
+            # the class only: `detail` can hold the speaker or a form slug
+            logger.warning("hermes-kernel: a card's keep did not reach the service: %s", type(exc).__name__)
         except Exception:  # noqa: BLE001 — a card costs a plain yes at worst, never the call
             logger.warning("hermes-kernel: could not read a card's result", exc_info=True)
 

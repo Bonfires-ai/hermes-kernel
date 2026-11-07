@@ -32,6 +32,8 @@ that make memory-kernel a person's own Hermes memory and turn reader.
 - README: upgrading, a Hermes that was already running, what `/kernel` can show. `.env.example` lists the optional
   settings. A root `.dockerignore`.
 - A person keeps a phrase by clicking a card, on the CLI and in a private Telegram chat. The keep comes only from
-  Hermes's real `clarify` result, seen in a hook, never from what the model says or passes. Everywhere else, and when
+  Hermes's real `clarify` result, seen in a hook, never from what the model says, passes or reads back from a tool. It
+  does not hold against a model that runs shell commands as your user with Hermes's `terminal` tool, which can read the
+  plugin's token and call the service directly (as it already could to forge a plain yes). Everywhere else, and when
   there is no card, a plain "yes" keeps it as before. Throw it away and Change it close the draft, so a later "yes"
   cannot revive it while this Hermes runs.

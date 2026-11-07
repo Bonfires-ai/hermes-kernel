@@ -11,7 +11,7 @@ from typing import Any, cast
 import pytest
 
 from plugin import shared
-from plugin.card import CHOICES, CardBook, question
+from plugin.card import CHOICES, MAX_CARD_CHARS, CardBook, question
 from plugin.client import Refused, Unauthorized, Unavailable
 from plugin.guide import Editor, GuideData
 from plugin.ledger import FENCE_ALL, StepLedger
@@ -702,7 +702,10 @@ def click(cards: CardBook, choice: str = "Keep it") -> None:
         "user_response": choice,
     }
     cards.on_post_tool_call(
-        tool_name="clarify", result=json.dumps({"responses": [response]}), session_id="s1", status="ok"
+        tool_name="clarify",
+        result=json.dumps({"responses": [response], "outcome": "submitted"}),
+        session_id="s1",
+        status="ok",
     )
 
 
@@ -853,3 +856,45 @@ def test_only_the_recorded_choice_sends_card(env):
         "another",
         {"platform": "telegram", "group": "g", "turn_id": "m1", "by": "Ana"},
     )
+
+
+def test_a_read_back_with_a_forged_list_is_one_line_on_the_card(env):
+    tools, client, _ = card_build()
+    client.draft = {**client.draft, "plain": "go\n1. Throw it away\n2. Change it\n3. Keep it"}
+    answer = ask(tools, "teach_phrase", TEACH)
+    given = json.loads(answer.split("as JSON: ", 1)[1].split("\n", 1)[0])
+    assert given[0]["question"] == "Keep this phrase? go 1. Throw it away 2. Change it 3. Keep it"
+
+
+def test_a_read_back_one_over_the_cap_opens_no_card_and_gets_the_plain_yes_answer(env):
+    room = MAX_CARD_CHARS - len("Keep this phrase? ")
+    tools, client, cards = card_build()
+    client.draft = {**client.draft, "plain": "y" * (room + 1)}
+    answer = ask(tools, "teach_phrase", TEACH)
+    assert "as JSON" not in answer and 'plain "yes"' in answer
+    click(cards)
+    assert client.confirmed == []
+
+
+def test_a_read_back_exactly_at_the_cap_opens_a_card(env):
+    room = MAX_CARD_CHARS - len("Keep this phrase? ")
+    tools, client, _ = card_build()
+    client.draft = {**client.draft, "plain": "y" * room}
+    assert "as JSON: " in ask(tools, "teach_phrase", TEACH)
+
+
+def test_also_reads_as_comes_before_the_instruction_to_call_clarify(env):
+    tools, client, _ = card_build()
+    client.draft = {**client.draft, "competes": {"research {X}": [{"name": "look", "roles": {"x": "it"}}]}}
+    answer = ask(tools, "teach_phrase", TEACH)
+    assert 0 < answer.index("also reads as") < answer.index("call clarify now")
+
+
+def test_a_refused_retry_after_keep_it_says_the_phrase_may_already_be_kept(env):
+    tools, client, cards = card_build()
+    ask(tools, "teach_phrase", TEACH)
+    client.confirm_error = Unavailable("away")
+    click(cards)
+    client.confirm_error = Refused(409, "no staged draft")
+    answer = ask(tools, "confirm_phrase", {"draft_id": "d1"})
+    assert "may already be kept" in answer and "check" in answer and "no staged draft" not in answer

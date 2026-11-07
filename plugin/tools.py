@@ -50,7 +50,7 @@ from typing import Any
 import httpx
 
 from .agent_source import THINK, AgentSource
-from .card import CardBook, card_lines, question
+from .card import MAX_CARD_CHARS, CardBook, card_lines, question
 from .client import Refused, ServiceClient, ServiceError, Unauthorized, Unavailable
 from .fence import BOUND_STEP, closed, fenced, fenced_input, fenced_job
 from .guide import Editor
@@ -646,22 +646,29 @@ class KernelTools:
             if not isinstance(draft_id, str) or not draft_id:
                 return "\n".join(["The kernel did not take this draft:", *(f"- {p}" for p in problems), *told])
             plain = draft.get("plain")
-            if self._cards is not None and turn.private and isinstance(plain, str) and plain:
-                self._cards.open(turn.session_id, draft_id, turn, question(plain))
-                lines = card_lines(draft_id, plain, turn.speaker)
-            else:
-                lines = [
-                    f"Draft {draft_id}: {draft.get('read_back')}",
-                    f'Read this back to {turn.speaker}; keep it with confirm_phrase only when they say yes (ask for a plain "yes").',
-                ]
-            if problems:
-                lines += ["The kernel noted:", *(f"- {p}" for p in problems), *told]
             competes = draft.get("competes")
+            reads: list[str] = []
             for form, readings in competes.items() if isinstance(competes, dict) else []:
                 seen = [reading_text(r) for r in readings if isinstance(r, dict)] if isinstance(readings, list) else []
                 if seen:
-                    lines.append(f"{form} also reads as {' or '.join(seen)}: tell {turn.speaker} before they keep it.")
-            return "\n".join(lines)
+                    reads.append(f"{form} also reads as {' or '.join(seen)}: tell {turn.speaker} before they keep it.")
+            noted = ["The kernel noted:", *(f"- {p}" for p in problems), *told] if problems else []
+            if (
+                self._cards is not None
+                and turn.private
+                and isinstance(plain, str)
+                and plain
+                and len(question(plain)) <= MAX_CARD_CHARS
+            ):
+                self._cards.open(turn.session_id, draft_id, turn, question(plain))
+                first, *rest = card_lines(draft_id, plain, turn.speaker)
+                # what competes goes before the instruction to ask, so the person hears it before they click
+                return "\n".join([first, *reads, *rest, *noted])
+            lines = [
+                f"Draft {draft_id}: {draft.get('read_back')}",
+                f'Read this back to {turn.speaker}; keep it with confirm_phrase only when they say yes (ask for a plain "yes").',
+            ]
+            return "\n".join([*lines, *noted, *reads])
 
         return self._answer("teach_phrase", kwargs, act)
 
@@ -688,7 +695,15 @@ class KernelTools:
             timed_out = False
             try:
                 if cards is not None and decided is not None:  # the hook saw their choice: nothing the model passed
-                    kept = cards.resend(decided, timeout=_TEACH_TIMEOUT_S)
+                    try:
+                        kept = cards.resend(decided, timeout=_TEACH_TIMEOUT_S)
+                    except Refused:
+                        # The hook gives up at 20 s while the service can wait longer, so this refusal is no proof
+                        # that the phrase was not kept.
+                        return (
+                            f"{decided.card.speaker} chose Keep it, but the service refused the second try. The phrase "
+                            "may already be kept: ask them to say the phrase to check."
+                        )
                 else:
                     kept = client.confirm(
                         draft_id,

@@ -374,7 +374,15 @@ dc logs --no-color turn-service >"$OUT/turn-service-stage4.log" 2>&1 || true
 confirms="$(grep -Ec 'POST /v1/teaching/[^ /]+/confirm HTTP/[0-9.]+" 200' "$OUT/turn-service-stage4.log" || true)"
 echo "confirms the turn service answered 200: $confirms"
 [ "$confirms" = "1" ] || fail "4. expected one confirm from the card in the service's log, found $confirms (see $OUT/turn-service-stage4.log)"
-pass "4. the phrase was kept on its card, with no yes sent (one confirm, 200, in the service's log)"
+# The 200 must have come from the card: Hermes's own log says the plugin's hook saw the answer. (The logs are read
+# here from the throwaway home; a Hermes that has not flushed them yet is waited for a moment.)
+card_logged=no
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  if grep -rqsF 'hermes-kernel: a card was answered: chosen' "$HERMES_HOME/logs"; then card_logged=yes; break; fi
+  sleep 1
+done
+[ "$card_logged" = "yes" ] || fail "4. the Hermes log has no 'a card was answered: chosen', so the 200 may not have come from the card (see $OUT/hermes-logs)"
+pass "4. the phrase was kept on its card, with no yes sent (one confirm, 200, in the service's log, and the card's own log line)"
 uses="$(mongo 'db.uses.countDocuments({outcome: "ok"})' | tr -d '[:space:]')"
 think_len="$(mongo 'const r = db.ledger.find({tool: "think", verdict: "committed"}).toArray(); print(r.length ? JSON.stringify(r[r.length-1].value_json || r[r.length-1].value).length : 0)' | tr -d '[:space:]')"
 search_ok="$(mongo 'db.ledger.countDocuments({tool: "web_search", verdict: "committed"})' | tr -d '[:space:]')"

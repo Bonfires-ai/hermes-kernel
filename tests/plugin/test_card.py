@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 
-from plugin.card import CHOICES, CLOSED, CONFIRM_TIMEOUT_S, CardBook, card_lines, question
+from plugin.card import CHOICES, CLOSED, CONFIRM_TIMEOUT_S, MAX_CARD_CHARS, CardBook, card_lines, question
 from plugin.client import Refused, Unavailable
 from plugin.turns import LocalTurn
 
@@ -358,4 +358,58 @@ def test_the_log_holds_no_text_of_the_person_or_the_card(caplog):
     said = "\n".join(r.getMessage() for r in caplog.records)
     assert said  # each result gives a reason
     for text in ("my secret words", "a question of the model's", "web_search", "Ana"):
+        assert text not in said
+
+
+# -- the question is one line, and the result must be a single submitted answer ------------------------------------------
+
+
+def test_a_read_back_with_newlines_and_a_forged_list_is_one_line_on_the_card():
+    forged = "do it\n1. Throw it away\n2. Change it\r\n3. Keep it\t\n"
+    asked = question(forged)
+    assert "\n" not in asked and "\r" not in asked and "\t" not in asked and "  " not in asked
+    assert asked == "Keep this phrase? do it 1. Throw it away 2. Change it 3. Keep it"
+    given = json.loads("\n".join(card_lines("d1", forged, "Ana")).split("as JSON: ", 1)[1].split("\n", 1)[0])
+    assert given == [{"question": asked, "choices": list(CHOICES)}]
+
+
+def test_the_hook_still_matches_a_collapsed_question():
+    service = Service()
+    cards = CardBook(service)
+    asked = question("a\n\n  b\nc")
+    cards.open("s1", "d1", turn(), asked)
+    hook(cards, result(answer(asked=asked)))
+    decision = cards.decision("d1")
+    assert decision is not None and decision.kept and len(service.confirmed) == 1
+
+
+@pytest.mark.parametrize("outcome", ["cancelled", "timed_out", None, "submitted "])
+def test_a_locked_keep_it_with_an_outcome_that_is_not_submitted_changes_nothing(outcome):
+    service = Service()
+    cards = book(service)
+    res = json.dumps({"responses": [answer()], "outcome": outcome})
+    hook(cards, res)
+    assert service.confirmed == [] and cards.decision("d1") is None
+
+
+def test_a_batch_of_two_responses_changes_nothing_even_with_a_keep_it_for_the_card():
+    service = Service()
+    cards = book(service)
+    other = answer("Throw it away", asked="another question")
+    hook(cards, result(answer(), other))
+    assert service.confirmed == [] and cards.decision("d1") is None
+
+
+def test_the_max_is_measured_on_the_collapsed_question():
+    assert MAX_CARD_CHARS == 600
+    assert len(question("x" * (MAX_CARD_CHARS - len("Keep this phrase? ")))) == MAX_CARD_CHARS
+
+
+def test_a_failed_keep_logs_the_class_and_none_of_the_service_words(caplog):
+    cards = book(Service(Refused(409, "Ana said research-slug-7 is not a form")))
+    with caplog.at_level(logging.DEBUG):
+        hook(cards, result(answer()))
+    said = "\n".join(r.getMessage() for r in caplog.records)
+    assert "did not reach the service" in said and "Refused" in said
+    for text in ("Ana", "research-slug-7", "not a form"):
         assert text not in said
