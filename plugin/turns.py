@@ -58,8 +58,6 @@ _MAX_FRAME_LINES = 12
 _MAX_OFFER_CHARS = 1500
 #: a phrase's name, id and step tool are shown up to this long
 _MAX_NAME_CHARS = 80
-#: a repair's text (the kernel may quote a step's outcome) is shown up to this long
-_MAX_REPAIR_CHARS = 300
 #: a recorded message's text is kept up to this long
 _MAX_INBOUND_CHARS = 4000
 #: the two affordances that are tools of their own, not phrases to run
@@ -308,8 +306,9 @@ def _reading_lines(frames: list[JsonObject], budget: int) -> list[str]:
     return []
 
 
-def repair_block(repair: str) -> str:
-    return f"For this message only, the kernel could not run it as asked: {_short(repair, _MAX_REPAIR_CHARS)}"
+def repair_block() -> str:
+    """A fixed line: the kernel's repair text may quote a step's outcome (a tool's result), so none of it is shown."""
+    return "For this message only, the kernel could not finish reading it: answer the person normally."
 
 
 class KernelTurns:
@@ -500,7 +499,7 @@ class KernelTurns:
         lines = [block, calls] if block else []
         repair = view.get("repair")
         if view.get("status") == "repair" and isinstance(repair, str) and repair:
-            lines.insert(0, repair_block(repair))
+            lines.insert(0, repair_block())
         context = "\n".join(line for line in lines if line)
         return {"context": context} if context else None
 

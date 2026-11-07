@@ -285,3 +285,12 @@ def test_a_rotated_session_without_reset_reads_with_the_same_chat(env):
     turns.on_pre_llm_call(**hook(session_id="s1", turn_id="h1"))
     turns.on_pre_llm_call(**hook(session_id="s2", turn_id="h2"))
     assert client.calls[0][0]["chat"] == client.calls[1][0]["chat"] == "slack:C1"
+
+
+def test_a_repair_gives_a_generic_line_and_none_of_its_text(env):
+    session(env)
+    view = {"status": "repair", "turn_id": "k1", "frames": [], "repair": "tool step s1 (fetch) failed: MARKER-5521"}
+    out = KernelTurns(FakeClient(view)).on_pre_llm_call(**hook())
+    assert out is not None
+    assert "MARKER-5521" not in out["context"] and "fetch" not in out["context"]
+    assert "answer" in out["context"]
