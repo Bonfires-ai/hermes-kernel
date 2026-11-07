@@ -22,10 +22,25 @@ from pathlib import Path
 import pexpect  # pyright: ignore[reportMissingModuleSource]
 
 
+def require_own_hermes_home() -> Path:
+    """Refuse, before anything is spawned, unless HERMES_HOME is set, absolute, and not the real ~/.hermes (after realpath)."""
+    raw = os.environ.get("HERMES_HOME", "")
+    if not raw:
+        sys.exit(
+            "refusing to run: HERMES_HOME is not set. Hermes migrates the home it starts on, so point it at a throwaway directory first."
+        )
+    if not os.path.isabs(raw):
+        sys.exit(f"refusing to run: HERMES_HOME must be an absolute path, got '{raw}'.")
+    real = os.path.realpath(os.path.expanduser("~/.hermes"))
+    if os.path.realpath(raw) == real:
+        sys.exit(f"refusing to run: HERMES_HOME resolves to the real Hermes home ({real}). Use a throwaway directory.")
+    return Path(raw)
+
+
 def main() -> int:
+    home = require_own_hermes_home()
     hermes = sys.argv[1]
     token = os.environ["E2E_SETUP_TOKEN"]
-    home = Path(os.environ["HERMES_HOME"])
     child = pexpect.spawn(hermes, ["memory", "setup"], encoding="utf-8", timeout=60, dimensions=(50, 140))
     child.expect("Memory provider setup", timeout=60)
     time.sleep(2)

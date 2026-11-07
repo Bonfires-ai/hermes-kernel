@@ -207,6 +207,8 @@ python3 -m venv .venv
 scripts/name-scan.sh                              # no machine paths, keys or private names in any file
 ```
 
+Set `HERMES_HOME` to a throwaway directory before running any of the scripts in `scripts/` (or any Hermes), because Hermes migrates the home it starts on; the scripts refuse to run when it is unset or resolves to `~/.hermes`.
+
 The plugin's tests need Hermes v0.23.0 importable. `.github/workflows/ci.yml` builds it the way Hermes does (Python 3.14,
 `uv sync --frozen` in a checkout of the `v0.23.0` tag) and runs `python -m pytest tests/plugin -q` in that environment.
 `scripts/name-scan.sh` also reads private names from `.dev/private-names.txt` (git-ignored); without that file it

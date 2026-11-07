@@ -244,3 +244,14 @@ def test_the_command_does_not_say_saving_when_the_provider_is_not_selected(impl_
     assert "hermes config set memory.provider hermes-kernel" in answer
     provider_config["cfg"] = None  # Hermes's config cannot be read: do not claim it
     assert "Saving." not in kernel("")
+
+
+def test_money_small_amounts_do_not_read_as_zero():
+    from plugin.command import _money
+
+    assert _money(0.0034) == "$0.0034"
+    assert _money(0.0004) == "$0.0004"
+    assert _money(0.1) == "$0.10"
+    assert _money(19.9) == "$19.90"
+    assert _money(0) == "$0.00"
+    assert _money(20.0) == "$20.00"

@@ -15,7 +15,11 @@ NOT_SELECTED = "memory.provider is not hermes-kernel: set it with `hermes config
 
 
 def _money(value: Any) -> str:
-    return f"${float(value):.2f}"
+    """Two decimals for ordinary amounts; more for a small non-zero one, so that it never reads as $0.00."""
+    amount = float(value)
+    if amount == 0 or abs(amount) >= 0.01:
+        return f"${amount:.2f}"
+    return f"${amount:.4f}" if abs(amount) >= 0.00005 else f"${amount:.8f}"
 
 
 def _held_lines(status: dict[str, Any], held: str) -> list[str]:

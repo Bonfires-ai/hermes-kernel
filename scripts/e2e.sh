@@ -9,7 +9,9 @@
 # something answers on port 8787, and generates a fresh KT_TOKEN for its stack (the shell's value beats .env in
 # compose), so a Hermes of yours that points at port 8787 later is refused (401) and keeps its data instead of feeding a
 # stack that is about to be wiped. It never reads or writes ~/.hermes: Hermes runs in a fresh temporary home, removed at
-# the end. It needs Hermes v0.23.0 exactly, and 9 GiB of RAM available.
+# the end, after every process that was started on that home (Hermes leaves a background gateway per home) is stopped.
+# It refuses to start unless HERMES_HOME is set in your shell to an absolute path that is not ~/.hermes (also through a
+# symlink): that value is only checked, the run uses its own temporary home. It needs Hermes v0.23.0 exactly, and 9 GiB of RAM available.
 #
 # It spends real money (a few cents to build the memory, and a chat model for about a dozen turns; the target is under
 # $1) and takes about half an hour, most of it waiting for memory to build.
@@ -49,6 +51,52 @@ PORT=8787
 
 die() { echo "e2e: $*" >&2; exit 2; }
 
+# Refuse, before anything is spawned, unless HERMES_HOME is set, absolute, and not the real ~/.hermes (after realpath).
+require_own_hermes_home() {
+  local raw="${HERMES_HOME:-}"
+  [ -n "$raw" ] || die "refusing to run: HERMES_HOME is not set. Hermes migrates the home it starts on, so point it at a throwaway directory first."
+  case "$raw" in /*) ;; *) die "refusing to run: HERMES_HOME must be an absolute path, got '$raw'." ;; esac
+  [ "$(realpath -m -- "$raw")" != "$(realpath -m -- "$HOME/.hermes")" ] \
+    || die "refusing to run: HERMES_HOME resolves to the real Hermes home ($HOME/.hermes). Use a throwaway directory."
+}
+require_own_hermes_home
+
+# The line "HERMES_HOME=<value>" from one process's environ (nothing else of it is read or shown), or nothing.
+home_of() { { tr '\0' '\n' <"/proc/$1/environ" | grep -m1 '^HERMES_HOME=' || true; } 2>/dev/null; }
+
+# Stop every process whose HERMES_HOME is "$1" (children included), reading only that one variable from each environ.
+stop_home_processes() {
+  local home="$1" round pid value found
+  for round in 1 2 3 4 5 6; do
+    found=0
+    for pid in $(ls /proc | grep -E '^[0-9]+$'); do
+      [ "$pid" != "$$" ] && [ "$pid" != "$BASHPID" ] || continue
+      value="$(home_of "$pid")"
+      if [ "$value" = "HERMES_HOME=$home" ]; then
+        found=1
+        kill -TERM "$pid" 2>/dev/null || true
+      fi
+    done
+    [ $found -eq 1 ] || return 0
+    sleep 3
+    for pid in $(ls /proc | grep -E '^[0-9]+$'); do
+      [ "$pid" != "$$" ] && [ "$pid" != "$BASHPID" ] || continue
+      value="$(home_of "$pid")"
+      [ "$value" != "HERMES_HOME=$home" ] || kill -KILL "$pid" 2>/dev/null || true
+    done
+    sleep 1
+  done
+}
+# The pids (one per line) of processes still holding "$1" as their HERMES_HOME.
+home_processes() {
+  local home="$1" pid value
+  for pid in $(ls /proc | grep -E '^[0-9]+$'); do
+    [ "$pid" != "$$" ] && [ "$pid" != "$BASHPID" ] || continue
+    value="$(home_of "$pid")"
+    [ "$value" != "HERMES_HOME=$home" ] || echo "$pid"
+  done
+}
+
 # ---- guards: nothing below runs until all of these pass ----------------------------------------------------------------
 
 case "$PROJECT" in
@@ -87,12 +135,13 @@ dc() { docker compose -p "$PROJECT" "${FILES[@]}" "$@"; }
 
 HERMES_HOME="$(mktemp -d)"
 export HERMES_HOME
+require_own_hermes_home
 [ -n "$OUT" ] || OUT="$(mktemp -d)"
 mkdir -p "$OUT"
 hermes_version="$("$HERMES" --version 2>&1 | head -1)"
 case "$hermes_version" in
   "Hermes Agent v0.23.0 "*) ;;
-  *) rm -rf "$HERMES_HOME"; die "this needs Hermes v0.23.0, and '$HERMES' says: $hermes_version" ;;
+  *) stop_home_processes "$HERMES_HOME"; rm -rf "$HERMES_HOME"; die "this needs Hermes v0.23.0, and '$HERMES' says: $hermes_version" ;;
 esac
 env_value() { grep -E "^$1=" .env | head -1 | cut -d= -f2- || true; }
 OPENROUTER_VALUE="$(env_value OPENROUTER_API_KEY)"
@@ -115,7 +164,21 @@ cleanup() {
   fi
   if [ $code -ne 0 ]; then dc logs --no-color --tail 300 >"$OUT/stack-logs.txt" 2>&1 || true; fi
   rm -f "$OUT/.auth-header"
-  [ "${E2E_KEEP_HOME:-no}" = "yes" ] || rm -rf "$HERMES_HOME"
+  # Hermes starts a background gateway for the home it runs on, and it outlives the chat: stop everything on this home
+  # first, and only then remove the home (a gateway still running would recreate part of it).
+  if [ "${E2E_KEEP_HOME:-no}" != "yes" ]; then
+    stop_home_processes "$HERMES_HOME"
+    rm -rf "$HERMES_HOME"
+    leftover="$(home_processes "$HERMES_HOME" | tr '\n' ' ')"
+    if [ -n "${leftover// /}" ]; then
+      RESULTS+=("FAIL  cleanup: processes still hold the temporary Hermes home after the stop: $leftover")
+      [ $code -ne 0 ] || code=1
+      STAGE="${STAGE:-cleanup}"
+    else
+      RESULTS+=("PASS  cleanup: no process holds the temporary Hermes home")
+    fi
+    rm -rf "$HERMES_HOME"
+  fi
   echo
   echo "== summary ($(( $(date +%s) - START )) s wall) =="
   for line in "${RESULTS[@]}"; do echo "$line"; done
@@ -131,6 +194,7 @@ cleanup() {
     dc down -v --remove-orphans >/dev/null 2>&1 || true
     echo "the stack '$PROJECT' was removed (E2E_KEEP_STACK=yes keeps it)"
   fi
+  exit $code
 }
 trap cleanup EXIT
 
