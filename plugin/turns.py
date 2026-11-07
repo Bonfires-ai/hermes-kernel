@@ -408,8 +408,10 @@ class KernelTurns:
             if found is None and sender_id:
                 found = next((e for e in events if not e.text.strip()), None)  # a voice message: no text
             if found is not None:
-                for e in events[: events.index(found) + 1]:  # older ones were never addressed: they match no later turn
-                    e.used = True
+                found.used = True
+                if found.user_id:  # this person's older messages were never addressed: they match no later turn
+                    for e in events[: events.index(found)]:
+                        e.used = e.used or e.user_id == found.user_id
             return found
 
     # -- pre_llm_call ------------------------------------------------------------------------------------------------

@@ -315,3 +315,23 @@ def test_a_taken_message_retires_the_senders_older_ones(env):
     turns.on_pre_llm_call(**hook(turn_id="h1", user_message="second", sender_id="U1"))
     turns.on_pre_llm_call(**hook(turn_id="h2", user_message="a voice note", sender_id="U1"))
     assert [c[0]["message_id"] for c in client.calls] == ["m2", "h2"]
+
+
+def test_a_take_retires_only_the_takers_own_older_messages(env):
+    session(env)
+    client = FakeClient()
+    turns = KernelTurns(client)
+    turns.on_gateway_dispatch(event("older", message_id="m1", user="U2", name="Bo"))
+    turns.on_gateway_dispatch(event("target", message_id="m2", user="U1", name="Ana"))
+    turns.on_pre_llm_call(**hook(turn_id="h1", user_message="target"))  # no sender_id
+    turns.on_pre_llm_call(**hook(turn_id="h2", user_message="older", sender_id="U2"))
+    assert [c[0]["message_id"] for c in client.calls] == ["m2", "m1"]
+
+
+def test_a_voice_message_is_matched_by_its_sender(env):
+    session(env)
+    client = FakeClient()
+    turns = KernelTurns(client)
+    turns.on_gateway_dispatch(event("", message_id="m1"))
+    turns.on_pre_llm_call(**hook(turn_id="h1", user_message="what I said aloud", sender_id="U1"))
+    assert client.calls[0][0]["message_id"] == "m1"
