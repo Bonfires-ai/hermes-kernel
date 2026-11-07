@@ -102,9 +102,12 @@ def _probe(value: JsonValue) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
 
 
-def bounded(value: JsonValue) -> str:
-    text = _probe(value)
+def _line_cut(text: str) -> str:
     return text if len(text) <= _MAX_VALUE_CHARS else text[: _MAX_VALUE_CHARS - 1] + "…"
+
+
+def bounded(value: JsonValue) -> str:
+    return _line_cut(_probe(value))
 
 
 def _holds(probe: str, value: str) -> bool:
@@ -509,7 +512,7 @@ class PhraseRun:
         if held is None:
             value, failure, real = self._dispatched(tool, args, task_id, session_id, platform)
             if failure is not None:
-                said = shown_failure(real, failure, args, carried)
+                said = shown_failure(real, _line_cut(failure), args, carried)  # cut first: the fence's end stays
                 return self._failed(child, step_id, failure, said, head, deadline)
             self._ledger.record(key, value, real)
         else:

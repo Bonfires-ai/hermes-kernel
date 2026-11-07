@@ -578,3 +578,61 @@ def test_any_failure_of_a_continue_keeps_the_record(env):
 def test_a_drive_that_found_the_phrase_finished_says_so():
     answer = describe_run("research", RunOutcome("done", "c1"))
     assert "nothing left to run" in answer and "finished" in answer
+
+
+def test_a_long_failure_is_cut_in_the_stop_reason_and_its_fence_still_closes(env):
+    long_failure = "x" * 20000
+
+    def dispatch(name, args):
+        raise RuntimeError(long_failure)
+
+    client = Client(view())
+    tools, _, _, _ = build(client, dispatch=dispatch)
+    answer = ask(tools, "run_phrase", {"phrase": "research"})
+    stopped = answer.split("It stopped: ")[1]
+    assert len(stopped) < 2 * 600 + 400  # the line and the reason, each cut to what a line shows
+    assert stopped.count("<untrusted_tool_result") == stopped.count("</untrusted_tool_result>")
+    assert client.reports[0][3].count("x") > 15000  # the service still gets the failure as it came
+
+
+def test_a_ledger_that_could_not_be_saved_starts_unsure_after_a_restart(tmp_path, monkeypatch):
+    path = tmp_path / "steps.json"
+    first = StepLedger(path)
+    first.carry("c1", "web_search", "known")  # a good save: the file reads as sure
+    assert not StepLedger(path).unsure
+
+    def refuse(*_):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr("plugin.ledger.os.replace", refuse)
+    first.carry("c1", "web_search", "a value the file never got")
+    monkeypatch.undo()
+    assert first.carried("c1")[-1][1] == "a value the file never got"  # the running ledger still knows
+    restarted = StepLedger(path)
+    assert restarted.unsure  # it must not read the stale file as sure
+    assert restarted.carried("c2") == FENCE_ALL
+
+
+def test_a_save_that_works_again_makes_the_file_sure_again(tmp_path, monkeypatch):
+    path = tmp_path / "steps.json"
+    ledger = StepLedger(path)
+    ledger.carry("c1", "web_search", "one")
+    with monkeypatch.context() as patched:
+        patched.setattr("plugin.ledger.os.replace", lambda *_: (_ for _ in ()).throw(OSError("full")))
+        ledger.carry("c1", "web_search", "two")
+    ledger.carry("c1", "web_search", "three")
+    restarted = StepLedger(path)
+    assert not restarted.unsure and [v for _, v in restarted.carried("c1")] == ["one", "two", "three"]
+
+
+def test_a_first_start_with_no_file_is_sure(tmp_path):
+    assert not StepLedger(tmp_path / "steps.json").unsure  # a fresh install is not fenced for a day
+
+
+def test_a_failed_first_save_still_leaves_the_next_start_unsure(tmp_path, monkeypatch):
+    path = tmp_path / "steps.json"
+    ledger = StepLedger(path)
+    with monkeypatch.context() as patched:
+        patched.setattr("plugin.ledger.os.replace", lambda *_: (_ for _ in ()).throw(OSError("full")))
+        ledger.carry("c1", "web_search", "lost")
+    assert StepLedger(path).unsure

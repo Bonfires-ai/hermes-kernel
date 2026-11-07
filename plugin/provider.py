@@ -15,6 +15,7 @@ from typing import Any
 from agent.memory_provider import MemoryProvider
 
 from .client import Refused, Unauthorized, Unavailable
+from .fence import block
 from .shared import CONFIG_FILE, DEFAULT_URL, get_shared
 
 log = logging.getLogger(__name__)
@@ -23,9 +24,10 @@ log = logging.getLogger(__name__)
 MAX_KERNEL_CHARS = 20000
 CONTEXT_TIMEOUT_S = 6.0
 SPOOL_NAME = "hermes-kernel-spool.jsonl"
+SEARCH_TOOL = "search_memory"
 
 SEARCH_SCHEMA = {
-    "name": "search_memory",
+    "name": SEARCH_TOOL,
     "description": "Search long-term memory of past conversations for facts, decisions and people.",
     "parameters": {
         "type": "object",
@@ -213,7 +215,7 @@ class KernelMemory(MemoryProvider):
         return [SEARCH_SCHEMA]
 
     def handle_tool_call(self, tool_name: str, args: dict[str, Any], **kwargs: Any) -> str:
-        if tool_name != "search_memory":
+        if tool_name != SEARCH_TOOL:
             return json.dumps({"error": f"unknown tool {tool_name}"})
         query = str((args or {}).get("query") or "").strip()
         client = get_shared().client
@@ -224,7 +226,8 @@ class KernelMemory(MemoryProvider):
         info = self._session(self._session_id)
         speaker = self._speaker(info) if info is not None else self._author
         try:
-            return json.dumps({"results": cut_kernel_block(client.context(query, speaker, timeout=CONTEXT_TIMEOUT_S))})
+            found = cut_kernel_block(client.context(query, speaker, timeout=CONTEXT_TIMEOUT_S))
+            return json.dumps({"results": block(SEARCH_TOOL, found) if found else ""})
         except Unauthorized:
             return json.dumps({"error": "memory refused the token: check HERMES_KERNEL_TOKEN"})
         except (Unavailable, Refused):

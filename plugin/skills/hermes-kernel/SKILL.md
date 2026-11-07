@@ -3,7 +3,7 @@ name: hermes-kernel
 description: "How to use the kernel's memory and phrases: read its block in a message, run a phrase with run_phrase, offer and teach one, continue one that paused with phrase_continue, and when a conversation reaches memory."
 version: 0.1.0
 author: Bonfires
-license: MIT
+license: Apache-2.0
 platforms: [linux]
 metadata:
   hermes:

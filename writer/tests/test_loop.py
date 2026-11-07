@@ -381,3 +381,32 @@ def test_an_outage_counts_no_attempt(db, settings):
     add_session(db, "A", 1)
     run_once(Queue(db), Script(BuildResult("busy", "ServiceUnavailable: down")), Release(), settings)
     assert state(db, "A")["state"] == "closed" and state(db, "A")["attempts"] == 0
+
+
+def test_tied_and_decreasing_timestamps_come_out_rising(db):
+    # A crash between a message's insert and its count leaves an orphan, and the next message reuses its seq and can
+    # carry an earlier time. mk refuses a session whose times do not rise, so it could never be built.
+    add_session(db, "s1", 1, messages=0)
+    db["messages"].insert_many(
+        [
+            {
+                "_id": f"m{i}",
+                "session_id": "s1",
+                "seq": i,
+                "speaker": "a",
+                "text": str(i),
+                "timestamp": T0 + timedelta(seconds=at),
+            }
+            for i, at in enumerate((0, 0, 0, 5, 3))
+        ]
+    )
+    claimed = Queue(db).claim()
+    assert claimed is not None
+    stamps = [datetime.fromisoformat(m["timestamp"]) for m in claimed["messages"]]
+    assert [m["message_id"] for m in claimed["messages"]] == ["m0", "m1", "m2", "m4", "m3"]  # by time, then seq
+    milli = timedelta(milliseconds=1)
+    assert stamps == [T0, T0 + milli, T0 + 2 * milli, T0 + timedelta(seconds=3), T0 + timedelta(seconds=5)]
+    assert all(later > earlier for earlier, later in zip(stamps, stamps[1:], strict=False))
+    assert (
+        db["messages"].find_one({"_id": "m1"})["timestamp"].replace(tzinfo=UTC) == T0
+    )  # the store keeps what was sent

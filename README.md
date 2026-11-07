@@ -60,6 +60,13 @@ would rather not use the menu, add that line yourself and run `hermes config set
 
 Start a new Hermes session. In it, type `/kernel`: it should say `Saving.`
 
+**If Hermes was already running** (its background gateway stays up for ten minutes after a chat, and for good if you run
+it as a service), these steps reach it with nothing restarted. That is why `hermes plugins enable` comes last: it makes a
+running gateway reload its plugins, and by then the token is there. If you run the steps in another order, or add the
+token later, memory still starts, and `/kernel` says that phrases are off until you run `hermes gateway restart`.
+`hermes gateway stop` ends the gateway too, but if you have installed one as a service it acts on that service, and
+everything the service runs stays stopped until you start it again.
+
 **Only the turn service has a host port**, `127.0.0.1:8787`, behind the bearer token. The memory engine, Neo4j and
 Mongo are reachable only from inside the stack.
 
@@ -132,8 +139,9 @@ test, a lowered ceiling showed within three minutes and a raised one after three
 finished build's $0.10 estimate until `mk-serve` was restarted). Restarting it does not change what the writer does.
 
 A held session is tried again on its own, with no restart: the writer looks for held sessions every ten minutes and
-retries those that have been held for ten minutes or more, so a build starts 10 to 20 minutes after it was held (in a
-test: 17 minutes, with the ceiling raised under 3 minutes after the hold).
+retries those that have been held for ten minutes or more, so a build starts 10 to 20 minutes after it was held, or one
+round later if another build is running then (in a test, the session was built 17 minutes after the hold, with the
+ceiling raised under 3 minutes after it).
 
 ## `/kernel`
 
@@ -146,6 +154,8 @@ Type `/kernel` in a Hermes session. It says one of:
   (1000 queued items).
 - A session that failed to build, with its id: `/kernel retry <session id>` retries it.
 - That the spend ceiling is holding builds, with the command above.
+- `Memory is not set up`, when there is no token: run `hermes memory setup`.
+- `Phrases are off`, when this Hermes loaded the plugin before it had the token: run `hermes gateway restart`.
 
 ## When something is down
 
@@ -157,6 +167,7 @@ recall is too slow goes on without it.
 docker compose ps                  # what is running
 docker compose up -d --wait        # start it again; memory is kept
 docker compose logs --tail 100 writer     # why a session did not build
+docker compose logs turn-service | grep call_refused      # why a phrase call was refused (its reason, never its words)
 ```
 
 `/kernel` tells you whether memory is saving and why not.
@@ -167,8 +178,9 @@ docker compose logs --tail 100 writer     # why a session did not build
 confirms and runs a phrase with a real `web_search` and a `think` step the model writes). On `openai/gpt-4o-mini` it
 did **not** work: asked to set up a phrase, that model called Hermes's own `skill_manage` tool (which failed) instead of
 `offer_phrase` and `teach_phrase`, in three tries (the last one with the instruction not to, in the skill and in the turn's prompt block), and
-then told the user that the phrase was set up when it was not. If your model does that, `/kernel` and a phrase that
-never shows up in "You may call" are the signs. Use a model that is good at calling tools for teaching.
+then told the user that the phrase was set up when it was not. `/kernel` says nothing about phrases, so the signs are
+that Hermes never reads a draft back to you, and that the phrase does nothing when you say it. Use a model that is good
+at calling tools for teaching.
 
 Ask Hermes to remember a routine ("when I say `research X`, search the web for X and summarise it"). It drafts the
 phrase, reads it back, and keeps it only when you say yes. **Answer with just `yes`**: the kernel reads a bare
@@ -181,6 +193,17 @@ does itself. A step that would change something outside is refused. The plugin i
 
 Tested on the Hermes CLI. Other platforms (Telegram, Discord and the rest) are best effort: speakers are named as the
 platform gives them, and a Hermes that serves several people shares one memory among them (see the warning at the top).
+
+## Upgrading
+
+```bash
+git pull
+docker compose build
+docker compose up -d --wait
+hermes plugins update hermes-kernel
+```
+
+Your memory stays in its Docker volumes.
 
 ## Uninstall
 
@@ -207,11 +230,11 @@ python3 -m venv .venv
 scripts/name-scan.sh                              # no machine paths, keys or private names in any file
 ```
 
-Set `HERMES_HOME` to a throwaway directory before running any of the scripts in `scripts/` (or any Hermes), because Hermes migrates the home it starts on; the scripts refuse to run when it is unset or resolves to `~/.hermes`.
+Set `HERMES_HOME` to a throwaway directory before running any of the scripts in `scripts/` (or any Hermes), because Hermes migrates the home it starts on; the scripts refuse to run when it is unset or inside `~/.hermes`, and the plugin's tests each run on a temporary home of their own.
 
 The plugin's tests need Hermes v0.23.0 importable. `.github/workflows/ci.yml` builds it the way Hermes does (Python 3.14,
 `uv sync --frozen` in a checkout of the `v0.23.0` tag) and runs `python -m pytest tests/plugin -q` in that environment.
-`scripts/name-scan.sh` also reads private names from `.dev/private-names.txt` (git-ignored); without that file it
+`scripts/name-scan.sh` also reads private names from `.dev/private-names.txt` (git-ignored); with no name to look for it
 fails, and `NAME_SCAN_GENERIC_ONLY=1` scans only for paths and keys.
 
 `scripts/e2e.sh` runs the whole thing from nothing on a real Hermes v0.23.0 and a real stack. **It deletes data**: it

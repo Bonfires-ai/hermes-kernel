@@ -198,3 +198,15 @@ class StepLedger:
             os.replace(tmp, self._path)
         except OSError:
             logger.warning("hermes-kernel: the agent step ledger %s could not be written", self._path, exc_info=True)
+            self._distrust(tmp)
+
+    def _distrust(self, tmp: Path) -> None:
+        """A save failed, so the file is older than what is carried. Empty it, so a restart finds a file it cannot read
+        and is unsure. Removing it would not do: no file reads as a first start, sure of everything. Emptying needs no
+        space on a full disk, and the next save that works writes it whole again."""
+        assert self._path is not None
+        try:
+            tmp.unlink(missing_ok=True)
+            os.close(os.open(self._path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600))
+        except OSError:
+            logger.warning("hermes-kernel: the stale step ledger %s could not be emptied", self._path, exc_info=True)

@@ -29,6 +29,20 @@ def _utc(when: datetime) -> datetime:
     return when.replace(tzinfo=UTC) if when.tzinfo is None else when.astimezone(UTC)
 
 
+def _rising(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """``messages`` in order, each one at least 1 ms after the one before. A crash between storing a message and counting
+    it leaves an orphan whose ``seq`` the next message takes, so a session can hold ties, and a tie must not make it
+    unbuildable. Only what the kernel is handed changes: the stored time stays as it was sent."""
+    last: datetime | None = None
+    for message in messages:
+        at = datetime.fromisoformat(message["timestamp"])
+        if last is not None and at <= last:
+            at = last + timedelta(milliseconds=1)
+            message["timestamp"] = at.isoformat()
+        last = at
+    return messages
+
+
 class Queue:
     def __init__(
         self, db: Database[Any], *, clock: Callable[[], datetime] | None = None, stop_backoff_s: float = 60
@@ -61,7 +75,7 @@ class Queue:
         # Neither contiguous ``seq`` nor an exact ``message_count`` is assumed, and ``last_ts`` is ignored.
         try:
             found = self._messages.find({"session_id": doc["_id"]}).sort([("timestamp", ASCENDING), ("seq", ASCENDING)])
-            messages = [m for m in (self._message(d) for d in found) if m is not None]
+            messages = _rising([m for m in (self._message(d) for d in found) if m is not None])
         except Exception:
             # The state is already ``running``: put it back, so a failed read leaves nothing stuck.
             self._sessions.update_one({"_id": doc["_id"]}, {"$set": {"state": "closed"}})
