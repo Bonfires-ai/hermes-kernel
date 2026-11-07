@@ -19,7 +19,7 @@
 # Settings (all optional except E2E_CONFIRM):
 #   E2E_PROJECT          compose project name, must start with hermes-kernel-e2e   (hermes-kernel-e2e)
 #   E2E_OVERRIDE         one extra compose file                      (none)
-#   E2E_PLUGIN_SOURCE    what `hermes plugins install` is given      (Bonfires-ai/hermes-kernel/plugin)
+#   E2E_PLUGIN_SOURCE    what install.sh gives `hermes plugins install`   (empty: install.sh picks this checkout's HEAD)
 #   E2E_HERMES           the hermes command                          (hermes)
 #   E2E_PYTHON           a python that has pexpect                   (python3)
 #   E2E_MODEL            the chat model (it must be good at calling tools; a small one may reach for Hermes's own
@@ -40,7 +40,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 PROJECT="${E2E_PROJECT:-hermes-kernel-e2e}"
-PLUGIN_SOURCE="${E2E_PLUGIN_SOURCE:-Bonfires-ai/hermes-kernel/plugin}"
+PLUGIN_SOURCE="${E2E_PLUGIN_SOURCE:-}"
 HERMES="${E2E_HERMES:-hermes}"
 PY="${E2E_PYTHON:-python3}"
 MODEL="${E2E_MODEL:-anthropic/claude-sonnet-4.5}"
@@ -282,10 +282,15 @@ prompts() { jq -n '$ARGS.positional' --args "$@"; }
 stage "1. install from nothing"
 echo "hermes: $hermes_version"
 dc down -v --remove-orphans
-[ "$BUILD" = "no" ] || dc build
 t0="$(now)"
-dc up -d --wait
-echo "stack up in $(( $(now) - t0 )) s; the kernel has spent $(spend) USD"
+# The way a person does it: install.sh builds and starts the stack, installs the plugin, stores the token and the URL,
+# selects the memory provider and enables the plugin last. KT_TOKEN is exported above (the shell's value beats .env).
+INSTALL=(./install.sh --mode local --hermes "$HERMES" --project "$PROJECT")
+[ -z "${E2E_OVERRIDE:-}" ] || INSTALL+=(--compose-file "$E2E_OVERRIDE")
+[ "$BUILD" != "no" ] || INSTALL+=(--no-build)
+[ -z "$PLUGIN_SOURCE" ] || INSTALL+=(--plugin-source "$PLUGIN_SOURCE")
+"${INSTALL[@]}" || fail "install.sh failed"
+echo "install.sh done in $(( $(now) - t0 )) s; the kernel has spent $(spend) USD"
 "$HERMES" config set model.provider openrouter >/dev/null
 "$HERMES" config set model.default "$MODEL" >/dev/null
 # Hermes's own memory and chat search are switched off so that anything recalled later can only have come from here.
@@ -296,11 +301,6 @@ echo "stack up in $(( $(now) - t0 )) s; the kernel has spent $(spend) USD"
 "$HERMES" config set telemetry.shared_metrics.enabled false >/dev/null
 "$HERMES" config set telemetry.shared_metrics.send false >/dev/null
 "$HERMES" config set telemetry.shared_metrics.offer_version 2 --force >/dev/null
-"$HERMES" plugins install "$PLUGIN_SOURCE" --enable
-# The README's way to give the plugin its token: the memory setup menu (the token itself is never printed).
-E2E_SETUP_TOKEN="$KT_TOKEN_VALUE" "$PY" "$ROOT/scripts/e2e_setup.py" "$HERMES" || fail "hermes memory setup did not store the token"
-# Last, as in the README: this is the step that makes a Hermes that is already running load the plugin, with the token.
-"$HERMES" plugins enable hermes-kernel
 "$HERMES" plugins list >"$OUT/plugins-list.txt"
 grep -Eq '^│ hermes-kernel +│ enabled +│' "$OUT/plugins-list.txt" || fail "the plugin is not enabled after install (see $OUT/plugins-list.txt)"
 curl -fsS "http://127.0.0.1:$PORT/healthz" >/dev/null || fail "the turn service does not answer"

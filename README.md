@@ -25,43 +25,50 @@ messages and runs.
 
 ```bash
 git clone https://github.com/Bonfires-ai/hermes-kernel && cd hermes-kernel
-cp .env.example .env
+export OPENROUTER_API_KEY=...   # or leave them out and the script asks, with the input hidden
+export VOYAGE_API_KEY=...
+./install.sh
 ```
 
-Fill in `.env`:
+`install.sh` sets up the local stack and the plugin in one go. It builds and starts the stack, installs the plugin into
+your Hermes, gives the plugin its token and the stack's URL, and enables it. What it asks you for are the OpenRouter and
+Voyage keys, and only if they are not in your environment or in `.env` already; keys are never taken from the command
+line. It makes a `.env` from `.env.example` with a fresh `NEO4J_PASSWORD` and `KT_TOKEN` (the bearer token Hermes uses to
+talk to the stack), mode 0600.
 
-| Variable | What |
-|---|---|
-| `NEO4J_PASSWORD` | Any password. It **cannot contain `/`** (Neo4j reads `NEO4J_AUTH` as `user/password`). |
-| `OPENROUTER_API_KEY` | Your OpenRouter key. |
-| `VOYAGE_API_KEY` | Your Voyage AI key. **Required.** Compose refuses to start with it empty, but the stack's health checks never call Voyage, so a wrong or revoked key does not show up there: it shows up as sessions that fail to build (`/kernel` lists them). |
-| `KT_TOKEN` | The bearer token Hermes uses to talk to the stack. Make one: `openssl rand -hex 24`. |
-| `KT_BONFIRE_ID` | Leave as `hermes`. |
+What it never does: install or upgrade Hermes (it checks that you have v0.23.0 and stops if not), delete a Docker
+volume, or overwrite a value already in `.env`. It follows your sticky Hermes profile (`hermes profile use`), and it
+writes to your real Hermes home, `~/.hermes` or `$HERMES_HOME`.
 
-Then build and start the stack:
+Run it a second time and nothing is lost: `.env` and your memory stay, the images are rebuilt, and the plugin is updated
+(`hermes plugins update`) rather than installed again.
+
+Options: `--hermes PATH` (the Hermes to use), `--project NAME` (the compose project, default `hermes-kernel`),
+`--compose-file FILE`, `--no-build`, `--plugin-source SOURCE`, `--url URL`; `./install.sh --help` lists them.
+
+### By hand
+
+The script does these steps. Copy `.env.example` to `.env` and fill in `NEO4J_PASSWORD` (any password, **no `/`**: Neo4j
+reads `NEO4J_AUTH` as `user/password`), `OPENROUTER_API_KEY`, `VOYAGE_API_KEY` (**required**; the stack's health checks
+never call Voyage, so a wrong or revoked key shows up as sessions that fail to build, which `/kernel` lists) and `KT_TOKEN`
+(`openssl rand -hex 24`). Leave `KT_BONFIRE_ID` as `hermes`. Then:
 
 ```bash
 docker compose build        # slow the first time: it builds the memory-kernel image and downloads its models
 docker compose up -d --wait
-```
-
-Install the plugin into Hermes and give it the token:
-
-```bash
 hermes plugins install Bonfires-ai/hermes-kernel/plugin --enable
 hermes memory setup         # arrow up to "hermes-kernel", Enter; Enter for the URL; paste KT_TOKEN
 hermes plugins enable hermes-kernel
 ```
 
 `hermes memory setup` writes the token to `~/.hermes/.env` as `HERMES_KERNEL_TOKEN`. Use the menu: in Hermes v0.23.0,
-`hermes memory setup hermes-kernel` (naming the provider) only switches it on and does not ask for the token. If you
-would rather not use the menu, add that line yourself and run `hermes config set memory.provider hermes-kernel`. The URL defaults to
-`http://127.0.0.1:8787`; set `HERMES_KERNEL_URL` to change it.
+`hermes memory setup hermes-kernel` (naming the provider) only switches it on and does not ask for the token. The URL
+defaults to `http://127.0.0.1:8787`; set `HERMES_KERNEL_URL` to change it.
 
 Start a new Hermes session. In it, type `/kernel`: it should say `Saving.`
 
 **If Hermes was already running** (its background gateway stays up for ten minutes after a chat, and for good if you run
-it as a service), these steps reach it with nothing restarted. That is why `hermes plugins enable` comes last: it makes a
+it as a service), the install reaches it with nothing restarted. That is why `hermes plugins enable` comes last: it makes a
 running gateway reload its plugins, and by then the token is there. If you run the steps in another order, or add the
 token later, memory still starts, and `/kernel` says that phrases are off until you run
 `hermes gateway restart --detach`.
@@ -222,13 +229,11 @@ platform gives them, and a Hermes that serves several people shares one memory a
 
 ```bash
 git pull
-docker compose build
-docker compose up -d --wait
-hermes plugins update hermes-kernel
+./install.sh
 hermes gateway restart --detach
 ```
 
-The restart is what loads the new plugin: a running gateway keeps the code it started with. Your memory stays in its
+The script rebuilds, restarts the stack and updates the plugin; it keeps your `.env`. The restart is what loads the new plugin: a running gateway keeps the code it started with. Your memory stays in its
 Docker volumes.
 
 ## Uninstall

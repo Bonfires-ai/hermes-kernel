@@ -71,14 +71,11 @@ passes() { # passes <label> <what shows the guard let it through> <command...>
 }
 E2E=(env E2E_CONFIRM=yes E2E_PROJECT=hermes-kernel-e2e-guardprobe E2E_HERMES="$WORK/hermes-stub" "$ROOT/scripts/e2e.sh")
 DRIVE=("$PY" "$ROOT/scripts/e2e_drive.py" "$WORK/hermes-stub" "$WORK/t.txt" "$WORK/prompts.json")
-SETUP=(env E2E_SETUP_TOKEN=x "$PY" "$ROOT/scripts/e2e_setup.py" "$WORK/hermes-stub")
 for mode in unset blank real symlink trailing-space profile expanded home-elsewhere home-unset; do
   probe e2e.sh "$mode" "${E2E[@]}"
   probe e2e_drive.py "$mode" "${DRIVE[@]}"
-  probe e2e_setup.py "$mode" "${SETUP[@]}"
 done
 # Without E2E_CONFIRM, e2e.sh stops at its warning, which is past the guard and before anything is changed.
 passes e2e.sh "Nothing has been changed" env -u E2E_CONFIRM E2E_PROJECT=hermes-kernel-e2e-guardprobe E2E_HERMES="$WORK/hermes-stub" "$ROOT/scripts/e2e.sh"
 passes e2e_drive.py "called" "${DRIVE[@]}"
-passes e2e_setup.py "called" "${SETUP[@]}"
 exit $bad

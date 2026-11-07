@@ -5,6 +5,8 @@
 The first release: a Hermes plugin and a small Docker stack (memory-kernel behind a local turn service and a writer)
 that make memory-kernel a person's own Hermes memory and turn reader.
 
+- `install.sh` sets up the local stack and the plugin in one step (it follows your sticky Hermes profile, keeps `.env`, and
+  updates the plugin on a second run); the end-to-end test now goes through it.
 - Memory: finished turns go to the turn service; a closed session is built into the memory by the writer; the next
   plan recalls it. Recall is added to the model's context before it answers.
 - Phrases: a person can teach Hermes a phrase (one or more forms and a body of read-only steps), confirm it, and run it
