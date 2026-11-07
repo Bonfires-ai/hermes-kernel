@@ -3,6 +3,8 @@ sends one throwaway plan itself so no person's turn pays for it.
 
 A bonfire exists only once its first conversation is built, so the catalogue the agent sent before then is kept, not
 installed. ``tick`` waits for the bonfire, installs the kept catalogue, warms once, and says it is done.
+
+``WarmPool`` keeps one warmer per bonfire, started the first time the service is told of it, once.
 """
 
 from __future__ import annotations
@@ -72,3 +74,22 @@ async def warm_until_done(warmer: Warmer, every_s: float = WARM_EVERY_S) -> None
         except Exception:
             log.exception("kernel_turns.warm_failed")
         await asyncio.sleep(every_s)
+
+
+class WarmPool:
+    def __init__(self, mk: KernelApi, teaching: Teaching, every_s: float = WARM_EVERY_S) -> None:
+        self._mk = mk
+        self._teaching = teaching
+        self._every_s = every_s
+        #: a finished warmer stays: its bonfire is warm, and it is not started again
+        self._warmers: dict[str, asyncio.Task[None]] = {}
+
+    def ensure(self, bonfire_id: str) -> None:
+        if bonfire_id not in self._warmers:
+            warmer = Warmer(self._mk, self._teaching, bonfire_id)
+            self._warmers[bonfire_id] = asyncio.create_task(warm_until_done(warmer, self._every_s))
+
+    async def stop(self) -> None:
+        for task in self._warmers.values():
+            task.cancel()
+        await asyncio.gather(*self._warmers.values(), return_exceptions=True)

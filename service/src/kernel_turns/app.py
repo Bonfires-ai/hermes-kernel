@@ -1,19 +1,24 @@
 """The turn service's HTTP surface.
 
-Every route but ``/healthz`` needs ``Authorization: Bearer <KT_TOKEN>`` (compared in constant time); an empty
-``KT_TOKEN`` refuses every request. Routes delegate to ``TurnEngine`` and ``Teaching``; the domain exceptions they
-raise are mapped here: ``UnknownTurn`` 404, ``Refused`` 409, ``NotTeacher`` 403, ``KernelBusy`` 503
-with ``Retry-After``, ``KernelDown`` 502, an invalid body 422.
+Every route but ``/healthz`` needs ``Authorization: Bearer <key>``. The ``caller`` dependency turns the bearer into a
+``Caller`` and every ``/v1`` route takes its bonfire from that and nowhere else, so a turn, session or draft of another
+bonfire is unknown to it: 404, never 403. With no ``authenticate`` injected the key is ``KT_TOKEN`` for the one
+configured bonfire (``callers.token_check``: an empty ``KT_TOKEN`` refuses every request), warmed at start; otherwise a
+bonfire is warmed when its caller first comes.
+
+Routes delegate to ``TurnEngine`` and ``Teaching``; the domain exceptions they raise are mapped here: ``Unauthorized``
+401, ``ReadOnlyKey`` 403, ``KeysAway`` 503 with ``Retry-After``, ``UnknownTurn`` 404, ``Refused`` 409, ``NotTeacher``
+403, ``KernelBusy`` 503 with ``Retry-After``, ``KernelDown`` 502, an invalid body 422.
 """
 
-from __future__ import annotations
+# No `from __future__ import annotations` in this file: FastAPI resolves a string annotation against the module's
+# globals, and `Depends(caller)` names a local of `create_app`, so `who` would silently become a query parameter.
 
 import asyncio
 import contextlib
-import hmac
 import logging
 import math
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Annotated
@@ -23,6 +28,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from pymongo import AsyncMongoClient
 
+from kernel_turns.callers import Authenticate, Caller, KeysAway, ReadOnlyKey, Unauthorized, token_check
 from kernel_turns.calls import CallView
 from kernel_turns.config import Settings
 from kernel_turns.mk_client import KernelApi, KernelBusy, KernelDown, MkClient, MkError, NotTeacher, Refused
@@ -42,13 +48,12 @@ from kernel_turns.store import Doc, MongoTurnStore, TurnStore
 from kernel_turns.teaching import ConfirmRequest, ConfirmView, DraftView, TeachDraft, Teaching
 from kernel_turns.turns import BeginTurn, TurnEngine, TurnView, UnknownTurn
 from kernel_turns.verbs import Verb
-from kernel_turns.warm import Warmer, warm_until_done
+from kernel_turns.warm import WarmPool
 
 log = logging.getLogger(__name__)
 
-
-class Unauthorized(Exception):
-    """No bearer, a wrong one, or no ``KT_TOKEN`` configured."""
+#: how long a caller waits when keys cannot be checked
+KEYS_RETRY_AFTER_S = 5
 
 
 class CallRequest(BaseModel):
@@ -89,17 +94,6 @@ class TurnTrace(TurnRecord):
     ledger: list[LedgerRow]
 
 
-def _bearer_check(token: str) -> Callable[[str | None], Awaitable[None]]:
-    expected = token.encode("utf-8")
-
-    async def require_token(authorization: Annotated[str | None, Header()] = None) -> None:
-        scheme, _, given = (authorization or "").partition(" ")
-        if not expected or scheme.lower() != "bearer" or not hmac.compare_digest(given.encode("utf-8"), expected):
-            raise Unauthorized("a bearer token is required")
-
-    return require_token
-
-
 def _error(status: int, detail: str, headers: dict[str, str] | None = None) -> JSONResponse:
     return JSONResponse({"detail": detail}, status_code=status, headers=headers)
 
@@ -107,6 +101,12 @@ def _error(status: int, detail: str, headers: dict[str, str] | None = None) -> J
 def _install_errors(app: FastAPI) -> None:
     async def unauthorized(_: Request, exc: Exception) -> JSONResponse:
         return _error(401, str(exc), {"WWW-Authenticate": "Bearer"})
+
+    async def read_only(_: Request, exc: Exception) -> JSONResponse:
+        return _error(403, str(exc))
+
+    async def keys_away(_: Request, exc: Exception) -> JSONResponse:
+        return _error(503, str(exc), {"Retry-After": str(KEYS_RETRY_AFTER_S)})
 
     async def not_found(_: Request, exc: Exception) -> JSONResponse:
         return _error(404, str(exc))
@@ -130,6 +130,8 @@ def _install_errors(app: FastAPI) -> None:
         return _error(409, exc.detail if isinstance(exc, MkError) else str(exc))  # PlanGone, should one surface
 
     app.add_exception_handler(Unauthorized, unauthorized)
+    app.add_exception_handler(ReadOnlyKey, read_only)
+    app.add_exception_handler(KeysAway, keys_away)
     app.add_exception_handler(UnknownTurn, not_found)
     app.add_exception_handler(Refused, refused)
     app.add_exception_handler(NotTeacher, not_teacher)
@@ -157,9 +159,11 @@ def create_app(
     store: TurnStore | None = None,
     sessions: SessionStore | None = None,
     clock: Callable[[], datetime] | None = None,
+    authenticate: Authenticate | None = None,
 ) -> FastAPI:
     """The app over ``settings``; ``mk`` and ``store`` are injected by tests (default: ``MkClient`` and
-    ``MongoTurnStore``, owned and closed by the app)."""
+    ``MongoTurnStore``, owned and closed by the app). ``authenticate`` says who a bearer is (default: ``token_check``
+    over ``KT_TOKEN`` and ``KT_BONFIRE_ID``)."""
     client: MkClient | None = None
     kernel: KernelApi
     if mk is None:
@@ -194,6 +198,18 @@ def create_app(
     )
     engine = TurnEngine(kernel, turns_store)
     teaching = Teaching(kernel, turns_store)
+    warm = WarmPool(kernel, teaching)
+    check = (
+        token_check(settings.token.get_secret_value(), settings.bonfire_id) if authenticate is None else authenticate
+    )
+
+    async def caller(authorization: Annotated[str | None, Header()] = None) -> Caller:
+        scheme, _, bearer = (authorization or "").partition(" ")
+        if scheme.lower() != "bearer" or not bearer:
+            raise Unauthorized("a bearer token is required")
+        who = await check(bearer)
+        warm.ensure(who.bonfire_id)
+        return who
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -202,13 +218,12 @@ def create_app(
         if mongo_sessions is not None and session_store is mongo_sessions:
             await mongo_sessions.ensure_indexes()  # one open session per chat
         sweeper = asyncio.create_task(_close_quiet_sessions(take))
-        warmer = asyncio.create_task(warm_until_done(Warmer(kernel, teaching, settings.bonfire_id)))
+        if authenticate is None:  # the one bonfire is known now, and no person's turn should pay for warming it
+            warm.ensure(settings.bonfire_id)
         try:
             yield
         finally:
-            warmer.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await warmer
+            await warm.stop()
             sweeper.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await sweeper
@@ -219,21 +234,23 @@ def create_app(
 
     # No generated docs or schema: only /healthz is open without the bearer.
     app = FastAPI(title="kernel-turns", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+    app.state.caller = caller
     _install_errors(app)
-    v1 = APIRouter(prefix="/v1", dependencies=[Depends(_bearer_check(settings.token.get_secret_value()))])
+    # On the router too, so a route that forgets `who` is still closed. It runs once per request either way.
+    v1 = APIRouter(prefix="/v1", dependencies=[Depends(caller)])
 
     @v1.post("/turns")
-    async def begin_turn(req: BeginTurn) -> TurnView:
-        return await engine.begin(settings.bonfire_id, req)
+    async def begin_turn(who: Annotated[Caller, Depends(caller)], req: BeginTurn) -> TurnView:
+        return await engine.begin(who.bonfire_id, req)
 
     @v1.get("/turns/{turn_id}")
-    async def get_turn(turn_id: str) -> TurnView:
-        return await engine.get(settings.bonfire_id, turn_id)
+    async def get_turn(who: Annotated[Caller, Depends(caller)], turn_id: str) -> TurnView:
+        return await engine.get(who.bonfire_id, turn_id)
 
     @v1.post("/turns/{turn_id}/calls")
-    async def call_tool(turn_id: str, req: CallRequest) -> CallView:
+    async def call_tool(who: Annotated[Caller, Depends(caller)], turn_id: str, req: CallRequest) -> CallView:
         try:
-            return await engine.call(settings.bonfire_id, turn_id, req.tool, req.args)
+            return await engine.call(who.bonfire_id, turn_id, req.tool, req.args)
         except MkError as exc:
             # The class and how many arguments, so a failure can be read from the logs: never `detail`, which can quote
             # what the person said.
@@ -244,54 +261,63 @@ def create_app(
             raise
 
     @v1.post("/turns/{turn_id}/offers")
-    async def offer_phrase(turn_id: str, req: OfferRequest) -> TurnView:
-        return await engine.offer(settings.bonfire_id, turn_id, req.forms, req.body, req.defaults)
+    async def offer_phrase(who: Annotated[Caller, Depends(caller)], turn_id: str, req: OfferRequest) -> TurnView:
+        return await engine.offer(who.bonfire_id, turn_id, req.forms, req.body, req.defaults)
 
     @v1.post("/turns/{turn_id}/report")
-    async def report_step(turn_id: str, req: ReportRequest) -> TurnView:
-        return await engine.report(settings.bonfire_id, turn_id, req.step_id, req.verdict, req.value, req.detail)
+    async def report_step(who: Annotated[Caller, Depends(caller)], turn_id: str, req: ReportRequest) -> TurnView:
+        return await engine.report(who.bonfire_id, turn_id, req.step_id, req.verdict, req.value, req.detail)
 
     @v1.post("/turns/{turn_id}/retry")
-    async def retry_step(turn_id: str) -> TurnView:
-        return await engine.retry(settings.bonfire_id, turn_id)
+    async def retry_step(who: Annotated[Caller, Depends(caller)], turn_id: str) -> TurnView:
+        return await engine.retry(who.bonfire_id, turn_id)
 
     @v1.post("/teaching")
-    async def teach(req: TeachDraft) -> DraftView:
-        return await teaching.begin(settings.bonfire_id, req)
+    async def teach(who: Annotated[Caller, Depends(caller)], req: TeachDraft) -> DraftView:
+        return await teaching.begin(who.bonfire_id, req)
 
     @v1.post("/teaching/{draft_id}/confirm")
-    async def confirm(draft_id: str, req: ConfirmRequest) -> ConfirmView:
-        return await teaching.confirm(settings.bonfire_id, draft_id, req)
+    async def confirm(who: Annotated[Caller, Depends(caller)], draft_id: str, req: ConfirmRequest) -> ConfirmView:
+        return await teaching.confirm(who.bonfire_id, draft_id, req)
 
     @v1.put("/groups/{platform}/{group}/catalogue/{source}", status_code=204)
-    async def put_catalogue(platform: str, group: str, source: Runner, catalogue: dict[str, JsonValue]) -> Response:
-        await teaching.put_catalogue(settings.bonfire_id, platform, group, catalogue, source)
+    async def put_catalogue(
+        who: Annotated[Caller, Depends(caller)],
+        platform: str,
+        group: str,
+        source: Runner,
+        catalogue: dict[str, JsonValue],
+    ) -> Response:
+        await teaching.put_catalogue(who.bonfire_id, platform, group, catalogue, source)
         return Response(status_code=204)
 
     @v1.get("/groups/{platform}/{group}/verbs")
-    async def verbs(platform: str, group: str) -> list[Verb]:
-        return await teaching.verbs(settings.bonfire_id, platform, group)
+    async def verbs(who: Annotated[Caller, Depends(caller)], platform: str, group: str) -> list[Verb]:
+        return await teaching.verbs(who.bonfire_id, platform, group)
 
     @v1.get("/groups/{platform}/{group}/turns")
     async def recent_turns(
-        platform: str, group: str, limit: Annotated[int, Query(ge=1, le=200)] = 20
+        who: Annotated[Caller, Depends(caller)],
+        platform: str,
+        group: str,
+        limit: Annotated[int, Query(ge=1, le=200)] = 20,
     ) -> list[TurnTrace]:
         return [
             TurnTrace(**turn.model_dump(), ledger=ledger)
-            for turn, ledger in await engine.recent(settings.bonfire_id, platform, group, limit)
+            for turn, ledger in await engine.recent(who.bonfire_id, platform, group, limit)
         ]
 
     @v1.post("/messages")
-    async def add_messages(req: AddRequest) -> AddResult:
-        return await take.add(settings.bonfire_id, req.messages, req.agent_handles)
+    async def add_messages(who: Annotated[Caller, Depends(caller)], req: AddRequest) -> AddResult:
+        return await take.add(who.bonfire_id, req.messages, req.agent_handles)
 
     @v1.post("/sessions/close")
-    async def close_session(req: CloseRequest) -> CloseResult:
-        return CloseResult(closed=await take.close(settings.bonfire_id, req.conversation_id))
+    async def close_session(who: Annotated[Caller, Depends(caller)], req: CloseRequest) -> CloseResult:
+        return CloseResult(closed=await take.close(who.bonfire_id, req.conversation_id))
 
     @v1.post("/sessions/{session_id}/retry")
-    async def retry_session(session_id: str) -> Response:
-        outcome = await take.retry(settings.bonfire_id, session_id)
+    async def retry_session(who: Annotated[Caller, Depends(caller)], session_id: str) -> Response:
+        outcome = await take.retry(who.bonfire_id, session_id)
         if outcome == "unknown":
             raise HTTPException(404, f"no session {session_id!r}")
         if outcome == "not_failed":
@@ -299,17 +325,17 @@ def create_app(
         return Response(status_code=204)
 
     @v1.post("/context")
-    async def recall(req: ContextRequest) -> ContextView:
+    async def recall(who: Annotated[Caller, Depends(caller)], req: ContextRequest) -> ContextView:
         try:
-            text, degraded = await kernel.context(settings.bonfire_id, req.query, req.speaker)
+            text, degraded = await kernel.context(who.bonfire_id, req.query, req.speaker)
         except MkError as exc:  # no bonfire yet, busy or away: never an error for the plugin
             log.info("kernel_turns.context_unavailable: %s", exc)
             return ContextView(context="", degraded=True)
         return ContextView(context=text, degraded=degraded)
 
     @v1.get("/status")
-    async def status() -> StatusView:
-        return await build_status(kernel, session_store, settings.bonfire_id)
+    async def status(who: Annotated[Caller, Depends(caller)]) -> StatusView:
+        return await build_status(kernel, session_store, who.bonfire_id)
 
     app.include_router(v1)
 

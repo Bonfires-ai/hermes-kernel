@@ -13,7 +13,8 @@ confirm then needs no ``yes`` frame, and everything else still holds.
 A group's catalogue is the agent's tools: installed in ``mk serve`` (``PUT …/catalogue``) and stored once the kernel
 accepts it. The turn engine reads the stored copy for what a turn affords.
 
-Every public method names the bonfire first: a turn of another bonfire is unknown here too.
+Every public method names the bonfire first: a turn or a draft of another bonfire is unknown here too. The kernel
+would answer 409 for a draft it does not hold, so ``confirm`` looks in the bonfire's constructions first.
 """
 
 from __future__ import annotations
@@ -123,6 +124,11 @@ def _rows(catalogue: dict[str, JsonValue] | None) -> list[dict[str, JsonValue]]:
     ]
 
 
+def _draft_of(row: dict[str, JsonValue]) -> JsonValue:
+    provenance = row.get("provenance")
+    return provenance.get("draft_id") if isinstance(provenance, dict) else None
+
+
 def _strings(value: JsonValue) -> list[str]:
     return [v for v in value if isinstance(v, str)] if isinstance(value, list) else []
 
@@ -158,7 +164,7 @@ class Teaching:
     def __init__(self, mk: KernelApi, store: TurnStore) -> None:
         self._mk = mk
         self._store = store
-        self._installing: dict[tuple[str, str], asyncio.Lock] = {}
+        self._installing: dict[tuple[str, str, str], asyncio.Lock] = {}
 
     async def _afforded(
         self,
@@ -240,7 +246,18 @@ class Teaching:
             previous.model_copy(update={"offer": offer.model_copy(update={"drafted": draft_id})})
         )
 
+    async def _require_draft(self, bonfire_id: str, draft_id: str) -> None:
+        """``UnknownTurn`` unless the bonfire's constructions hold the draft. When they cannot be read, the kernel
+        answers the confirm, within that same bonfire."""
+        try:
+            rows = await self._mk.constructions(bonfire_id)
+        except MkError:
+            return
+        if not any(_draft_of(row) == draft_id for row in rows):
+            raise UnknownTurn(f"no staged draft {draft_id!r}")
+
     async def confirm(self, bonfire_id: str, draft_id: str, req: ConfirmRequest) -> ConfirmView:
+        await self._require_draft(bonfire_id, draft_id)
         if req.card:
             await self._card_afforded(bonfire_id, req)
         else:
@@ -273,7 +290,7 @@ class Teaching:
         kernel last accepted installs nothing: every install drops the bonfire's in-flight plans. A bonfire that does
         not exist yet (``NotFounded``) keeps the agent source and answers as if installed; the merged catalogue is
         stored only once the kernel has it, so the same catalogue is installed after founding."""
-        async with self._installing.setdefault((platform, group), asyncio.Lock()):
+        async with self._installing.setdefault((bonfire_id, platform, group), asyncio.Lock()):
             held = await self._store.source(bonfire_id, platform, group, source)
             merged = merge_sources(catalogue)
             # stored only once the kernel has taken it
@@ -293,7 +310,7 @@ class Teaching:
         when nothing is kept; False when the bonfire does not exist yet, or the kernel refused or was away (retry
         later)."""
         for platform, group in await self._store.kept_groups(bonfire_id, "agent"):
-            async with self._installing.setdefault((platform, group), asyncio.Lock()):
+            async with self._installing.setdefault((bonfire_id, platform, group), asyncio.Lock()):
                 source = await self._store.source(bonfire_id, platform, group, "agent")
                 if source is None:
                     continue

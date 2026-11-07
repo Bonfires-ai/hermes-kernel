@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from kernel_turns.mk_client import NotTeacher, Refused
+from kernel_turns.mk_client import KernelBusy, NotTeacher, Refused
 from kernel_turns.models import JsonValue, UseRecord
 from kernel_turns.store import MemoryTurnStore
 from kernel_turns.teaching import ConfirmRequest, TeachDraft, Teaching
@@ -80,6 +82,7 @@ async def test_teach_needs_the_editor_affordance() -> None:
         await teaching.begin(BONFIRE, _draft(turn_id=plain))
     assert mk.calls_of("teach") == []  # nothing reached the kernel
     confirm = ConfirmRequest(platform="telegram", group="-100777", by="Kira Dace", turn_id=plain)
+    mk.rows = [{"id": "brew.d1.0", "status": "staged", "provenance": {"teacher": "Milo", "draft_id": "d1"}}]
     with pytest.raises(Refused, match="confirm_phrase is not afforded"):
         await teaching.confirm(BONFIRE, "d1", confirm)
     assert mk.calls_of("confirm") == []
@@ -255,9 +258,9 @@ async def test_a_confirm_refused_while_a_draft_waits_tells_the_person_to_answer_
     mk.rows = [{"id": "brew.d1.0", "status": "staged", "provenance": {"teacher": "Milo", "draft_id": "d1"}}]
     with pytest.raises(Refused, match="confirm_phrase is not afforded"):
         await teaching.confirm(BONFIRE, "d1", request)
-    # and with no draft staged at all
+    # and with no draft at all there is nothing to refuse: the bonfire does not hold it
     mk.rows = []
-    with pytest.raises(Refused, match="confirm_phrase is not afforded"):
+    with pytest.raises(UnknownTurn, match="no staged draft 'd1'"):
         await teaching.confirm(BONFIRE, "d1", request)
 
 
@@ -308,7 +311,7 @@ async def test_a_card_needs_a_draft_of_this_person_waiting() -> None:
     store = MemoryTurnStore()
     teaching = Teaching(mk, store)
     turn = await afforded_turn(store, "web_search", turn_id="t-card")
-    with pytest.raises(Refused):  # nothing staged at all
+    with pytest.raises(UnknownTurn):  # nothing staged at all
         await teaching.confirm(BONFIRE, "d1", _card(turn))
     mk.rows = [{"id": "brew.d1.0", "status": "staged", "provenance": {"teacher": "Milo", "draft_id": "d1"}}]
     with pytest.raises(Refused):  # staged by somebody else
@@ -362,3 +365,95 @@ async def test_without_card_no_yes_frame_is_still_refused() -> None:
             BONFIRE, "d1", ConfirmRequest(platform="telegram", group="-100777", by="Kira Dace", turn_id=plain)
         )
     assert mk.calls_of("confirm") == []
+
+
+def _confirm(turn: str, *, card: bool = False) -> ConfirmRequest:
+    return ConfirmRequest(platform="telegram", group="-100777", by="Kira Dace", turn_id=turn, card=card)
+
+
+@pytest.mark.parametrize("card", [False, True])
+async def test_confirm_of_a_draft_this_bonfire_does_not_hold_is_unknown(card: bool) -> None:
+    mk = FakeMk()
+    store = MemoryTurnStore()
+    teaching = Teaching(mk, store)
+    theirs = await afforded_turn(store, "teach_phrase", bonfire_id="a", turn_id="t-a")
+    mine = await afforded_turn(store, "confirm_phrase", bonfire_id="b", turn_id="t-b")
+    held = await teaching.begin("a", _draft(turn_id=theirs))
+    with pytest.raises(UnknownTurn, match=f"no staged draft '{held.draft_id}'"):
+        await teaching.confirm("b", held.draft_id, _confirm(mine, card=card))
+    assert mk.calls_of("confirm") == []
+
+
+async def test_a_draft_held_goes_to_the_kernel_even_once_kept() -> None:
+    mk = FakeMk()
+    store = MemoryTurnStore()
+    teaching = Teaching(mk, store)
+    turn = await afforded_turn(store, "teach_phrase", "confirm_phrase")
+    held = await teaching.begin(BONFIRE, _draft(turn_id=turn))
+    await teaching.confirm(BONFIRE, held.draft_id, _confirm(turn))
+    await teaching.confirm(BONFIRE, held.draft_id, _confirm(turn))
+    assert len(mk.calls_of("confirm")) == 2  # what the kernel says of a second confirm stays the kernel's to say
+
+
+async def test_when_the_constructions_cannot_be_read_the_kernel_answers_the_confirm() -> None:
+    mk = FakeMk()
+    store = MemoryTurnStore()
+    teaching = Teaching(mk, store)
+    turn = await afforded_turn(store, "confirm_phrase")
+    mk.unborn = True  # the kernel has no such bonfire yet: both routes answer 404
+    with pytest.raises(Refused, match="first conversation"):
+        await teaching.confirm(BONFIRE, "d1", _confirm(turn))
+    mk.unborn, mk.busy = False, True
+    with pytest.raises(KernelBusy):
+        await teaching.confirm(BONFIRE, "d1", _confirm(turn))
+    assert len(mk.calls_of("confirm")) == 2
+
+
+AGENT_A: dict[str, JsonValue] = {
+    "schema_version": "kernel-catalogue/v1",
+    "tools": [{"name": "a_tool", "x-side-effect": False}],
+}
+AGENT_B: dict[str, JsonValue] = {
+    "schema_version": "kernel-catalogue/v1",
+    "tools": [{"name": "b_tool", "x-side-effect": False}],
+}
+
+
+async def test_a_kept_catalogue_installs_only_into_its_own_bonfire() -> None:
+    mk = FakeMk()
+    mk.unborn = True
+    store = MemoryTurnStore()
+    teaching = Teaching(mk, store)
+    await teaching.put_catalogue("a", "hermes", "main", AGENT_A)  # the same group, in two bonfires: kept, not installed
+    await teaching.put_catalogue("b", "hermes", "main", AGENT_B)
+    assert mk.catalogues == {}
+    mk.unborn = False
+    assert await teaching.install_kept("a") is True
+    assert list(mk.catalogues) == ["a"]
+    assert "a_tool" in str(mk.catalogues["a"]) and "b_tool" not in str(mk.catalogues["a"])
+    assert await store.catalogue("b", "hermes", "main") is None
+    assert await teaching.install_kept("b") is True
+    assert "b_tool" in str(mk.catalogues["b"]) and "a_tool" not in str(mk.catalogues["b"])
+
+
+async def test_an_install_in_one_bonfire_never_waits_on_the_same_group_in_another() -> None:
+    class HeldInstall(FakeMk):
+        def __init__(self) -> None:
+            super().__init__()
+            self.release = asyncio.Event()
+            self.held = asyncio.Event()
+
+        async def put_catalogue(self, bonfire: str, catalogue: Mapping[str, JsonValue]) -> None:
+            if bonfire == "a":
+                self.held.set()
+                await self.release.wait()
+            await super().put_catalogue(bonfire, catalogue)
+
+    mk = HeldInstall()
+    teaching = Teaching(mk, MemoryTurnStore())
+    first = asyncio.create_task(teaching.put_catalogue("a", "hermes", "main", AGENT_A))
+    await mk.held.wait()
+    await asyncio.wait_for(teaching.put_catalogue("b", "hermes", "main", AGENT_B), 1)
+    assert list(mk.catalogues) == ["b"]
+    mk.release.set()
+    await first

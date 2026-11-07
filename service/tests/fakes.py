@@ -60,12 +60,17 @@ class FakeMk:
         self.scripts = dict(scripts or {})
         self.events = events if events is not None else []
         self.calls: list[tuple[str, JsonValue]] = []
+        #: (call, bonfire) of every call that names a bonfire
+        self.seen: list[tuple[str, str]] = []
         self.plans: dict[str, _Plan] = {}
         self.down = False
         self.busy = False
         #: the next resume dies with the process (the service stops after its ledger write)
         self.crash_on_resume = False
-        self.drafts: dict[str, dict[str, JsonValue]] = {}
+        #: (bonfire, draft id) -> the teach request: a draft belongs to its bonfire, as in the kernel
+        self.drafts: dict[tuple[str, str], dict[str, JsonValue]] = {}
+        #: bonfire -> the rows its teaches staged, listed by ``constructions`` as the kernel lists them
+        self.staged: dict[str, list[dict[str, JsonValue]]] = {}
         self.teach_answer: dict[str, JsonValue] | None = None
         self.rows: list[dict[str, JsonValue]] = []
         self.catalogues: dict[str, dict[str, JsonValue]] = {}
@@ -88,20 +93,21 @@ class FakeMk:
         body = self.calls_of("plan")[-1]
         return body.get("committed") if isinstance(body, dict) else None
 
-    def _check(self, name: str, body: JsonValue) -> None:
+    def _check(self, name: str, body: JsonValue, bonfire: str) -> None:
         self.calls.append((name, body))
+        self.seen.append((name, bonfire))
         self.events.append(name)
         if self.down:
             raise KernelDown("mk serve unreachable (ConnectError): connection refused")
         if self.busy:
             raise KernelBusy("bonfire is teaching: call again later", retry_after=2.0)
-        if self.unborn and name in ("plan", "teach", "confirm", "put_catalogue", "context"):
+        if self.unborn and name in ("plan", "teach", "confirm", "constructions", "put_catalogue", "context"):
             raise NotFounded("unknown bonfire")
 
     # -- turns ---------------------------------------------------------------------------------------------------------
 
     async def plan(self, bonfire: str, body: Mapping[str, JsonValue]) -> dict[str, JsonValue]:
-        self._check("plan", dict(body))
+        self._check("plan", dict(body), bonfire)
         self._n += 1
         plan_id = f"p{self._n}"
         turn = {k: v for k, v in body.items() if k != "committed"}
@@ -125,7 +131,7 @@ class FakeMk:
     async def resume(
         self, bonfire: str, plan_id: str, results: Sequence[Mapping[str, JsonValue]]
     ) -> dict[str, JsonValue]:
-        self._check("resume", [dict(r) for r in results])
+        self._check("resume", [dict(r) for r in results], bonfire)
         if self.crash_on_resume:
             self.crash_on_resume = False
             raise RuntimeError("the process died mid-request")
@@ -146,7 +152,7 @@ class FakeMk:
         return self._json(plan)
 
     async def retry(self, bonfire: str, plan_id: str) -> dict[str, JsonValue]:
-        self._check("retry", plan_id)
+        self._check("retry", plan_id, bonfire)
         plan = self.plans.get(plan_id)
         if plan is None:
             raise PlanGone(f"no plan {plan_id!r}")
@@ -223,41 +229,59 @@ class FakeMk:
     # -- teaching and the verb book ------------------------------------------------------------------------------------
 
     async def teach(self, bonfire: str, body: Mapping[str, JsonValue]) -> dict[str, JsonValue]:
-        self._check("teach", dict(body))
+        self._check("teach", dict(body), bonfire)
         if self.teach_answer is not None:
             return self.teach_answer
-        draft_id = f"d{len(self.drafts) + 1}"
-        self.drafts[draft_id] = dict(body)
+        draft_id = f"d{sum(held == bonfire for held, _ in self.drafts) + 1}"
+        self.drafts[bonfire, draft_id] = dict(body)
         forms = body["forms"]
+        assert isinstance(forms, list)
         specs = [{"id": f"brew.{draft_id}.{k}", "kind": "taught"} for k in range(len(forms))]
+        provenance = {"teacher": body["teacher"], "chat_id": body["chat_id"], "draft_id": draft_id}
+        self.staged.setdefault(bonfire, []).extend(
+            {
+                "id": f"brew.{draft_id}.{k}",
+                "kind": "taught",
+                "status": "staged",
+                "form": [form],
+                "meaning": [],
+                "standing": {"confirmed": 0, "uses_ok": 0, "uses_failed": 0, "uses_world": 0},
+                "provenance": {**provenance, "form": form},
+            }
+            for k, form in enumerate(forms)
+        )
         return {"draft_id": draft_id, "specs": specs, "problems": []}
 
     async def confirm(self, bonfire: str, draft_id: str, by: str) -> dict[str, JsonValue]:
-        self._check("confirm", {"draft_id": draft_id, "by": by})
-        draft = self.drafts.get(draft_id)
+        self._check("confirm", {"draft_id": draft_id, "by": by}, bonfire)
+        draft = self.drafts.get((bonfire, draft_id))
         if draft is None:
             raise Refused(f"no staged draft {draft_id!r}")
         if draft["teacher"] != by:
             raise NotTeacher(f"only {draft['teacher']} may confirm draft {draft_id}")
         specs: list[JsonValue] = [{"id": f"brew.{draft_id}.{k}"} for k in range(len(draft["forms"]))]
+        for row in self.staged.get(bonfire, []):
+            provenance = row["provenance"]
+            if isinstance(provenance, dict) and provenance["draft_id"] == draft_id:
+                row["status"] = "live"
         return {"draft_id": draft_id, "specs": specs}
 
     async def constructions(self, bonfire: str) -> list[dict[str, JsonValue]]:
-        self._check("constructions", bonfire)
-        return list(self.rows)
+        self._check("constructions", bonfire, bonfire)
+        return [*self.rows, *self.staged.get(bonfire, [])]
 
     async def get_catalogue(self, bonfire: str) -> dict[str, JsonValue]:
-        self._check("get_catalogue", bonfire)
+        self._check("get_catalogue", bonfire, bonfire)
         return self.catalogues.get(bonfire, {"sha256": None, "tools": []})
 
     async def put_catalogue(self, bonfire: str, catalogue: Mapping[str, JsonValue]) -> None:
-        self._check("put_catalogue", dict(catalogue))
+        self._check("put_catalogue", dict(catalogue), bonfire)
         if "schema_version" not in catalogue:  # the real kernel's parse_catalogue refuses it
             raise Refused("catalogue: schema_version is required")
         self.catalogues[bonfire] = dict(catalogue)
 
     async def context(self, bonfire: str, query: str, speaker: str | None) -> tuple[str, bool]:
-        self._check("context", query)
+        self._check("context", query, bonfire)
         return "", False
 
     async def health(self) -> dict[str, JsonValue]:

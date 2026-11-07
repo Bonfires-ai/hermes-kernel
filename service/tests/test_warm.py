@@ -3,12 +3,23 @@
 from __future__ import annotations
 
 import asyncio
+import time
+from collections.abc import Callable
 
+from fastapi.testclient import TestClient
+from pydantic import SecretStr
+
+from kernel_turns.app import create_app
+from kernel_turns.callers import Caller
+from kernel_turns.config import Settings
+from kernel_turns.models import JsonValue
 from kernel_turns.store import MemoryTurnStore
 from kernel_turns.teaching import Teaching
-from kernel_turns.warm import Warmer, warm_until_done
+from kernel_turns.warm import Warmer, WarmPool, warm_until_done
 from tests.fakes import FakeMk
 from tests.test_sources import AGENT, BONFIRE
+
+TOKEN = "s3cret-token"
 
 
 def _setup() -> tuple[FakeMk, Teaching, Warmer]:
@@ -89,3 +100,75 @@ async def test_a_tick_that_raises_does_not_end_the_loop() -> None:
     flaky = Flaky()
     await asyncio.wait_for(warm_until_done(flaky, every_s=0.001), 2)  # type: ignore[arg-type]
     assert flaky.n == 2
+
+
+def _founded(*bonfires: str) -> dict[str, JsonValue]:
+    return {"status": "ok", "version": "2.0.0", "bonfires": {b: {} for b in bonfires}, "spend": {}}
+
+
+def _warm_plans(mk: FakeMk) -> list[str]:
+    return sorted(bonfire for call, bonfire in mk.seen if call == "plan")
+
+
+def _settle(done: Callable[[], bool]) -> None:
+    """The warmer runs on the test client's loop, in another thread: wait for it, briefly."""
+    deadline = time.monotonic() + 2
+    while not done() and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert done()
+
+
+async def test_warm_pool_starts_one_warmer_per_bonfire() -> None:
+    mk = FakeMk()
+    mk.healthz = _founded("a", "b")
+    pool = WarmPool(mk, Teaching(mk, MemoryTurnStore()), every_s=0.001)
+    before = asyncio.all_tasks()
+    pool.ensure("a")
+    pool.ensure("a")
+    pool.ensure("b")
+    started = asyncio.all_tasks() - before
+    assert len(started) == 2
+    await asyncio.wait(started)
+    assert _warm_plans(mk) == ["a", "b"]
+    pool.ensure("a")  # once: a bonfire that is warm is not warmed again
+    assert asyncio.all_tasks() <= before
+    await pool.stop()
+
+
+async def test_stopping_the_pool_ends_a_warmer_still_waiting() -> None:
+    mk = FakeMk()  # no bonfire founded: the warmer waits
+    pool = WarmPool(mk, Teaching(mk, MemoryTurnStore()), every_s=60)
+    before = asyncio.all_tasks()
+    pool.ensure("a")
+    started = asyncio.all_tasks() - before
+    assert len(started) == 1
+    await pool.stop()
+    assert all(task.done() for task in started)
+
+
+def test_local_warms_at_start_as_before() -> None:
+    mk = FakeMk()
+    mk.healthz = _founded(BONFIRE)
+    settings = Settings(token=SecretStr(TOKEN), bonfire_id=BONFIRE)
+    with TestClient(create_app(settings, mk=mk, store=MemoryTurnStore())):  # no request is made
+        _settle(lambda: bool(_warm_plans(mk)))
+    assert _warm_plans(mk) == [BONFIRE]
+
+
+def test_with_callers_of_its_own_a_service_warms_only_the_bonfires_that_call() -> None:
+    mk = FakeMk()
+    mk.healthz = _founded(BONFIRE, "a", "b")
+
+    async def authenticate(_: str) -> Caller:
+        return Caller(bonfire_id="a")
+
+    settings = Settings(token=SecretStr(TOKEN), bonfire_id=BONFIRE)
+    app = create_app(settings, mk=mk, store=MemoryTurnStore(), authenticate=authenticate)
+    with TestClient(app) as client:
+        assert client.get("/healthz").status_code == 200  # the loop has turned: a warmer at start would have planned
+        assert _warm_plans(mk) == []
+        for _ in range(2):
+            answer = client.get("/v1/status", headers={"Authorization": "Bearer a-key"})
+            assert answer.status_code == 200, answer.text
+        _settle(lambda: bool(_warm_plans(mk)))
+    assert _warm_plans(mk) == ["a"]

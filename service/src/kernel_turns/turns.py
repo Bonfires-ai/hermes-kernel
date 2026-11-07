@@ -88,7 +88,7 @@ UNREAD_CONTEXT = "The kernel did not read this turn."
 
 
 class UnknownTurn(LookupError):
-    """This bonfire has no turn with this id."""
+    """This bonfire has no turn or draft with this id: it may be another bonfire's, which is told nothing more."""
 
 
 class BeginTurn(BaseModel):
