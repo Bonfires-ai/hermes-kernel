@@ -196,8 +196,9 @@ does itself. A step that would change something outside is refused. The plugin i
 
 The agent is always called `hermes` in memory, so a person whose platform name is `hermes` is read as the agent.
 
-Tested on the Hermes CLI. Other platforms (Telegram, Discord and the rest) are best effort: speakers are named as the
-platform gives them, and a Hermes that serves several people shares one memory among them (see the warning at the top).
+Tested on the Hermes CLI, and by hand once on Telegram: one conversation, recall in a new session and one taught
+phrase. Telegram and the other platforms (Discord and the rest) are best effort: speakers are named as the platform gives
+them, and a Hermes that serves several people shares one memory among them (see the warning at the top).
 
 ## Upgrading
 
