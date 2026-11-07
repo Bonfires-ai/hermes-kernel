@@ -10,7 +10,7 @@ from pydantic import SecretStr
 
 from kernel_turns.app import create_app
 from kernel_turns.config import Settings
-from kernel_turns.sessions import MemorySessionStore, MessageIn, SessionTake
+from kernel_turns.sessions import MemorySessionStore, MessageIn, Session, SessionTake
 from kernel_turns.store import MemoryTurnStore
 from tests.fakes import FakeMk
 
@@ -93,8 +93,52 @@ async def test_two_chats_keep_their_own_sessions() -> None:
 
 async def test_timestamps_never_run_backwards_in_a_session() -> None:
     take, store, _ = _take()
-    await take.add([_msg("m1", ts=T0 + timedelta(seconds=5)), _msg("m2", ts=T0 + timedelta(seconds=1))], HANDLES)
-    assert store.messages["m2"].timestamp > store.messages["m1"].timestamp
+    sub = timedelta(microseconds=100), timedelta(microseconds=900)  # both store as the same millisecond
+    batch = [
+        _msg("m1", ts=T0 + timedelta(seconds=5)),
+        _msg("m2", ts=T0 + timedelta(seconds=1)),  # backwards
+        _msg("m3", ts=T0 + timedelta(seconds=1)),  # equal to the bumped one
+        _msg("m4", ts=T0 + timedelta(seconds=9) + sub[0]),
+        _msg("m5", ts=T0 + timedelta(seconds=9) + sub[1]),
+    ]
+    await take.add(batch, HANDLES)
+    stamps = [store.messages[f"m{i}"].timestamp for i in range(1, 6)]
+    assert all(a < b for a, b in zip(stamps, stamps[1:], strict=False))
+    assert all(t.microsecond % 1000 == 0 for t in stamps)
+
+
+class _SweepsBetween(MemorySessionStore):
+    """Closes the open session after it was handed out and before the message lands, once."""
+
+    swept = False
+
+    async def append(
+        self, session: Session, message: MessageIn, timestamp: datetime, agent_handles: list[str], now: datetime
+    ) -> int | None:
+        if not self.swept:
+            self.swept = True
+            await self.close_session(session.id, now)
+        return await super().append(session, message, timestamp, agent_handles, now)
+
+
+async def test_a_message_never_lands_in_a_session_closed_under_it() -> None:
+    store, clock = _SweepsBetween(), Clock()
+    take = SessionTake(store, 1800, 100, clock, bonfire_id="b1")
+    await take.add([_msg("m1")], HANDLES)  # opens S, S is closed before the append
+    await take.add([_msg("m2")], HANDLES)
+    by_state = sorted((s.state, s.message_count) for s in store.sessions.values())
+    assert by_state == [("closed", 0), ("open", 2)]
+    assert len({m.session_id for m in store.messages.values()}) == 1
+
+
+async def test_a_resend_after_the_writer_removed_the_text_is_still_a_duplicate() -> None:
+    take, store, _ = _take()
+    await take.add([_msg("m1")], HANDLES)
+    await take.close("telegram:1")
+    store.messages["m1"].text = None  # the writer unsets `text` and keeps the rest
+    result = await take.add([_msg("m1")], HANDLES)
+    assert (result.accepted, result.duplicates) == (0, 1)
+    assert len(store.sessions) == 1
 
 
 @pytest.fixture

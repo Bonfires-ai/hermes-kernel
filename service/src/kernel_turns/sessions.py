@@ -12,6 +12,18 @@ The two collections below (in ``KT_MONGO_DB``) are the contract between the two 
   resend is a duplicate. ``timestamp`` is timezone-aware and strictly increasing within a session (mk refuses
   anything else).
 
+Guarantees the writer may rely on, and what it must not assume:
+
+* A message is only ever added to an ``open`` session: the add is guarded on ``state``, so a session that has been
+  closed (and perhaps built) never gains a message.
+* The writer must NOT delete a message document. To drop the text after building it removes only ``text`` (``$unset``)
+  and keeps ``_id``, ``session_id``, ``seq``, ``speaker`` and ``timestamp``, so a resent ``message_id`` stays a
+  duplicate. ``text`` may therefore be absent on a message.
+* ``timestamp`` is truncated to milliseconds (what BSON keeps) before it is ordered, so stored values are strictly
+  increasing within a session.
+* After a crash ``seq`` may have a gap or a tie and ``message_count`` may be off by one. Sort a session's messages by
+  ``(timestamp, seq)``; never assume ``seq`` is contiguous or ``message_count`` exact.
+
 A session closes after ``idle_s`` of quiet, at ``max_messages`` messages, or on request. A message for a chat with no
 open session opens a new one.
 """
@@ -34,6 +46,10 @@ log = logging.getLogger(__name__)
 Doc = dict[str, object]
 State = Literal["open", "closed", "running", "built", "failed", "held"]
 Retry = Literal["retried", "unknown", "not_failed"]
+
+
+class SessionClosed(Exception):
+    """The session was closed between being opened for an add and the add."""
 
 
 class MessageIn(BaseModel):
@@ -85,7 +101,7 @@ class StoredMessage(BaseModel):
     session_id: str
     seq: int
     speaker: str
-    text: str
+    text: str | None  #: None once the writer has removed it
     timestamp: datetime
     addressees: list[str]
 
@@ -103,7 +119,7 @@ class SessionStore(Protocol):
         self, session: Session, message: MessageIn, timestamp: datetime, agent_handles: list[str], now: datetime
     ) -> int | None:
         """Store ``message`` (at the already-ordered ``timestamp``) as the session's next; its ``seq``, or None when
-        the ``message_id`` is already stored."""
+        the ``message_id`` is already stored. Raises ``SessionClosed`` when the session is no longer open."""
         ...
 
     async def close_session(self, session_id: str, now: datetime) -> None: ...
@@ -155,6 +171,8 @@ class MemorySessionStore:
         if message.message_id in self.messages:
             return None
         stored = self.sessions[session.id]
+        if stored.state != "open":
+            raise SessionClosed(session.id)
         stored.message_count += 1
         stored.last_message_at = now
         stored.last_ts = timestamp
@@ -253,18 +271,7 @@ class MongoSessionStore:
     async def append(
         self, session: Session, message: MessageIn, timestamp: datetime, agent_handles: list[str], now: datetime
     ) -> int | None:
-        after = await self._sessions.find_one_and_update(
-            {"_id": session.id},
-            {
-                "$inc": {"message_count": 1},
-                "$set": {"last_message_at": now, "last_ts": timestamp},
-                "$addToSet": {"agent_handles": {"$each": agent_handles}},
-            },
-            return_document=ReturnDocument.AFTER,
-        )
-        if after is None:
-            raise LookupError(f"no session {session.id!r}")
-        seq = int(str(after["message_count"]))
+        seq = session.message_count + 1  # the lock orders adds; after a crash a gap or a tie is accepted
         try:
             await self._messages.insert_one(
                 {
@@ -278,8 +285,18 @@ class MongoSessionStore:
                 }
             )
         except DuplicateKeyError:
-            await self._sessions.update_one({"_id": session.id}, {"$inc": {"message_count": -1}})
             return None
+        counted = await self._sessions.update_one(
+            {"_id": session.id, "state": "open"},
+            {
+                "$inc": {"message_count": 1},
+                "$set": {"last_message_at": now, "last_ts": timestamp},
+                "$addToSet": {"agent_handles": {"$each": agent_handles}},
+            },
+        )
+        if counted.matched_count == 0:  # closed since we opened it: the message belongs in the next session
+            await self._messages.delete_one({"_id": message.message_id})
+            raise SessionClosed(session.id)
         return seq
 
     async def close_session(self, session_id: str, now: datetime) -> None:
@@ -339,19 +356,30 @@ class SessionTake:
                 if await self._store.has_message(message.message_id):
                     duplicates += 1
                     continue
-                now = self._clock()
-                session = await self._store.open_session(message.conversation_id, self._bonfire_id, agent_handles, now)
-                timestamp = message.timestamp
-                if session.last_ts is not None and timestamp <= session.last_ts:
-                    timestamp = session.last_ts + timedelta(milliseconds=1)  # mk wants strictly increasing times
-                seq = await self._store.append(session, message, timestamp, agent_handles, now)
-                if seq is None:
+                stored = await self._append(message, agent_handles)
+                if stored is None:
                     duplicates += 1
                     continue
                 accepted += 1
+                seq, session_id, now = stored
                 if seq >= self._max:
-                    await self._store.close_session(session.id, now)
+                    await self._store.close_session(session_id, now)
         return AddResult(accepted=accepted, duplicates=duplicates)
+
+    async def _append(self, message: MessageIn, agent_handles: list[str]) -> tuple[int, str, datetime] | None:
+        """Add one message to its chat's open session: ``(seq, session id, now)``, or None for a duplicate."""
+        while True:
+            now = self._clock()
+            session = await self._store.open_session(message.conversation_id, self._bonfire_id, agent_handles, now)
+            # BSON keeps milliseconds: order on what will be stored, and keep mk's times strictly increasing
+            timestamp = message.timestamp.replace(microsecond=message.timestamp.microsecond // 1000 * 1000)
+            if session.last_ts is not None and timestamp <= session.last_ts:
+                timestamp = session.last_ts + timedelta(milliseconds=1)
+            try:
+                seq = await self._store.append(session, message, timestamp, agent_handles, now)
+            except SessionClosed:
+                continue  # closed under us (the sweep): open the next one and try again
+            return None if seq is None else (seq, session.id, now)
 
     async def close(self, conversation_id: str) -> bool:
         async with self._lock:
