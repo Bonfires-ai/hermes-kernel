@@ -70,6 +70,9 @@ class CollectorCtx:
 def impl_shared(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KERNEL_TOKEN", "t")
     monkeypatch.delenv("HERMES_HOME", raising=False)
+    import hermes_constants  # pyright: ignore[reportMissingImports]
+
+    monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: tmp_path)  # never a developer's real home
     plugin._canonical()
     mod = importlib.import_module("hermes_kernel_impl.shared")
     mod.reset_shared()
@@ -78,9 +81,6 @@ def impl_shared(tmp_path, monkeypatch):
 
 
 def test_register_on_the_general_path_wires_hooks_and_tools(impl_shared, tmp_path, monkeypatch):
-    import hermes_constants  # pyright: ignore[reportMissingImports]
-
-    monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: tmp_path)
     ctx = GeneralCtx()
     plugin.register(ctx)
     assert ctx.events == ["pre_gateway_dispatch", "pre_llm_call", *TOOLS, "post_tool_call"]
@@ -107,15 +107,28 @@ def test_the_memory_path_registers_no_hooks_or_tools(impl_shared):
     assert ctx.calls == []
 
 
-def test_register_with_no_token_registers_the_provider_only(impl_shared, monkeypatch):
+def test_register_with_no_token_registers_the_provider_and_the_command_only(impl_shared, monkeypatch, caplog):
     monkeypatch.delenv("HERMES_KERNEL_TOKEN")
     impl_shared.reset_shared()
     ctx = GeneralCtx()
-    plugin.register(ctx)
-    assert ctx.tools == [] and ctx.hooks == [] and ctx.commands == {} and ctx.skills == []
+    with caplog.at_level(logging.INFO):
+        plugin.register(ctx)
+    assert ctx.tools == [] and ctx.hooks == [] and ctx.skills == []
+    assert list(ctx.commands) == ["kernel"]
+    assert "not set up" in ctx.commands["kernel"]("")
+    assert any(r.levelno == logging.ERROR and "HERMES_KERNEL_TOKEN" in r.getMessage() for r in caplog.records)
     collector = CollectorCtx()
     plugin.register(collector)
     assert len(collector.providers) == 1
+
+
+def test_a_second_register_after_a_reload_still_has_the_five_tools(impl_shared):
+    first, second = GeneralCtx(), GeneralCtx()
+    plugin.register(first)
+    plugin.register(second)  # Hermes unloaded the first registrations; the module and its state stayed
+    for ctx in (first, second):
+        assert ctx.tools == TOOLS
+        assert sorted(ctx.hooks) == ["post_tool_call", "pre_gateway_dispatch", "pre_llm_call"]
 
 
 def test_one_hook_failing_costs_only_that_hook(impl_shared, caplog):
@@ -130,17 +143,57 @@ def test_one_hook_failing_costs_only_that_hook(impl_shared, caplog):
 
 def test_status_line_says_is_it_saving():
     built = {"founded": True, "last_built_at": "2026-11-07T01:32:30Z", "failed": [], "held": None}
+    assert "Saving." in status_line(built, None)
     assert "2026-11-07T01:32:30Z" in status_line(built, None)
-    failed = {**built, "failed": [{"session_id": "s9", "reason": "boom", "attempts": 2}]}
+    failed = {**built, "failed": [{"session_id": "s9", "reason": None, "attempts": 2}]}
     line = status_line(failed, None)
-    assert "s9" in line and "/kernel retry s9" in line
-    held = {**built, "held": "spend ceiling reached"}
-    assert "docker compose exec writer mk bonfire ceiling" in status_line(held, None)
+    assert "s9" in line and "/kernel retry s9" in line and "no reason given" in line
     assert "refused the token" in status_line(built, "memory refused the token: check HERMES_KERNEL_TOKEN")
-    assert "away" in status_line(None, None)
+    assert "Saving." not in status_line(built, None, saving_known=False)
+    # service away: one true thing, never both "not saving" and "kept"
+    assert "away" in status_line(None, None) and "limit" in status_line(None, None)
+    both = status_line(None, "the spool could not be read")
+    assert "Not saving" in both and "kept" not in both
+    # mk serve away: recall is off
+    assert "Recall is off" in status_line({**built, "versions": {"service": "1", "mk": None}}, None)
+    # a long quiet waiting list is not "nothing built yet"
+    waiting = {"founded": False, "last_built_at": None, "sessions_waiting": 2, "failed": [], "held": None}
+    assert "memory starts once" not in status_line(waiting, None)
 
 
-def test_the_kernel_command_shows_status_and_retries(impl_shared):
+def test_the_ceiling_hold_gives_a_command_that_runs():
+    held = {
+        "bonfire_id": "hermes",
+        "founded": True,
+        "last_built_at": None,
+        "failed": [],
+        "held": "bonfire spend ceiling reached: bonfire 'hermes' has spent $19.9 of $20; this run's estimate is $1",
+        "spend": {"charged_usd": 19.9, "ceiling_usd": 20.0},
+    }
+    line = status_line(held, None)
+    assert "docker compose exec writer mk bonfire ceiling hermes <new total in USD>" in line
+    assert "hermes-kernel directory" in line and "Spent $19.90 of $20.00" in line and "long session" in line
+    assert "Spent $" not in status_line({**held, "spend": None}, None)
+    other = status_line({**held, "held": "cannot found bonfire hermes: OPENROUTER_API_KEY is unset"}, None)
+    assert "OPENROUTER_API_KEY is unset" in other and "mk bonfire ceiling" not in other
+
+
+@pytest.fixture
+def provider_config(monkeypatch):
+    import hermes_cli.config  # pyright: ignore[reportMissingImports]
+
+    state = {"cfg": {"memory": {"provider": "hermes-kernel"}}}
+
+    def load():
+        if state["cfg"] is None:
+            raise OSError("unreadable")
+        return state["cfg"]
+
+    monkeypatch.setattr(hermes_cli.config, "load_config_readonly", load)
+    return state
+
+
+def test_the_kernel_command_shows_status_and_retries(impl_shared, provider_config):
     ctx = GeneralCtx()
     plugin.register(ctx)
     sh = impl_shared.get_shared()
@@ -150,8 +203,8 @@ def test_the_kernel_command_shows_status_and_retries(impl_shared):
         def status(self):
             return {"founded": True, "last_built_at": "T", "failed": [], "held": None}
 
-        def retry_session(self, sid):
-            calls.append(sid)
+        def retry_session(self, sid, timeout=30.0):
+            calls.append((sid, timeout))
 
         def close(self):
             pass
@@ -159,12 +212,34 @@ def test_the_kernel_command_shows_status_and_retries(impl_shared):
     sh.client = Client()
     kernel = ctx.commands["kernel"]
     assert "T" in kernel("")
-    assert "s9" in kernel("retry s9", session_id="x") and calls == ["s9"]
+    assert "s9" in kernel("retry s9", session_id="x") and calls == [("s9", 5.0)]
     assert "session id" in kernel("retry")
+    assert "retry <session id>" in kernel("retyr s1") and "Last built" not in kernel("retyr s1")
 
     def away():
-        # the impl's own class: the package is loaded once under its canonical name
         raise sys.modules["hermes_kernel_impl.client"].Unavailable("down")
 
     sh.client.status = away
     assert "away" in kernel("")
+
+
+def test_the_command_does_not_say_saving_when_the_provider_is_not_selected(impl_shared, provider_config):
+    ctx = GeneralCtx()
+    plugin.register(ctx)
+    sh = impl_shared.get_shared()
+
+    class Client:
+        def status(self):
+            return {"founded": True, "last_built_at": "T", "failed": [], "held": None}
+
+        def close(self):
+            pass
+
+    sh.client = Client()
+    kernel = ctx.commands["kernel"]
+    provider_config["cfg"] = {"memory": {"provider": ""}}
+    answer = kernel("")
+    assert "Saving." not in answer and "memory.provider is not hermes-kernel" in answer
+    assert "hermes config set memory.provider hermes-kernel" in answer
+    provider_config["cfg"] = None  # Hermes's config cannot be read: do not claim it
+    assert "Saving." not in kernel("")

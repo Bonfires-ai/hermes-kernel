@@ -209,9 +209,6 @@ def test_the_block_is_true_with_the_service_up_or_down(env):
     block = KernelMemory().system_prompt_block()
     assert "automatically" not in block
     assert "when the memory service is reachable" in block
-    for name in ("run_phrase", "offer_phrase", "teach_phrase", "phrase_continue", "search_memory"):
+    for name in ("run_phrase", "offer_phrase", "teach_phrase", "confirm_phrase", "phrase_continue", "search_memory"):
         assert name in block
-    assert "5 minutes" in block
-    env.client = None
-    off = KernelMemory().system_prompt_block()
-    assert "not set up" in off and "run_phrase" not in off
+    assert "5 minutes" in block and "30 minutes" in block

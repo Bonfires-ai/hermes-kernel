@@ -99,7 +99,6 @@ def register(ctx) -> None:
         from .turns import KernelTurns
 
         shared = get_shared()
-        new_tools = None
         with shared.lock:
             if shared.turns is None and shared.client is not None:
                 try:
@@ -115,20 +114,21 @@ def register(ctx) -> None:
                 shared.turns = KernelTurns(shared.client, source=source, call_log=call_log)
             if shared.tools is None and shared.turns is not None and shared.client is not None:
                 shared.runs = PhraseRun(shared.client, shared.source, ctx.dispatch_tool, StepLedger(_ledger_path()))
-                shared.tools = new_tools = KernelTools(
-                    shared.client, shared.turns, shared.runs, shared.source, shared.editor
-                )
-            turns, call_log = shared.turns, shared.call_log
+                shared.tools = KernelTools(shared.client, shared.turns, shared.runs, shared.source, shared.editor)
+            turns, call_log, tools = shared.turns, shared.call_log, shared.tools
         if turns is not None:
             _fenced("the gateway hook", ctx.register_hook, "pre_gateway_dispatch", turns.on_gateway_dispatch)
             _fenced("the prompt hook", ctx.register_hook, "pre_llm_call", turns.on_pre_llm_call)
-        if new_tools is not None:
-            register_tools(ctx, new_tools)  # once: Hermes defers them behind `tool_search` (v0.23.0)
+        if tools is not None:  # every load: a reload unloads the registrations but the module and its state stay
+            register_tools(ctx, tools)  # Hermes defers them behind `tool_search` (v0.23.0)
         if call_log is not None:
             _fenced("the tool-call hook", ctx.register_hook, "post_tool_call", call_log.on_post_tool_call)
-        if turns is not None:  # no token: the provider alone says so, visibly
-            _fenced("the /kernel command", _register_command, ctx)
+        _fenced("the /kernel command", _register_command, ctx)  # with no token too: that is when it is needed
+        if turns is not None:
             _fenced("the skill", _register_skill, ctx)
-        log.info("hermes-kernel loaded (general path)")
+        else:
+            log.error("hermes-kernel is not configured: HERMES_KERNEL_TOKEN is not set, so there is no memory")
+        if turns is not None:
+            log.info("hermes-kernel loaded (general path)")
         return
     ctx.register_memory_provider(KernelMemory())
