@@ -52,7 +52,7 @@ scan() { # scan <label> <grep args...>
 # Generic. The brackets keep this file from matching its own patterns.
 scan "a home-directory path" -E '[/]home[/]'
 scan "something shaped like an sk- key" -E '(^|[^A-Za-z0-9])sk-[A-Za-z0-9_-]{10,}'
-scan "something shaped like a bf_ token" -E '(^|[^A-Za-z0-9])bf_[A-Za-z0-9]{16,}'
+scan "something shaped like a bf_ token" -E '(^|[^A-Za-z0-9])bf_[A-Za-z0-9_-]{16,}'
 
 # Private.
 mode="generic and private names"

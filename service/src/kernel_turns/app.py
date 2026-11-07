@@ -28,7 +28,15 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from pymongo import AsyncMongoClient
 
-from kernel_turns.callers import Authenticate, Caller, KeysAway, ReadOnlyKey, Unauthorized, token_check
+from kernel_turns.callers import (
+    Authenticate,
+    Caller,
+    KeyCheck,
+    KeysAway,
+    ReadOnlyKey,
+    Unauthorized,
+    token_check,
+)
 from kernel_turns.calls import CallView
 from kernel_turns.config import Settings
 from kernel_turns.mk_client import KernelApi, KernelBusy, KernelDown, MkClient, MkError, NotTeacher, Refused
@@ -199,9 +207,15 @@ def create_app(
     engine = TurnEngine(kernel, turns_store)
     teaching = Teaching(kernel, turns_store)
     warm = WarmPool(kernel, teaching)
-    check = (
-        token_check(settings.token.get_secret_value(), settings.bonfire_id) if authenticate is None else authenticate
-    )
+    key_check: KeyCheck | None = None
+    check: Authenticate
+    if authenticate is not None:
+        check = authenticate
+    elif settings.auth_url is not None:
+        key_check = check = KeyCheck(settings.auth_url, settings.auth_token.get_secret_value())
+    else:
+        assert settings.bonfire_id is not None  # Settings: local means a bonfire
+        check = token_check(settings.token.get_secret_value(), settings.bonfire_id)
 
     async def caller(authorization: Annotated[str | None, Header()] = None) -> Caller:
         scheme, _, bearer = (authorization or "").partition(" ")
@@ -218,7 +232,7 @@ def create_app(
         if mongo_sessions is not None and session_store is mongo_sessions:
             await mongo_sessions.ensure_indexes()  # one open session per chat
         sweeper = asyncio.create_task(_close_quiet_sessions(take))
-        if authenticate is None:  # the one bonfire is known now, and no person's turn should pay for warming it
+        if settings.bonfire_id is not None and authenticate is None:  # the one bonfire is known now
             warm.ensure(settings.bonfire_id)
         try:
             yield
@@ -229,6 +243,8 @@ def create_app(
                 await sweeper
             if client is not None:
                 await client.aclose()
+            if key_check is not None:
+                await key_check.aclose()
             if mongo is not None:
                 await mongo.close()
 

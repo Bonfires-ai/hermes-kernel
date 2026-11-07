@@ -1,4 +1,4 @@
-"""``python -m kernel_turns``: the turn service on 0.0.0.0:8000 (the compose service ``kernel-turns``)."""
+"""``python -m kernel_turns``: the turn service on 0.0.0.0:``KT_PORT`` (8000; the compose service ``kernel-turns``)."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from kernel_turns.config import Settings
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     settings = Settings()  # pyright: ignore[reportCallIssue] - the fields come from KT_* in the environment
-    uvicorn.run(create_app(settings), host="0.0.0.0", port=8000)
+    uvicorn.run(create_app(settings), host="0.0.0.0", port=settings.port)
 
 
 if __name__ == "__main__":
