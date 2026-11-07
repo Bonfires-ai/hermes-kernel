@@ -3,8 +3,7 @@ FROM python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PIP_NO_CACHE_DIR=1 \
-    PYTHONPATH=/app/src
+    PIP_NO_CACHE_DIR=1
 
 # git: the kernel is a git install. build-essential: a few transitive wheels (pyfcg, sentencepiece) may compile.
 RUN apt-get update \
@@ -13,13 +12,13 @@ RUN apt-get update \
 
 # The parser extra pulls torch; the default Linux wheel carries CUDA (gigabytes) and this service has no GPU.
 ARG TORCH_INDEX=https://download.pytorch.org/whl/cpu
-RUN pip install --index-url "${TORCH_INDEX}" "torch>=2.5,<3"
+RUN pip install --index-url "${TORCH_INDEX}" "torch==2.15.0"
 
-# pymongo>=4.13: the kernel's `ops` extra asks only for >=4.
-RUN pip install "arq>=0.26.0" "pydantic>=2.13.0" "pydantic-settings>=2.6.0" "pymongo>=4.13" httpx
+# Pinned exactly, from `pip freeze` in the image built with them; the writer needs pymongo, pydantic-settings and httpx.
+RUN pip install "pydantic==2.14.3" "pydantic-settings==2.16.2" "pymongo==4.19.0" "httpx==0.28.1"
 
 # build: the FCG engine; parser: the syntactic parser; serve: fastapi/uvicorn; ops: pymongo for kernel_ops.
-ARG MK_VERSION=2.0.0
+ARG MK_VERSION=2.0.1
 RUN pip install "memory-kernel[build,parser,serve,ops] @ git+https://github.com/Bonfires-ai/memory-kernel@v${MK_VERSION}"
 
 # Runtime data lives in the image, not on a volume.
