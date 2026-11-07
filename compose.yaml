@@ -3,6 +3,7 @@ name: hermes-kernel
 services:
   neo4j:
     image: neo4j:5.26-community
+    restart: unless-stopped
     hostname: neo4j
     extra_hosts:
       - "neo4j:127.0.0.1"
@@ -27,6 +28,7 @@ services:
 
   mongo:
     image: mongo:7
+    restart: unless-stopped
     volumes:
       - mongo-data:/data/db
     networks: [kernel]
@@ -39,6 +41,7 @@ services:
 
   mk-serve:
     image: hermes-kernel-mk:${MK_VERSION:-2.0.0}
+    restart: unless-stopped
     build: &mk-build
       # The repo root: the image also installs writer/.
       context: .
@@ -67,6 +70,7 @@ services:
   # The writer: reads closed sessions from Mongo and builds them into the bonfire. Same image as mk-serve.
   writer:
     image: hermes-kernel-mk:${MK_VERSION:-2.0.0}
+    restart: unless-stopped
     build: *mk-build
     command: ["python", "-m", "hermes_writer"]
     environment:
@@ -94,6 +98,7 @@ services:
   # The turn service: the one published port, on loopback.
   turn-service:
     image: hermes-kernel-turns:latest
+    restart: unless-stopped
     build:
       context: .
       dockerfile: images/service/Dockerfile

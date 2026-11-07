@@ -94,6 +94,8 @@ class Session(BaseModel):
     reason: str | None = None
     built_at: datetime | None = None
     last_ts: datetime | None = None
+    #: the writer's: a stopped session is not tried again before this
+    retry_after: datetime | None = None
 
 
 class StoredMessage(BaseModel):
@@ -133,7 +135,7 @@ class SessionStore(Protocol):
         ...
 
     async def retry(self, session_id: str) -> Retry:
-        """``failed`` back to ``closed`` with ``reason`` cleared and ``attempts`` 0."""
+        """``failed`` back to ``closed`` with ``reason`` cleared, ``attempts`` 0 and no ``retry_after``."""
         ...
 
     async def waiting(self, bonfire_id: str) -> list[Session]:
@@ -223,7 +225,7 @@ class MemorySessionStore:
             return "unknown"
         if session.state != "failed":
             return "not_failed"
-        session.state, session.reason, session.attempts = "closed", None, 0
+        session.state, session.reason, session.attempts, session.retry_after = "closed", None, 0, None
         return "retried"
 
     async def waiting(self, bonfire_id: str) -> list[Session]:
@@ -338,7 +340,8 @@ class MongoSessionStore:
 
     async def retry(self, session_id: str) -> Retry:
         result = await self._sessions.update_one(
-            {"_id": session_id, "state": "failed"}, {"$set": {"state": "closed", "reason": None, "attempts": 0}}
+            {"_id": session_id, "state": "failed"},
+            {"$set": {"state": "closed", "reason": None, "attempts": 0}, "$unset": {"retry_after": ""}},
         )
         if result.modified_count == 1:
             return "retried"

@@ -99,11 +99,14 @@ def test_a_stop_retries_then_fails_and_releases(db, settings):
     add_session(db, "B", 2)
     stop = BuildResult("stopped", "stopped before seal")
     build, release = Script(stop, stop, stop, BuildResult("built")), Release()
-    queue = Queue(db)
+    now = [T0]
+    queue = Queue(db, clock=lambda: now[0])
     run_once(queue, build, release, settings)
     assert state(db, "A")["attempts"] == 1 and state(db, "A")["state"] == "closed"
+    now[0] += timedelta(seconds=60)
     run_once(queue, build, release, settings)
     assert state(db, "A")["attempts"] == 2
+    now[0] += timedelta(seconds=120)
     run_once(queue, build, release, settings)
     assert state(db, "A")["state"] == "failed" and release.calls == 1
     assert db.messages.find_one({"session_id": "A"})["text"]  # the text stays
@@ -111,13 +114,55 @@ def test_a_stop_retries_then_fails_and_releases(db, settings):
     assert build.seen == ["A", "A", "A", "B"] and state(db, "B")["state"] == "built"
 
 
+def test_a_stop_waits_out_its_delay_before_the_next_try(db, settings):
+    add_session(db, "A", 1)
+    stop = BuildResult("stopped", "x")
+    build = Script(stop, stop, BuildResult("built"))
+    now = [T0]
+    queue = Queue(db, clock=lambda: now[0])
+    assert run_once(queue, build, Release(), settings)  # the stop itself is work done
+    assert state(db, "A")["retry_after"].replace(tzinfo=UTC) == T0 + timedelta(seconds=60)
+    now[0] = T0 + timedelta(seconds=59)
+    assert not run_once(queue, build, Release(), settings) and build.seen == ["A"]
+    now[0] = T0 + timedelta(seconds=60)
+    assert run_once(queue, build, Release(), settings) and build.seen == ["A", "A"]
+    assert state(db, "A")["retry_after"].replace(tzinfo=UTC) == T0 + timedelta(seconds=60 + 120)  # doubled
+    now[0] = T0 + timedelta(seconds=60 + 119)
+    assert not run_once(queue, build, Release(), settings)
+    now[0] = T0 + timedelta(seconds=60 + 120)
+    assert run_once(queue, build, Release(), settings) and state(db, "A")["state"] == "built"
+
+
+def test_while_a_stop_waits_no_other_session_is_claimed(db, settings):
+    add_session(db, "A", 1)
+    add_session(db, "B", 2)
+    build = Script(BuildResult("stopped", "x"), BuildResult("built"), BuildResult("built"))
+    now = [T0]
+    queue = Queue(db, clock=lambda: now[0])
+    run_once(queue, build, Release(), settings)
+    now[0] = T0 + timedelta(seconds=30)
+    assert queue.claim() is None and state(db, "B")["state"] == "closed"
+    now[0] = T0 + timedelta(seconds=61)
+    run_once(queue, build, Release(), settings)
+    run_once(queue, build, Release(), settings)
+    assert build.seen == ["A", "A", "B"]
+
+
+def test_a_busy_or_held_result_sets_no_delay(db, settings):
+    add_session(db, "A", 1)
+    run_once(Queue(db), Script(BuildResult("busy", "leased")), Release(), settings)
+    assert "retry_after" not in state(db, "A")
+
+
 def test_a_failed_release_still_fails_the_session_and_hides_keys(db, settings):
     add_session(db, "A", 1)
     stop = BuildResult("stopped", f"died with {KEY}")
     build = Script(stop, stop, stop)
-    queue = Queue(db)
+    now = [T0]
+    queue = Queue(db, clock=lambda: now[0])
     for _ in range(3):
         run_once(queue, build, Release(fail=True), settings)
+        now[0] += timedelta(seconds=300)
     session = state(db, "A")
     assert session["state"] == "failed" and "lease is live" in session["reason"]
     assert KEY not in session["reason"]
@@ -127,8 +172,10 @@ def test_a_stopped_session_goes_first(db, settings):
     add_session(db, "A", 1)
     add_session(db, "B", 2)
     build = Script(BuildResult("stopped", "x"), BuildResult("built"), BuildResult("built"))
-    queue = Queue(db)
+    now = [T0]
+    queue = Queue(db, clock=lambda: now[0])
     run_once(queue, build, Release(), settings)
+    now[0] += timedelta(seconds=60)
     run_once(queue, build, Release(), settings)
     assert build.seen == ["A", "A"]
 

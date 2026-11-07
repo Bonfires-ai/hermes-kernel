@@ -196,8 +196,9 @@ def test_retry_moves_a_failed_session_back_to_closed(api: tuple[TestClient, Memo
     assert client.post(url, headers=AUTH).status_code == 409  # closed, not failed
     assert session.state == "closed"
     session.state, session.reason, session.attempts = "failed", "mk refused", 3
+    session.retry_after = datetime(2026, 11, 7, tzinfo=UTC)
     assert client.post(url, headers=AUTH).status_code == 204
-    assert (session.state, session.reason, session.attempts) == ("closed", None, 0)
+    assert (session.state, session.reason, session.attempts, session.retry_after) == ("closed", None, 0, None)
     assert client.post("/v1/sessions/nope/retry", headers=AUTH).status_code == 404
 
 

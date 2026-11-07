@@ -30,18 +30,26 @@ def _utc(when: datetime) -> datetime:
 
 
 class Queue:
-    def __init__(self, db: Database[Any], *, clock: Callable[[], datetime] | None = None) -> None:
+    def __init__(
+        self, db: Database[Any], *, clock: Callable[[], datetime] | None = None, stop_backoff_s: float = 60
+    ) -> None:
         self._sessions = db["sessions"]
         self._messages = db["messages"]
         self._clock = clock or (lambda: datetime.now(UTC))
         self._pending_release_at: datetime | None = None
+        self._stop_backoff_s = stop_backoff_s
 
     def reset_running(self) -> int:
         """After a restart nothing is running: put those sessions back (attempts unchanged)."""
         return self._sessions.update_many({"state": "running"}, {"$set": {"state": "closed"}}).modified_count
 
     def claim(self) -> Claimed | None:
-        """The oldest closed session (by ``closed_at``, so one put back keeps its place), now ``running``."""
+        """The oldest closed session (by ``closed_at``, so one put back keeps its place), now ``running``.
+
+        None while any closed session is waiting out a stop's delay (``retry_after`` in the future): mk wants that
+        session to land before any other, so taking the next one would only come back busy."""
+        if self._sessions.find_one({"state": "closed", "retry_after": {"$gt": self._clock()}}, {"_id": 1}):
+            return None
         doc = self._sessions.find_one_and_update(
             {"state": "closed"},
             {"$set": {"state": "running", "started_at": self._clock()}},
@@ -90,13 +98,19 @@ class Queue:
         self._messages.update_many({"session_id": session_id}, {"$unset": {"text": ""}})
 
     def stopped(self, session_id: str, reason: str) -> int:
-        """Back to ``closed`` for another try; the attempts so far, this one included."""
+        """Back to ``closed`` for another try, after a delay of ``backoff * 2 ** (attempts - 1)`` (``retry_after``); the
+        attempts so far, this one included."""
         doc = self._sessions.find_one_and_update(
             {"_id": session_id},
             {"$set": {"state": "closed", "reason": reason}, "$inc": {"attempts": 1}},
             return_document=ReturnDocument.AFTER,
         )
-        return int(doc["attempts"]) if doc else 0
+        if doc is None:
+            return 0
+        attempts = int(doc["attempts"])
+        delay = timedelta(seconds=self._stop_backoff_s * 2 ** (attempts - 1))
+        self._sessions.update_one({"_id": session_id}, {"$set": {"retry_after": self._clock() + delay}})
+        return attempts
 
     def requeue(self, session_id: str, reason: str) -> None:
         """Back to ``closed`` with no attempt counted."""

@@ -34,6 +34,8 @@ class Settings(BaseSettings):
     founding_cap_usd: Decimal = Field(default=Decimal("1"), validation_alias="KT_FOUNDING_CAP_USD")
     # Stops of one session before it is marked failed.
     max_tries: int = Field(default=3, validation_alias="KT_WRITER_MAX_TRIES")
+    # After a stop the session waits this long, then twice as long, and so on, before the next try.
+    stop_backoff_s: float = Field(default=60, validation_alias="KT_WRITER_STOP_BACKOFF_S")
     poll_s: float = Field(default=15, validation_alias="KT_WRITER_POLL_S")
     # A session held at the spend ceiling is tried again after this many seconds.
     held_retry_s: float = Field(default=600, validation_alias="KT_WRITER_HELD_RETRY_S")
