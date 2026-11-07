@@ -10,6 +10,7 @@ few fast runs, and WiredTiger's panic ends the server. Only the tests of the ind
 
 from __future__ import annotations
 
+import logging
 import os
 import uuid
 from collections.abc import AsyncIterator, Iterator
@@ -453,6 +454,63 @@ async def test_a_failure_removing_text_never_sends_the_session_again(store: Stor
     assert await sessions.closed_heads(AT) == []
     assert await sessions.waiting(A) == []
     assert [m.text for m in await sessions.messages_of(A, session.id)] == ["hi", "hi"]  # left behind: see mark_handed
+
+
+async def test_an_unreadable_session_holds_up_only_its_own_bonfire(
+    store: Stores, caplog: pytest.LogCaptureFixture
+) -> None:
+    if not isinstance(store.sessions, MongoSessionStore):
+        pytest.skip("only Mongo rows can be unreadable")
+    sessions = store.sessions
+    behind = await _closed(store, A, "behind", "m1")
+    await _closed(store, B, "chat", "m2")
+    raw = sessions._sessions  # pyright: ignore[reportPrivateUsage]
+    await raw.insert_one({"_id": "broken", "bonfire_id": A, "state": "closed", "closed_at": AT - timedelta(hours=1)})
+
+    seam = Seam()
+    assert await hand_over_once(sessions, seam, lambda: AT) == 1
+
+    assert [bonfire for bonfire, _ in seam.sent] == [B]  # nothing of A: not the broken one, nor what is behind it
+    assert "broken" in caplog.text
+    await raw.delete_one({"_id": "broken"})
+    assert [s.id for s in await sessions.closed_heads(AT)] == [behind.id]
+
+
+async def test_a_message_that_cannot_be_read_stops_its_session_and_is_never_skipped(
+    store: Stores, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A skip would send fewer ids, which is a new job. The session waits, with a reason, until the row is mended."""
+    if not isinstance(store.sessions, MongoSessionStore):
+        pytest.skip("only Mongo rows can be unreadable")
+    caplog.set_level(logging.DEBUG, logger="kernel_turns")
+    words = "the person's own words"
+    sessions = store.sessions
+    session = await _closed(store, A, "chat", "m1", "m2", text=words)
+    behind = await _closed(store, A, "behind", "m3")
+    await _closed(store, B, "chat", "m4")
+    await _set_closed_at(store, session, AT)
+    await _set_closed_at(store, behind, AT + timedelta(seconds=1))
+    raw = sessions._messages  # pyright: ignore[reportPrivateUsage]
+    await raw.update_one({"_id": message_key(A, "m2")}, {"$unset": {"speaker": ""}})
+
+    seam = Seam()
+    assert await hand_over_once(sessions, seam, lambda: AT) == 1
+    assert [bonfire for bonfire, _ in seam.sent] == [B]
+
+    waiting = {s.id: s for s in await sessions.waiting(A)}
+    stuck = waiting[session.id]
+    assert (stuck.state, stuck.attempts) == ("closed", 1)
+    assert stuck.reason == "the hand-off failed: ValidationError"
+    assert stuck.retry_after == AT + timedelta(seconds=30)
+    assert words not in caplog.text
+    assert await sessions.closed_heads(AT) == []  # and nothing of A goes ahead of it
+
+    await raw.update_one({"_id": message_key(A, "m2")}, {"$set": {"speaker": "Kira"}})
+    seam.sent.clear()
+    assert await hand_over_once(sessions, seam, lambda: AT + timedelta(seconds=30)) == 1
+    ((bonfire, body),) = seam.sent
+    assert bonfire == A
+    assert sorted(m["message_id"] for m in body["messages"]) == ["m1", "m2"]
 
 
 async def test_messages_read_back_in_one_order_and_an_old_row_by_its_plain_id(store: Stores) -> None:

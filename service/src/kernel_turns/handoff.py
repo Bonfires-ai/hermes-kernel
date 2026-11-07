@@ -4,10 +4,15 @@ With ``KT_HANDOFF_URL`` set no writer runs. Every ``KT_HANDOFF_EVERY_S`` a pass 
 and posts it to ``{url}/bonfires/{bonfire}/sessions``, with ``Authorization: Bearer <KT_HANDOFF_TOKEN>``:
 
 * a 2xx is ``accepted``: the session is ``handed`` and its text goes, because the receiver holds it now;
-* 400, 404, 409, 413 or 422 is ``refused``: the session is ``failed`` with the answer's message and keeps its text, for
+* 400, 409, 413 or 422 is ``refused``: the session is ``failed`` with the answer's message and keeps its text, for
   ``/v1/sessions/{id}/retry``, and it stops holding up the sessions behind it;
-* anything else is ``later``, a wrong seam token and a timeout included, so a broken seam never fails a session: it stays
-  ``closed`` and waits out ``retry_after``, and the sessions behind it wait too.
+* anything else is ``later``, so a broken seam never fails a session: a wrong seam token, a timeout, and a 404, which the
+  route never answers and so means a wrong URL or a deploy-order slip. It stays ``closed`` and waits out ``retry_after``,
+  and the sessions behind it wait too.
+
+A session that raises (a row that cannot be read, a database blip) waits the same way, with the error's class as its
+reason. A message that cannot be read stops its session until the row is mended: skipping it, as the writer does, would
+send fewer ids, and that is a new job.
 
 None is lost and none is built twice because a resend is the same job. The receiver keys a job on the sorted message ids,
 and a resend sends the same ids: a closed session never gains a message (see ``sessions``) and keeps its text until it is
@@ -38,7 +43,7 @@ Body = dict[str, Any]
 #: what the agent is called in memory (the plugin's ``capture.AGENT_HANDLE``): a hosted bonfire is created with it, and a
 #: body with any other handle is refused for good, so a session's stored handles are not what is sent
 AGENT_HANDLE = "hermes"
-REFUSED_STATUSES = frozenset({400, 404, 409, 413, 422})
+REFUSED_STATUSES = frozenset({400, 409, 413, 422})
 REASON_MAX_CHARS = 500
 BACKOFF_MAX_S = 600.0
 #: past this the doubling is well over ``BACKOFF_MAX_S``, and ``2**attempts`` must stay small enough to be a float
@@ -146,6 +151,11 @@ def _backoff_s(attempts: int, backoff_s: float) -> float:
     return min(backoff_s * 2 ** min(attempts, _BACKOFF_MAX_DOUBLINGS), BACKOFF_MAX_S)
 
 
+async def _put_off(store: SessionStore, session: Session, reason: str, now: datetime, backoff_s: float) -> None:
+    until = now + timedelta(seconds=_backoff_s(session.attempts, backoff_s))
+    await store.put_off(session.bonfire_id, session.id, reason, until)
+
+
 async def _hand_over(
     store: SessionStore, api: HandoffApi, session: Session, clock: Callable[[], datetime], backoff_s: float
 ) -> bool:
@@ -168,8 +178,7 @@ async def _hand_over(
         )
         return False
     reason = outcome.reason or "the hand-off said later"
-    until = now + timedelta(seconds=_backoff_s(session.attempts, backoff_s))
-    await store.put_off(bonfire_id, session_id, reason, until)
+    await _put_off(store, session, reason, now, backoff_s)
     log.warning(
         "kernel_turns.handoff_later: bonfire=%s session=%s attempts=%d reason=%s",
         bonfire_id,
@@ -180,6 +189,23 @@ async def _hand_over(
     return False
 
 
+async def _put_off_failed(
+    store: SessionStore, session: Session, error: str, clock: Callable[[], datetime], backoff_s: float
+) -> None:
+    """A session that raised waits as a ``later`` one does; otherwise it goes again every pass, with no reason given."""
+    bonfire_id, session_id = session.bonfire_id, session.id
+    log.warning("kernel_turns.handoff_failed: bonfire=%s session=%s error=%s", bonfire_id, session_id, error)
+    try:
+        await _put_off(store, session, f"the hand-off failed: {error}", clock(), backoff_s)
+    except Exception as exc:  # noqa: BLE001 - the database is away too: the next pass tries it again
+        log.warning(
+            "kernel_turns.handoff_put_off_failed: bonfire=%s session=%s error=%s",
+            bonfire_id,
+            session_id,
+            type(exc).__name__,
+        )
+
+
 async def hand_over_once(
     store: SessionStore, api: HandoffApi, clock: Callable[[], datetime], backoff_s: float = 30.0
 ) -> int:
@@ -187,15 +213,13 @@ async def hand_over_once(
     trouble stays its own. How many were handed over."""
     handed = 0
     for session in await store.closed_heads(clock()):
+        error: str | None = None
         try:
             handed += await _hand_over(store, api, session, clock, backoff_s)
-        except Exception as exc:  # noqa: BLE001 - it stays closed and goes again next pass; the next bonfire goes now
-            log.warning(
-                "kernel_turns.handoff_failed: bonfire=%s session=%s error=%s",
-                session.bonfire_id,
-                session.id,
-                type(exc).__name__,
-            )
+        except Exception as exc:  # noqa: BLE001 - only the class: its words can quote what it read
+            error = type(exc).__name__
+        if error is not None:
+            await _put_off_failed(store, session, error, clock, backoff_s)
     return handed
 
 

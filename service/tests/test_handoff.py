@@ -221,7 +221,7 @@ async def test_a_refused_session_stops_holding_up_the_next_and_comes_first_when_
     assert world.state(third) == "closed"
 
 
-@pytest.mark.parametrize("answer", [500, 503, httpx.ReadTimeout("slow"), 401, 403, 429])
+@pytest.mark.parametrize("answer", [500, 503, httpx.ReadTimeout("slow"), 401, 403, 404, 429])
 async def test_5xx_timeout_and_a_wrong_seam_token_try_later(answer: int | Exception) -> None:
     def respond(_: httpx.Request) -> httpx.Response:
         if isinstance(answer, Exception):
@@ -238,6 +238,26 @@ async def test_5xx_timeout_and_a_wrong_seam_token_try_later(answer: int | Except
     assert stored.retry_after == world.clock.now + timedelta(seconds=30)
     assert stored.attempts == 1
     assert world.texts_of(session) == [TEXT]
+
+
+async def test_a_404_is_a_wrong_url_and_fails_nothing() -> None:
+    """The route never answers 404: only a wrong URL or a deploy-order slip does, and neither is the session's fault."""
+    world = World()
+    first, second = await world.closed(A, "a1", "m1"), await world.closed(A, "a2", "m2")
+    tried: list[object] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        tried.append(json.loads(request.read())["conversation_id"])
+        return httpx.Response(404, json={"detail": "Not Found"})
+
+    client = client_over(respond)
+    for _ in range(2):
+        assert await world.once(client) == 0
+        world.clock.now += timedelta(seconds=61)
+
+    assert (world.state(first), world.state(second)) == ("closed", "closed")
+    assert tried == ["a1", "a1"]  # the next session did not move up
+    assert not [s for s in await world.store.waiting(A) if s.state == "failed"]
 
 
 async def test_each_attempt_waits_twice_as_long_up_to_ten_minutes() -> None:
@@ -282,6 +302,7 @@ async def test_a_crash_after_send_resends_the_same_body() -> None:
     assert world.state(session) == "closed"
     assert world.texts_of(session) == [TEXT, TEXT]
 
+    world.clock.now += timedelta(seconds=31)
     assert await world.once(seam) == 1
     first, second = seam.sent
     assert first == second
@@ -362,6 +383,43 @@ async def test_one_bonfires_exception_never_stops_the_next() -> None:
     assert (other.state(stuck), other.state(fine)) == ("closed", "handed")
 
 
+async def test_an_exception_puts_the_head_off_with_a_reason() -> None:
+    world = World(ReadFails())
+    stuck = await world.closed(A, "a1", "m1")
+    behind = await world.closed(A, "a2", "m2")
+    seam = Seam()
+
+    await world.once(seam)
+    stored = world.store.sessions[stuck.id]
+    assert (stored.state, stored.attempts) == ("closed", 1)
+    assert stored.reason == "the hand-off failed: ConnectionError"
+    assert stored.retry_after == world.clock.now + timedelta(seconds=30)
+
+    await world.once(seam)  # not again before its time, and nothing goes ahead of it
+    assert world.store.sessions[stuck.id].attempts == 1
+
+    world.clock.now += timedelta(seconds=30)
+    await world.once(seam)
+    stored = world.store.sessions[stuck.id]
+    assert stored.attempts == 2
+    assert stored.retry_after == world.clock.now + timedelta(seconds=60)
+    assert world.state(behind) == "closed"
+    assert seam.sent == []
+
+
+class PutOffFails(ReadFails):
+    async def put_off(self, bonfire_id: str, session_id: str, reason: str, until: datetime) -> None:
+        raise ConnectionError("gone")
+
+
+async def test_a_put_off_that_fails_never_stops_the_next_bonfire() -> None:
+    world = World(PutOffFails())
+    stuck = await world.closed(A, "a1", "m1")
+    fine = await world.closed(B, "b1", "m2")
+    assert await world.once(Seam()) == 1
+    assert (world.state(stuck), world.state(fine)) == ("closed", "handed")
+
+
 async def test_the_loop_outlives_a_failing_pass() -> None:
     world = World()
     await world.closed(A, "chat", "m1")
@@ -420,7 +478,7 @@ async def test_any_2xx_is_accepted(status: int) -> None:
     assert await client_over(lambda _: httpx.Response(status)).send(A, {}) == ACCEPTED
 
 
-@pytest.mark.parametrize("status", [400, 404, 409, 413, 422])
+@pytest.mark.parametrize("status", [400, 409, 413, 422])
 async def test_a_refusal_carries_the_answers_message(status: int) -> None:
     body = {"error": "kernel.handles_mismatch", "message": "other handles", "context": {}}
     outcome = await client_over(lambda _: httpx.Response(status, json=body)).send(A, {})
@@ -428,8 +486,8 @@ async def test_a_refusal_carries_the_answers_message(status: int) -> None:
 
 
 async def test_a_plain_detail_is_a_message_too() -> None:
-    outcome = await client_over(lambda _: httpx.Response(404, json={"detail": "Not Found"})).send(A, {})
-    assert outcome == Outcome("refused", "Not Found")
+    outcome = await client_over(lambda _: httpx.Response(409, json={"detail": "other handles"})).send(A, {})
+    assert outcome == Outcome("refused", "other handles")
 
 
 @pytest.mark.parametrize(
@@ -452,7 +510,7 @@ async def test_a_long_message_is_cut() -> None:
     assert outcome.reason == "x" * 500
 
 
-@pytest.mark.parametrize("status", [301, 401, 403, 408, 429, 500, 502, 503, 504])
+@pytest.mark.parametrize("status", [301, 401, 403, 404, 408, 429, 500, 502, 503, 504])
 async def test_everything_else_is_later(status: int) -> None:
     outcome = await client_over(lambda _: httpx.Response(status, json={"message": TEXT})).send(A, {})
     assert outcome == Outcome("later", f"the hand-off answered {status}")

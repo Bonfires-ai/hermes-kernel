@@ -46,9 +46,9 @@ import logging
 import uuid
 from collections.abc import Callable
 from datetime import datetime, timedelta
-from typing import Literal, Protocol
+from typing import Annotated, Literal, Protocol
 
-from pydantic import AwareDatetime, BaseModel, Field
+from pydantic import AwareDatetime, BaseModel, Field, ValidationError, field_validator
 from pymongo import ASCENDING, AsyncMongoClient, ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
@@ -67,13 +67,24 @@ class SessionClosed(Exception):
 
 
 class MessageIn(BaseModel):
+    """A message at the door. mk refuses a blank ``conversation_id`` and an empty addressee, for good, so a session
+    holding one blocks every later session of its bonfire: they stop here, where the caller hears of it. The tests are
+    mk's own and no stricter, because a refusal costs the plugin its whole batch."""
+
     conversation_id: str = Field(min_length=1)
     message_id: str = Field(min_length=1)
     speaker: str = Field(min_length=1)
     text: str = Field(min_length=1)
     #: must carry a timezone: mk refuses a naive one
     timestamp: AwareDatetime
-    addressees: list[str] | None = None
+    addressees: list[Annotated[str, Field(min_length=1)]] | None = None
+
+    @field_validator("conversation_id")
+    @classmethod
+    def _not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("conversation_id is blank")
+        return value
 
 
 class AddRequest(BaseModel):
@@ -167,7 +178,8 @@ class SessionStore(Protocol):
 
     async def closed_heads(self, now: datetime) -> list[Session]:
         """Each bonfire's oldest ``closed`` session by ``(closed_at, id)``, of any bonfire. A head whose ``retry_after``
-        is still to come is left out and nothing behind it takes its place: a bonfire's sessions go in order."""
+        is still to come, or that cannot be read, is left out and nothing behind it takes its place: a bonfire's sessions
+        go in order, and one bad row is that bonfire's trouble alone."""
         ...
 
     async def messages_of(self, bonfire_id: str, session_id: str) -> list[StoredMessage]:
@@ -472,7 +484,16 @@ class MongoSessionStore:
                 {"$replaceWith": "$head"},
             ]
         )
-        return [session for session in [_session(doc) async for doc in cursor] if _due(session, now)]
+        heads: list[Session] = []
+        async for doc in cursor:
+            try:
+                session = _session(doc)
+            except ValidationError:  # only the ids: its words quote the row
+                log.warning("kernel_turns.session_unreadable: bonfire=%s session=%s", doc.get("bonfire_id"), doc["_id"])
+                continue
+            if _due(session, now):
+                heads.append(session)
+        return heads
 
     async def messages_of(self, bonfire_id: str, session_id: str) -> list[StoredMessage]:
         # A message stored before the bonfire was in the key has no `bonfire_id`, and None matches that.

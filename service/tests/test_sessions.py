@@ -211,3 +211,47 @@ def test_an_empty_text_or_a_naive_timestamp_is_refused(api: tuple[TestClient, Me
         r = client.post("/v1/messages", json={"messages": [bad], "agent_handles": HANDLES}, headers=AUTH)
         assert r.status_code == 422
     assert not store.sessions
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"conversation_id": "   "},
+        {"conversation_id": "\t\n"},
+        {"addressees": [""]},
+        {"addressees": ["Kira", ""]},
+    ],
+)
+def test_what_mk_can_never_build_is_refused_at_the_door(
+    api: tuple[TestClient, MemorySessionStore], fields: dict[str, object]
+) -> None:
+    """mk refuses these for good once a session holds one, and every later session of the bonfire waits behind it."""
+    client, store = api
+    bad = {**_msg("m1").model_dump(mode="json"), **fields}
+    r = client.post("/v1/messages", json={"messages": [bad], "agent_handles": HANDLES}, headers=AUTH)
+    assert r.status_code == 422
+    assert not store.sessions
+    assert not store.messages
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"conversation_id": "telegram:-100777"},
+        {"conversation_id": "cli:"},  # the plugin's, with no chat and no session id
+        {"conversation_id": " padded "},  # kept as sent: a chat's id is not ours to change
+        {"addressees": None},
+        {"addressees": []},
+        {"addressees": ["hermes"]},
+        {"addressees": ["   "]},  # a person named only spaces: the plugin addresses them, and mk takes it
+        {"speaker": "   ", "addressees": ["hermes"]},
+    ],
+)
+def test_what_mk_takes_still_comes_in(api: tuple[TestClient, MemorySessionStore], fields: dict[str, object]) -> None:
+    """A refusal here makes the plugin drop its whole batch, so the door refuses only what mk does."""
+    client, store = api
+    message = {**_msg("m1").model_dump(mode="json"), **fields}
+    r = client.post("/v1/messages", json={"messages": [message], "agent_handles": HANDLES}, headers=AUTH)
+    assert r.json() == {"accepted": 1, "duplicates": 0}
+    (session,) = store.sessions.values()
+    assert session.conversation_id == message["conversation_id"]
