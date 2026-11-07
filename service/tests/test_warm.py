@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from kernel_turns.groups import SingleBonfire
 from kernel_turns.store import MemoryTurnStore
 from kernel_turns.teaching import Teaching
-from kernel_turns.warm import Warmer
+from kernel_turns.warm import Warmer, warm_until_done
 from tests.fakes import FakeMk
 from tests.test_sources import AGENT, BONFIRE
 
@@ -57,10 +59,34 @@ async def test_a_refused_install_retries_next_tick(groups: SingleBonfire) -> Non
     assert len(mk.calls_of("plan")) == 1
 
 
+async def test_an_unborn_bonfire_with_nothing_kept_is_not_warmed(groups: SingleBonfire) -> None:
+    mk, _, warmer = _setup(groups)
+    assert await warmer.tick() is False
+    assert mk.calls_of("plan") == []
+
+
 async def test_boot_warms_a_bonfire_that_already_exists(groups: SingleBonfire) -> None:
-    mk, teaching, warmer = _setup(groups)
-    await teaching.put_catalogue("hermes", "main", AGENT)  # kept before a restart
+    mk, teaching, _ = _setup(groups)
     _found(mk)
+    await teaching.put_catalogue("hermes", "main", AGENT)  # installed and stored before the restart
+    mk.calls.clear()
+    del mk.catalogues[BONFIRE]  # the kernel no longer holds it
+    warmer = Warmer(mk, teaching, BONFIRE)  # the restarted service
     assert await warmer.tick() is True
-    assert len(mk.calls_of("put_catalogue")) == 1
+    assert "web_search" in str(mk.catalogues[BONFIRE])
     assert len(mk.calls_of("plan")) == 1
+
+
+async def test_a_tick_that_raises_does_not_end_the_loop() -> None:
+    class Flaky:
+        n = 0
+
+        async def tick(self) -> bool:
+            self.n += 1
+            if self.n == 1:
+                raise RuntimeError("a database blip")
+            return True
+
+    flaky = Flaky()
+    await asyncio.wait_for(warm_until_done(flaky, every_s=0.001), 2)  # type: ignore[arg-type]
+    assert flaky.n == 2
