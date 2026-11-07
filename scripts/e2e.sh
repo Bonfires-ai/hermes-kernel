@@ -13,7 +13,7 @@
 # It refuses to start unless HERMES_HOME is set in your shell to an absolute path outside ~/.hermes (also through a
 # symlink): that value is only checked, the run uses its own temporary home. It needs Hermes v0.23.0 exactly, and 9 GiB of RAM available.
 #
-# It spends real money (a few cents to build the memory, and a chat model for about a dozen turns; the target is under
+# It spends real money (under a cent to build the memory, and a chat model for about a dozen turns; the target is under
 # $1) and takes about 15 minutes, most of it waiting for memory to build.
 #
 # Settings (all optional except E2E_CONFIRM):

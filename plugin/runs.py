@@ -35,10 +35,9 @@ that is pending and reports it (`POST /v1/turns/{child}/report`), and repeats un
   was written by an older plugin), every line of it is fenced (`FENCE_ALL`). So is what may echo those args: the
   service's repair question (always, whatever the child carries), and a step's failure (its own tool's fence, as
   Hermes fences an error result, else the fence of a value its args carry), in its line and its stop reason. A think
-  step's input is always fenced, and so is its instruction when it may hold an earlier step's value (`carries`:
-  whichever tool gave it, a think step's own text included; `tools.think_lines`). The fence, the scan and the values
-  carried go by the tool's real name, never the step's short one: Hermes fences an `mcp_*` result, not a bare
-  `mcp__srv__search`. The name is
+  step's input is always fenced, and so is its instruction when it may hold a tool step's value (`carries`, whichever
+  tool gave it; `tools.think_lines`). The fence, the scan and the values carried go by the tool's real name, never the
+  step's short one: Hermes fences an `mcp_*` result, not a bare `mcp__srv__search`. The name is
   the one the step was dispatched under, kept with a held result in the step ledger (after a restart no registry read
   may name the short one yet: its MCP server not connected). A held result whose name is unknown fails closed: its line
   in the plugin's own block (`fence.closed`), and the value carried under an `mcp_*` name, so Hermes fences what
@@ -356,8 +355,6 @@ class PhraseRun:
                     if reported == "ended":  # a licensed turn with nothing pending is still alive: keep its record
                         self._ledger.end(child_turn_id)
                     return RunOutcome("stopped", child_turn_id, reason=NOT_WAITING)
-                # The model's text can repeat what it read, and a later step can bind it, so it counts as carried.
-                self._ledger.carry(child_turn_id, THINK, _cut(text))
                 if reported == "taken":
                     out.lines.append("1. think: its text went in already, on an earlier try (not sent again)")
                 else:
