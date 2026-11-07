@@ -69,17 +69,22 @@ def _spend(health: dict[str, JsonValue], bonfire_id: str) -> Spend | None:
     return Spend(charged_usd=charged, ceiling_usd=ceiling) if charged is not None and ceiling is not None else None
 
 
+def is_founded(health: dict[str, JsonValue], bonfire_id: str) -> bool:
+    """Whether the bonfire is a key in ``/healthz``'s ``bonfires``: it exists once its first session is built."""
+    bonfires = health.get("bonfires")
+    return isinstance(bonfires, dict) and bonfire_id in bonfires
+
+
 async def build_status(mk: KernelApi, sessions: SessionStore, bonfire_id: str) -> StatusView:
     try:
         health = await mk.health()
     except MkError:  # mk serve away: say so by what it cannot tell us
         health = {}
-    bonfires = health.get("bonfires")
     version = health.get("version")
     waiting = await sessions.waiting(bonfire_id)
     return StatusView(
         bonfire_id=bonfire_id,
-        founded=isinstance(bonfires, dict) and bonfire_id in bonfires,
+        founded=is_founded(health, bonfire_id),
         open_messages=sum(s.message_count for s in waiting if s.state == "open"),
         sessions_waiting=sum(1 for s in waiting if s.state in ("closed", "running", "held")),
         last_built_at=await sessions.last_built_at(bonfire_id),

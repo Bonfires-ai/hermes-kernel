@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from kernel_turns.affordances import CONFIRM, TEACH
 from kernel_turns.groups import GroupFinder
-from kernel_turns.mk_client import KernelApi, NotFounded, Refused
+from kernel_turns.mk_client import KernelApi, MkError, NotFounded, Refused
 from kernel_turns.models import BodyStep, Frame, JsonValue, Runner
 from kernel_turns.store import TurnStore
 from kernel_turns.turns import UnknownTurn
@@ -230,6 +230,24 @@ class Teaching:
                 return
             await self._store.save_source(platform, group, source, catalogue)
             await self._store.save_catalogue(platform, group, merged)
+
+    async def install_kept(self) -> bool:
+        """Install every kept agent catalogue in the kernel and store the merged one. True when installed or when
+        nothing is kept; False when the bonfire does not exist yet, or the kernel refused or was away (retry later)."""
+        for platform, group in await self._store.kept_groups("agent"):
+            found = await self._groups.find(platform, group)
+            async with self._installing.setdefault((platform, group), asyncio.Lock()):
+                source = await self._store.source(platform, group, "agent")
+                if source is None:
+                    continue
+                merged = merge_sources(source)
+                try:
+                    await self._mk.put_catalogue(found.bonfire_id, merged)
+                except MkError as exc:  # not founded, refused, busy or away
+                    log.info("kernel_turns.install_kept: %s/%s not installed: %s", platform, group, exc)
+                    return False
+                await self._store.save_catalogue(platform, group, merged)
+        return True
 
 
 def _by_name(catalogue: dict[str, JsonValue]) -> dict[str, JsonValue]:

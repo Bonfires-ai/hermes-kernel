@@ -60,6 +60,10 @@ class TurnStore(Protocol):
 
     async def source(self, platform: str, group: str, source: Runner) -> dict[str, JsonValue] | None: ...
 
+    async def kept_groups(self, source: Runner) -> list[tuple[str, str]]:
+        """The (platform, group) pairs that have a stored ``source``."""
+        ...
+
     async def waiting_turn(self, turn: TurnRecord) -> TurnRecord | None:
         """The latest phrase child turn of ``turn``'s speaker in its chat that is licensed with a pending step that runs
         in the agent, other than ``turn``'s own children, begun no later than ``turn``; or None."""
@@ -131,6 +135,9 @@ class MemoryTurnStore:
     async def source(self, platform: str, group: str, source: Runner) -> dict[str, JsonValue] | None:
         found = self._sources.get((platform, group, source))
         return json.loads(json.dumps(found)) if found is not None else None
+
+    async def kept_groups(self, source: Runner) -> list[tuple[str, str]]:
+        return sorted((p, g) for p, g, s in self._sources if s == source)
 
     async def waiting_turn(self, turn: TurnRecord) -> TurnRecord | None:
         waiting = [
@@ -285,6 +292,10 @@ class MongoTurnStore:
     async def source(self, platform: str, group: str, source: Runner) -> dict[str, JsonValue] | None:
         doc = await self._catalogues.find_one({"_id": f"{platform}\x1f{group}\x1f{source}"})
         return _decode(doc.get("catalogue_json") if doc is not None else None)
+
+    async def kept_groups(self, source: Runner) -> list[tuple[str, str]]:
+        docs = self._catalogues.find({"source": source})
+        return sorted([(str(d["platform"]), str(d["group"])) async for d in docs])
 
     async def waiting_turn(self, turn: TurnRecord) -> TurnRecord | None:
         query: Doc = {

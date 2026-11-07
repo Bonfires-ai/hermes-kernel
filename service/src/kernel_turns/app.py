@@ -43,6 +43,7 @@ from kernel_turns.store import Doc, MongoTurnStore, TurnStore
 from kernel_turns.teaching import ConfirmRequest, ConfirmView, DraftView, TeachDraft, Teaching
 from kernel_turns.turns import BeginTurn, TurnEngine, TurnView, UnknownTurn
 from kernel_turns.verbs import Verb
+from kernel_turns.warm import Warmer, warm_until_done
 
 log = logging.getLogger(__name__)
 
@@ -204,9 +205,13 @@ def create_app(
         if mongo_sessions is not None and session_store is mongo_sessions:
             await mongo_sessions.ensure_indexes()  # one open session per chat
         sweeper = asyncio.create_task(_close_quiet_sessions(take))
+        warmer = asyncio.create_task(warm_until_done(Warmer(kernel, teaching, settings.bonfire_id)))
         try:
             yield
         finally:
+            warmer.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await warmer
             sweeper.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await sweeper
