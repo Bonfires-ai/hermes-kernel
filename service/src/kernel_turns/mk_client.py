@@ -48,7 +48,12 @@ class PlanGone(MkError):
 
 
 class Refused(MkError):
-    """The kernel refused the request (400, 409, 422); ``detail`` is its reason."""
+    """The kernel refused the request (400, 409, 422); ``detail`` is its reason. ``why`` is a fixed word for what kind of
+    refusal it is, safe to log: a ``detail`` can quote what the person said."""
+
+    def __init__(self, detail: str, why: str = "kernel") -> None:
+        super().__init__(detail)
+        self.why = why
 
 
 #: how a ``NotFounded`` detail opens: a turn's problems carry it when its plan failed for want of a bonfire

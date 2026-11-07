@@ -75,9 +75,9 @@ class CallsMixin:
         async with self._lock(turn_id):
             turn = await self._load(turn_id)
             if tool in (TEACH, CONFIRM):
-                raise Refused(f"{tool} is not a call: it has its own route and the teacher's yes")
+                raise Refused(f"{tool} is not a call: it has its own route and the teacher's yes", "own_route")
             if tool == THINK:
-                raise Refused("think is a phrase step, answered with phrase_continue, not a call")
+                raise Refused("think is a phrase step, answered with phrase_continue, not a call", "think_step")
             wanted = canon_key(tool, args)
             earlier = next((c for c in turn.calls if canon_key(c.tool, c.args) == wanted), None)
             if earlier is not None:
@@ -89,13 +89,13 @@ class CallsMixin:
             phrase = any(f.kind == "phrase" and f.name == tool for f in turn.frames)
             if tool not in turn.affordances:
                 if row is None and not phrase:
-                    raise Refused(f"{tool} is not a tool or phrase this group knows")
+                    raise Refused(f"{tool} is not a tool or phrase this group knows", "unknown")
                 afforded = ", ".join(turn.affordances) or "nothing"
-                raise Refused(f"{tool} is not afforded this turn (afforded: {afforded})")
+                raise Refused(f"{tool} is not afforded this turn (afforded: {afforded})", "not_afforded")
             if phrase:
                 return await self._call_phrase(turn, tool, args)
             if row is None:
-                raise Refused(f"{tool} is not a tool or phrase this group knows")
+                raise Refused(f"{tool} is not a tool or phrase this group knows", "unknown")
             return await self._call_tool(turn, row, args)
 
     async def _again(self, turn: TurnRecord, same: PendingStep) -> CallView:
@@ -106,7 +106,9 @@ class CallsMixin:
             return CallView(kind="done", step=same, value=done.value)
         ended = next((r for r in mine if r.verdict != "tool_error"), None)
         if ended is not None:
-            raise Refused(f"{same.tool} already ended in this turn ({ended.verdict}: {ended.detail or 'no detail'})")
+            raise Refused(
+                f"{same.tool} already ended in this turn ({ended.verdict}: {ended.detail or 'no detail'})", "ended"
+            )
         return CallView(kind="step", step=same)
 
     async def _child_view(self, child_id: str) -> CallView:
@@ -117,7 +119,7 @@ class CallsMixin:
         tool = str(row["name"])
         problem = missing_args(row, args)
         if problem is not None:
-            raise Refused(problem)
+            raise Refused(problem, "bad_args")
         ledger = await self._store.ledger(turn.turn_id)
         occurrence = sum(
             1
@@ -143,7 +145,7 @@ class CallsMixin:
         verbs = verb_book(rows, tool_names(await self._catalogue(turn)), [])
         found = next((v for v in verbs if tool in v.ids and v.status == "live"), None)
         if found is None:
-            raise Refused(f"{tool} is not a phrase this group has taught")
+            raise Refused(f"{tool} is not a phrase this group has taught", "not_taught")
         return found
 
     async def _call_phrase(self, turn: TurnRecord, tool: str, args: dict[str, JsonValue]) -> CallView:
@@ -151,10 +153,10 @@ class CallsMixin:
         slots = {s.lower() for s in verb.slots}
         stray = [k for k in args if k.lower() not in slots]
         if stray or any(not isinstance(v, str) for v in args.values()):
-            raise Refused(f"{tool} takes {', '.join(verb.slots) or 'no arguments'}, each as text")
+            raise Refused(f"{tool} takes {', '.join(verb.slots) or 'no arguments'}, each as text", "stray_arg")
         text, why = render_form(verb.forms, args, verb.defaults)
         if text is None:
-            raise Refused(f"{tool}: {why}")
+            raise Refused(f"{tool}: {why}", "slot_missing")
         # the phrase's effect is the sentence it renders: args spelled another way (a slot's case, a default given)
         # that render a recorded child's text are that call again
         for called in turn.children:
@@ -179,10 +181,13 @@ class CallsMixin:
                 child = await self._plan(child, await self._store.ledger(child_id))
         if child.status == "unread":
             raise Refused(
-                f"{tool} did not read as {text!r} just now: {'; '.join(child.problems) or 'the kernel read nothing'}"
+                f"{tool} did not read as {text!r} just now: {'; '.join(child.problems) or 'the kernel read nothing'}",
+                "not_read",
             )
         if child.phrase not in verb.ids:
-            raise Refused(f"{tool} did not read as {text!r} just now: the kernel read it as another phrase")
+            raise Refused(
+                f"{tool} did not read as {text!r} just now: the kernel read it as another phrase", "other_phrase"
+            )
         await self._store.save_turn(
             turn.model_copy(
                 update={"children": [*turn.children, ChildCall(tool=tool, args=dict(args), turn_id=child_id)]}

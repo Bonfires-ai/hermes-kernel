@@ -204,6 +204,14 @@ def reading_text(frame: JsonObject) -> str:
     return f"{frame.get('name')}({', '.join(given)})" if given else str(frame.get("name"))
 
 
+def _call_shape(name: str, frames: list[JsonObject]) -> str:
+    """`run_phrase`'s arguments for the phrase `name`: its role names as the kernel read them, and a placeholder for each
+    role's text, never the text (`run_phrase` is deferred, so a model may call it without reading its schema)."""
+    roles = next((f.get("roles") for f in frames if f.get("name") == name), None)
+    names = list(roles) if isinstance(roles, dict) else []
+    return json.dumps({"phrase": _short(name), "args": {_short(role): "<text>" for role in names}}, ensure_ascii=False)
+
+
 def frames_block(
     view: JsonObject,
     *,
@@ -231,9 +239,10 @@ def frames_block(
     native = [a for a in afford if a in own]
     calls = [a for a in afford if a not in OWN_TOOLS and a not in native]
     if calls:
+        shapes = "; ".join(_call_shape(name, frames) for name in calls)
         lines.append(
-            f"You may call: {', '.join(calls)} (with run_phrase). A call changes the work once; ask the person for "
-            "a role that is not given instead of guessing it."
+            f"You may call: {', '.join(calls)} (with run_phrase, whose arguments are {shapes}). A call changes the work "
+            "once; ask the person for a role that is not given instead of guessing it."
         )
     if native:
         real = natively or {}

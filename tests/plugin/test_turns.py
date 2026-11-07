@@ -371,3 +371,20 @@ def test_a_block_that_affords_teaching_says_a_phrase_is_not_a_skill() -> None:
     assert "skill_manage" not in frames_block(
         {"frames": [{"name": "yes", "kind": "reply"}], "affordances": ["web_search"]}
     )
+
+
+def test_the_block_shows_how_to_call_a_phrase_and_holds_no_value_in_that_line():
+    from plugin.turns import frames_block
+
+    phrase = {"name": "research.t1.0", "kind": "phrase", "roles": {"X": "sourdough hydration"}, "complete": True}
+    block = frames_block({"frames": [phrase], "affordances": ["research.t1.0"]})
+    shape = next(line for line in block.splitlines() if line.startswith("You may call"))
+    assert '{"phrase": "research.t1.0", "args": {"X": "<text>"}}' in shape
+    assert "sourdough" not in shape
+
+
+def test_the_call_shape_of_a_phrase_read_with_no_roles_has_empty_args():
+    from plugin.turns import frames_block
+
+    block = frames_block({"frames": [{"name": "t.1"}], "affordances": ["other.2"]})
+    assert '{"phrase": "other.2", "args": {}}' in block

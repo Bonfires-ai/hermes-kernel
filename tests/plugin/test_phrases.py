@@ -15,7 +15,7 @@ from plugin.client import Refused, Unauthorized, Unavailable
 from plugin.guide import Editor, GuideData
 from plugin.ledger import FENCE_ALL, StepLedger
 from plugin.runs import PhraseRun, RunOutcome
-from plugin.tools import KernelTools, describe_run
+from plugin.tools import SCHEMAS, KernelTools, describe_run
 from plugin.turns import KernelTurns, LocalTurn
 
 RESULT = "Sourdough starter notes: feed 1:1:1 daily; rye starters are forgiving."
@@ -156,6 +156,28 @@ def test_run_phrase_runs_its_steps_through_dispatch_and_reports(env):
     assert [r[:2] for r in client.reports] == [("s1", "committed"), ("s2", "committed")]
     assert client.reports[0][2] == RESULT  # the service gets the raw text
     assert answer.index("<untrusted_tool_result") < answer.index(RESULT)  # the model gets it fenced
+
+
+def test_a_slot_at_the_top_level_is_folded_into_args(env):
+    client = Client(view())
+    tools, _, _, _ = build(client)
+    ask(tools, "run_phrase", {"phrase": "research", "X": "bread"})
+    assert client.called == [("m1", "research", {"X": "bread"})]
+
+
+def test_an_empty_args_folds_too_and_a_given_one_wins(env):
+    client = Client(view(), view())
+    tools, _, _, _ = build(client)
+    ask(tools, "run_phrase", {"phrase": "research", "args": {}, "X": "bread"})
+    ask(tools, "run_phrase", {"phrase": "research", "args": {"X": "rye"}, "Y": "stray"})
+    assert client.called == [("m1", "research", {"X": "bread"}), ("m1", "research", {"X": "rye"})]
+
+
+def test_a_top_level_slot_gets_past_the_schema_of_a_deferred_call():
+    # Hermes validates a `tool_call` against this schema (when jsonschema is installed): False refuses a slot up there
+    parameters = SCHEMAS["run_phrase"]["parameters"]
+    assert parameters.get("additionalProperties") is not False
+    assert parameters["required"] == ["phrase"]
 
 
 def test_run_phrase_refuses_a_plain_tool(env):

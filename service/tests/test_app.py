@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterator
 
 import pytest
@@ -140,3 +141,18 @@ def test_teach_and_offer_routes_accept_structured_steps(client: TestClient, mk: 
         f"/v1/turns/{editor['turn_id']}/offers", json={"forms": ["sitrep {X}"], "body": [step]}, headers=AUTH
     )
     assert offer.status_code == 200 and offer.json()["offer"] is None
+
+
+def test_a_refused_call_is_logged_by_its_reason_with_no_value(
+    client: TestClient, caplog: pytest.LogCaptureFixture
+) -> None:
+    secret = "the-address-of-the-safehouse"
+    begun = _begin(client)
+    with caplog.at_level(logging.INFO):
+        refused = client.post(
+            f"/v1/turns/{begun['turn_id']}/calls", json={"tool": "give.d1.0", "args": {"X": secret}}, headers=AUTH
+        )
+    assert refused.status_code == 409 and secret in refused.json()["detail"]  # the sentence goes back to the model
+    lines = [r.getMessage() for r in caplog.records if r.name.startswith("kernel_turns")]
+    assert any("call_refused" in line and "reason=not_read" in line and "tool=give.d1.0" in line for line in lines)
+    assert secret not in caplog.text

@@ -275,3 +275,34 @@ async def test_a_phrase_the_kernel_read_as_another_is_not_called(groups: SingleB
         await engine.call(view.turn_id, "file.d3.0", {"X": "JUJ-3"})
     stored = await store.get_turn(view.turn_id)
     assert stored is not None and stored.children == []
+
+
+SECRET = "the-address-of-the-safehouse"
+
+
+async def test_every_refused_call_carries_a_reason_class_with_no_value_in_it(groups: SingleBonfire) -> None:
+    mk = FakeMk(
+        {
+            "file it": Script(
+                steps=[], partial=True, frames=[frame("file.d3.0", "phrase", construction="frame.file.d3.0.file")]
+            )
+        }
+    )
+    mk.rows = [FILE_ROW]
+    engine, _ = await _engine(mk, groups)
+    view = await engine.begin(team_turn("file it"))
+    for tool, args, reason in (
+        ("file.d3.0", {}, "slot_missing"),
+        ("file.d3.0", {"Y": SECRET}, "stray_arg"),
+        ("file.d3.0", {"X": 7}, "stray_arg"),
+        ("file.d3.0", {"X": SECRET}, "not_read"),
+        ("nothing.at.all", {"X": SECRET}, "unknown"),
+        ("teach_phrase", {}, "own_route"),
+        ("think", {}, "think_step"),
+    ):
+        with pytest.raises(Refused) as refused:
+            await engine.call(view.turn_id, tool, args)
+        assert refused.value.why == reason and SECRET not in refused.value.why
+    with pytest.raises(Refused) as refused:
+        await engine.call(view.turn_id, "file.d3.0", {"X": SECRET})
+    assert SECRET in refused.value.detail  # the sentence for the model holds it, so the log never takes the sentence

@@ -91,8 +91,12 @@ CANNOT_CHECK = "Step {n}: I couldn't check that step's tool, so nothing was sent
 Handler = Callable[..., str]
 
 
-def _schema(name: str, description: str, properties: dict[str, Any], required: list[str]) -> dict[str, Any]:
-    parameters: dict[str, Any] = {"type": "object", "properties": properties, "additionalProperties": False}
+def _schema(
+    name: str, description: str, properties: dict[str, Any], required: list[str], *, closed: bool = True
+) -> dict[str, Any]:
+    parameters: dict[str, Any] = {"type": "object", "properties": properties}
+    if closed:
+        parameters["additionalProperties"] = False
     if required:
         parameters["required"] = required
     return {"name": name, "description": description, "parameters": parameters}
@@ -149,6 +153,7 @@ SCHEMAS: dict[str, dict[str, Any]] = {
             },
         },
         ["phrase"],
+        closed=False,  # Hermes validates a deferred call against this: a role given beside `phrase` must reach the fold
     ),
     "offer_phrase": _schema(
         "offer_phrase",
@@ -209,6 +214,8 @@ SCHEMAS: dict[str, dict[str, Any]] = {
     ),
 }
 
+_RUN_PHRASE_OWN = frozenset(SCHEMAS["run_phrase"]["parameters"]["properties"])
+
 _EMOJI = {
     "run_phrase": "▶️",
     "offer_phrase": "💡",
@@ -264,6 +271,14 @@ def think_lines(instruction: str, given: str | None, phrase: str | None, carried
         "Nothing after this step has run."
     )
     return lines
+
+
+def _phrase_args(args: dict[str, Any]) -> JsonObject:
+    """`run_phrase`'s phrase arguments: `args`, or when that is absent or empty, what was given beside the tool's own
+    parameters (a model that has not read the schema puts a role there, and it must not arrive as no argument at all)."""
+    raw = args.get("args")
+    given = raw if isinstance(raw, dict) and raw else {k: v for k, v in args.items() if k not in _RUN_PHRASE_OWN}
+    return {str(k): v for k, v in given.items()}
 
 
 def _is_timeout(exc: Unavailable) -> bool:
@@ -372,8 +387,7 @@ class KernelTools:
 
     def run_phrase(self, args: dict[str, Any], **kwargs: Any) -> str:
         phrase = str(args.get("phrase") or "").strip()
-        raw = args.get("args")
-        call_args: JsonObject = {str(k): v for k, v in raw.items()} if isinstance(raw, dict) else {}
+        call_args = _phrase_args(args)
 
         def act(turn: LocalTurn, client: ServiceClient) -> str:
             if not phrase:

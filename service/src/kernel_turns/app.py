@@ -235,7 +235,16 @@ def create_app(
 
     @v1.post("/turns/{turn_id}/calls")
     async def call_tool(turn_id: str, req: CallRequest) -> CallView:
-        return await engine.call(turn_id, req.tool, req.args)
+        try:
+            return await engine.call(turn_id, req.tool, req.args)
+        except MkError as exc:
+            # The class and how many arguments, so a failure can be read from the logs: never `detail`, which can quote
+            # what the person said.
+            why = exc.why if isinstance(exc, Refused) else type(exc).__name__
+            log.warning(
+                "kernel_turns.call_refused: reason=%s tool=%s args=%d turn=%s", why, req.tool, len(req.args), turn_id
+            )
+            raise
 
     @v1.post("/turns/{turn_id}/offers")
     async def offer_phrase(turn_id: str, req: OfferRequest) -> TurnView:
