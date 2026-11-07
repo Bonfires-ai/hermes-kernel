@@ -194,3 +194,24 @@ def test_a_rebuilt_provider_keeps_the_counter_and_the_carried_conversation(env):
     rebuilt = start("s2", platform="cli")
     rebuilt.sync_turn("ok", "ok", session_id="s2")
     assert env.made_capture.turns[-1][0] == "cli:s1" and env.made_capture.turns[-1][5] == 3
+
+
+def test_a_saved_url_is_read_under_hermes_own_home(tmp_path, monkeypatch):
+    import hermes_constants  # pyright: ignore[reportMissingImports]
+
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: tmp_path)
+    KernelMemory().save_config({"url": "http://kernel.example:9"}, str(tmp_path))
+    assert shared.configured_url() == "http://kernel.example:9"
+
+
+def test_the_block_is_true_with_the_service_up_or_down(env):
+    block = KernelMemory().system_prompt_block()
+    assert "automatically" not in block
+    assert "when the memory service is reachable" in block
+    for name in ("run_phrase", "offer_phrase", "teach_phrase", "phrase_continue", "search_memory"):
+        assert name in block
+    assert "5 minutes" in block
+    env.client = None
+    off = KernelMemory().system_prompt_block()
+    assert "not set up" in off and "run_phrase" not in off

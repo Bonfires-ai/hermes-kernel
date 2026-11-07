@@ -6,3 +6,5 @@ kind: standalone
 description: Makes the memory-kernel turn service this Hermes's memory and turn reader.
 # Nothing is mandatory here: a missing token is reported by the provider's is_available(), visibly.
 requires_env: []
+provides_tools: [run_phrase, offer_phrase, teach_phrase, confirm_phrase, phrase_continue]
+provides_hooks: [pre_gateway_dispatch, pre_llm_call, post_tool_call]

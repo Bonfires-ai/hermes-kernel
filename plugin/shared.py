@@ -49,15 +49,14 @@ _shared: Shared | None = None
 
 
 def configured_url() -> str:
-    """`url` from `<HERMES_HOME>/hermes-kernel.json`, written by `save_config`; "" when absent or unreadable."""
-    home = os.environ.get("HERMES_HOME", "").strip()
-    if not home:
-        return ""
+    """`url` from `hermes-kernel.json` under Hermes's home, written by `save_config`; "" when absent or unreadable."""
     try:
-        data = json.loads((Path(home) / CONFIG_FILE).read_text(encoding="utf-8"))
+        from hermes_constants import get_hermes_home  # pyright: ignore[reportMissingImports]
+
+        data = json.loads((Path(str(get_hermes_home())) / CONFIG_FILE).read_text(encoding="utf-8"))
         value = data.get("url") if isinstance(data, dict) else None
         return value.strip() if isinstance(value, str) else ""
-    except (OSError, ValueError):
+    except Exception:  # noqa: BLE001  no home, no file or unreadable: the default URL
         return ""
 
 

@@ -123,9 +123,14 @@ class KernelMemory(MemoryProvider):
     # recall
 
     def system_prompt_block(self) -> str:
+        if get_shared().client is None:
+            return "Long-term memory is not set up here (no token), so there is nothing to search or to teach."
         return (
-            "Long-term memory from past conversations is added to your context automatically when it is relevant. "
-            "The search_memory tool looks further."
+            "Long-term memory from past conversations is added to your context when the memory service is "
+            "reachable, and the search_memory tool looks further. A conversation reaches memory after its session "
+            "closes, up to about 5 minutes later; a new fact needs no restart. Phrases are read-only here: "
+            "run_phrase runs one, offer_phrase and teach_phrase propose and draft one, and phrase_continue goes "
+            "on when one is waiting. Load the hermes-kernel skill for how."
         )
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:

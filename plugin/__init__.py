@@ -55,6 +55,33 @@ def _ledger_path() -> Path | None:
         return None
 
 
+def _fenced(what: str, fn, *args) -> None:
+    """Run one registration; a failure costs only that registration."""
+    try:
+        fn(*args)
+    except Exception:  # noqa: BLE001  plain Hermes still works without it
+        log.exception("hermes-kernel: %s did not register", what)
+
+
+def _register_command(ctx) -> None:
+    from .command import kernel_command
+
+    ctx.register_command(
+        "kernel",
+        kernel_command,
+        description="Is memory saving? '/kernel retry <session id>' retries a session that failed to build.",
+        args_hint="[retry <session id>]",
+    )
+
+
+def _register_skill(ctx) -> None:
+    ctx.register_skill(
+        "hermes-kernel",
+        Path(__file__).resolve().parent / "skills" / "hermes-kernel" / "SKILL.md",
+        description="Reading the kernel's block, running and teaching phrases, and when memory arrives.",
+    )
+
+
 def register(ctx) -> None:
     if __name__ != _CANON:
         return _canonical().register(ctx)
@@ -93,11 +120,15 @@ def register(ctx) -> None:
                 )
             turns, call_log = shared.turns, shared.call_log
         if turns is not None:
-            ctx.register_hook("pre_gateway_dispatch", turns.on_gateway_dispatch)
-            ctx.register_hook("pre_llm_call", turns.on_pre_llm_call)
-            ctx.register_hook("post_tool_call", call_log.on_post_tool_call)
+            _fenced("the gateway hook", ctx.register_hook, "pre_gateway_dispatch", turns.on_gateway_dispatch)
+            _fenced("the prompt hook", ctx.register_hook, "pre_llm_call", turns.on_pre_llm_call)
         if new_tools is not None:
             register_tools(ctx, new_tools)  # once: Hermes defers them behind `tool_search` (v0.23.0)
-        log.info("hermes-kernel loaded (general path)")  # commands arrive in a later task
+        if call_log is not None:
+            _fenced("the tool-call hook", ctx.register_hook, "post_tool_call", call_log.on_post_tool_call)
+        if turns is not None:  # no token: the provider alone says so, visibly
+            _fenced("the /kernel command", _register_command, ctx)
+            _fenced("the skill", _register_skill, ctx)
+        log.info("hermes-kernel loaded (general path)")
         return
     ctx.register_memory_provider(KernelMemory())
