@@ -38,6 +38,7 @@ from kernel_turns.sessions import (
     SessionStore,
     SessionTake,
 )
+from kernel_turns.status import StatusView, build_status
 from kernel_turns.store import Doc, MongoTurnStore, TurnStore
 from kernel_turns.teaching import ConfirmRequest, ConfirmView, DraftView, TeachDraft, Teaching
 from kernel_turns.turns import BeginTurn, TurnEngine, TurnView, UnknownTurn
@@ -69,6 +70,17 @@ class ReportRequest(BaseModel):
     #: the tool's result (null when it returned nothing)
     value: JsonValue = None
     detail: str | None = None
+
+
+class ContextRequest(BaseModel):
+    query: str = Field(min_length=1)
+    speaker: str | None = None
+
+
+class ContextView(BaseModel):
+    context: str
+    #: true when memory could not be read (no bonfire yet, or mk away): the plugin treats it as no recall
+    degraded: bool
 
 
 class TurnTrace(TurnRecord):
@@ -274,6 +286,19 @@ def create_app(
         if outcome == "not_failed":
             raise HTTPException(409, "only a failed session can be retried")
         return Response(status_code=204)
+
+    @v1.post("/context")
+    async def recall(req: ContextRequest) -> ContextView:
+        try:
+            text, degraded = await kernel.context(settings.bonfire_id, req.query, req.speaker)
+        except MkError as exc:  # no bonfire yet, busy or away: never an error for the plugin
+            log.info("kernel_turns.context_unavailable: %s", exc)
+            return ContextView(context="", degraded=True)
+        return ContextView(context=text, degraded=degraded)
+
+    @v1.get("/status")
+    async def status() -> StatusView:
+        return await build_status(kernel, session_store, settings.bonfire_id)
 
     app.include_router(v1)
 

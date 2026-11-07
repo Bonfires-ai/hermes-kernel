@@ -14,7 +14,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
-from kernel_turns.mk_client import KernelBusy, KernelDown, NotTeacher, PlanGone, Refused
+from kernel_turns.mk_client import KernelBusy, KernelDown, NotFounded, NotTeacher, PlanGone, Refused
 from kernel_turns.models import JsonValue, LedgerRow, TurnRecord
 from kernel_turns.store import MemoryTurnStore
 from kernel_turns.turns import BeginTurn
@@ -68,6 +68,9 @@ class FakeMk:
         self.teach_answer: dict[str, JsonValue] | None = None
         self.rows: list[dict[str, JsonValue]] = []
         self.catalogues: dict[str, dict[str, JsonValue]] = {}
+        #: the bonfire has no first session yet: teach, confirm, catalogue and context answer 404
+        self.unborn = False
+        self.healthz: dict[str, JsonValue] = {"status": "ok", "version": "2.0.0", "bonfires": {}, "spend": {}}
         self._n = 0
 
     # -- helpers for tests ---------------------------------------------------------------------------------------------
@@ -91,6 +94,8 @@ class FakeMk:
             raise KernelDown("mk serve unreachable (ConnectError): connection refused")
         if self.busy:
             raise KernelBusy("bonfire is teaching: call again later", retry_after=2.0)
+        if self.unborn and name in ("teach", "confirm", "put_catalogue", "context"):
+            raise NotFounded("unknown bonfire")
 
     # -- turns ---------------------------------------------------------------------------------------------------------
 
@@ -250,9 +255,14 @@ class FakeMk:
             raise Refused("catalogue: schema_version is required")
         self.catalogues[bonfire] = dict(catalogue)
 
-    async def context(self, bonfire: str, query: str, speaker: str | None) -> str:
+    async def context(self, bonfire: str, query: str, speaker: str | None) -> tuple[str, bool]:
         self._check("context", query)
-        return ""
+        return "", False
+
+    async def health(self) -> dict[str, JsonValue]:
+        if self.down:
+            raise KernelDown("mk serve unreachable (ConnectError): connection refused")
+        return self.healthz
 
 
 # -- a store that logs its writes ----------------------------------------------------------------------------------------

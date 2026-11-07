@@ -136,6 +136,17 @@ class SessionStore(Protocol):
         """``failed`` back to ``closed`` with ``reason`` cleared and ``attempts`` 0."""
         ...
 
+    async def waiting(self, bonfire_id: str) -> list[Session]:
+        """The bonfire's sessions in state ``open``, ``closed``, ``running``, ``held`` or ``failed``."""
+        ...
+
+    async def last_built_at(self, bonfire_id: str) -> datetime | None:
+        """The newest ``built_at`` of the bonfire's sessions."""
+        ...
+
+
+WAITING_STATES = ("open", "closed", "running", "held", "failed")
+
 
 class MemorySessionStore:
     """``SessionStore`` in process memory; ``sessions`` and ``messages`` are open for tests to read and set."""
@@ -214,6 +225,15 @@ class MemorySessionStore:
             return "not_failed"
         session.state, session.reason, session.attempts = "closed", None, 0
         return "retried"
+
+    async def waiting(self, bonfire_id: str) -> list[Session]:
+        return [
+            s.model_copy() for s in self.sessions.values() if s.bonfire_id == bonfire_id and s.state in WAITING_STATES
+        ]
+
+    async def last_built_at(self, bonfire_id: str) -> datetime | None:
+        built = [s.built_at for s in self.sessions.values() if s.bonfire_id == bonfire_id and s.built_at is not None]
+        return max(built, default=None)
 
 
 class MongoSessionStore:
@@ -323,6 +343,17 @@ class MongoSessionStore:
         if result.modified_count == 1:
             return "retried"
         return "not_failed" if await self._sessions.find_one({"_id": session_id}, {"_id": 1}) else "unknown"
+
+    async def waiting(self, bonfire_id: str) -> list[Session]:
+        cursor = self._sessions.find({"bonfire_id": bonfire_id, "state": {"$in": list(WAITING_STATES)}})
+        return [_session(doc) async for doc in cursor]
+
+    async def last_built_at(self, bonfire_id: str) -> datetime | None:
+        doc = await self._sessions.find_one(
+            {"bonfire_id": bonfire_id, "built_at": {"$ne": None}}, {"built_at": 1}, sort=[("built_at", -1)]
+        )
+        built = doc.get("built_at") if doc else None
+        return built if isinstance(built, datetime) else None
 
 
 def _session(doc: Doc) -> Session:

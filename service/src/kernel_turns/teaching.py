@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from kernel_turns.affordances import CONFIRM, TEACH
 from kernel_turns.groups import GroupFinder
-from kernel_turns.mk_client import KernelApi, Refused
+from kernel_turns.mk_client import KernelApi, NotFounded, Refused
 from kernel_turns.models import BodyStep, Frame, JsonValue, Runner
 from kernel_turns.store import TurnStore
 from kernel_turns.turns import UnknownTurn
@@ -203,14 +203,21 @@ class Teaching:
     ) -> None:
         """Install the agent's catalogue in the kernel, then store it as the agent source and as the merged catalogue.
         Stored only after the kernel accepts it, so a failed install is retried. A catalogue identical to the one the
-        kernel last accepted installs nothing: every install drops the bonfire's in-flight plans."""
+        kernel last accepted installs nothing: every install drops the bonfire's in-flight plans. A bonfire that does
+        not exist yet (``NotFounded``) keeps the agent source and answers as if installed; the merged catalogue is
+        stored only once the kernel has it, so the same catalogue is installed after founding."""
         found = await self._groups.find(platform, group)
         async with self._installing.setdefault((platform, group), asyncio.Lock()):
             held = await self._store.source(platform, group, source)
-            if held is not None and _by_name(held) == _by_name(catalogue):
-                return
             merged = merge_sources(catalogue)
-            await self._mk.put_catalogue(found.bonfire_id, merged)
+            installed = await self._store.catalogue(platform, group)  # stored only once the kernel has taken it
+            if held is not None and _by_name(held) == _by_name(catalogue) and installed is not None:
+                return
+            try:
+                await self._mk.put_catalogue(found.bonfire_id, merged)
+            except NotFounded:
+                await self._store.save_source(platform, group, source, catalogue)
+                return
             await self._store.save_source(platform, group, source, catalogue)
             await self._store.save_catalogue(platform, group, merged)
 

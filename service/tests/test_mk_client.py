@@ -151,7 +151,7 @@ async def test_reads_return_their_rows() -> None:
     assert await mk.constructions(BONFIRE) == rows
     assert await mk.get_catalogue(BONFIRE) == {"sha256": "ab", "tools": [{"name": "look"}]}
     assert await mk.put_catalogue(BONFIRE, {"schema_version": "kernel-catalogue/v1", "tools": []}) is None
-    assert await mk.context(BONFIRE, "who has the herb?", "Ana") == "Ana has the herb."
+    assert await mk.context(BONFIRE, "who has the herb?", "Ana") == ("Ana has the herb.", False)
     with pytest.raises(KernelDown):
         await mk.teach(BONFIRE, {"forms": ["brew {X}"], "body": ["take water"], "teacher": "Ana", "chat_id": "c"})
     await mk.aclose()

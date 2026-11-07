@@ -10,6 +10,7 @@ Status codes become domain exceptions (the app maps them to HTTP):
   ``committed=``. A 404 anywhere else (``POST …/plan`` included) names an unknown bonfire: that is a ``Refused``, never
   "the plan is gone", so a re-plan can never loop on it.
 * ``Refused(detail)``: 400, 409 or 422, carrying the kernel's ``reason``.
+* ``NotFounded`` (a ``Refused``): a 404 off the plan routes: no such bonfire yet (it is founded by the first session).
 * ``NotTeacher``: 403 (a confirm by someone other than the draft's teacher).
 * ``KernelBusy``: a 503 again after waiting its ``Retry-After`` once (capped at 5 s; 1 s when it names none).
 * ``KernelDown``: a connect error, a timeout, any other status, or a body that is not JSON of the expected shape.
@@ -50,6 +51,15 @@ class Refused(MkError):
     """The kernel refused the request (400, 409, 422); ``detail`` is its reason."""
 
 
+class NotFounded(Refused):
+    """The bonfire does not exist yet: it is founded when the first session is built, which can be many minutes after
+    install (mk answers 404). ``detail`` is something to say to a person; the kernel's own words follow in brackets."""
+
+    def __init__(self, kernel_detail: str = "") -> None:
+        said = "I can start learning phrases once the first conversation has been saved."
+        super().__init__(f"{said} [{kernel_detail}]" if kernel_detail else said)
+
+
 class NotTeacher(MkError):
     """A confirm by someone other than the draft's teacher (403)."""
 
@@ -87,7 +97,9 @@ class KernelApi(Protocol):
 
     async def put_catalogue(self, bonfire: str, catalogue: Mapping[str, JsonValue]) -> None: ...
 
-    async def context(self, bonfire: str, query: str, speaker: str | None) -> str: ...
+    async def context(self, bonfire: str, query: str, speaker: str | None) -> tuple[str, bool]: ...
+
+    async def health(self) -> dict[str, JsonValue]: ...
 
 
 def _seg(value: str) -> str:
@@ -191,13 +203,25 @@ class MkClient:
 
     # -- memory -----------------------------------------------------------------------------------------------------
 
-    async def context(self, bonfire: str, query: str, speaker: str | None) -> str:
+    async def context(self, bonfire: str, query: str, speaker: str | None) -> tuple[str, bool]:
+        """The recalled text and whether mk could not read (``degraded``)."""
         body: dict[str, JsonValue] = {"query": query}
         if speaker is not None:
             body["speaker"] = speaker
         out = _object(await self._call("POST", f"{self._root(bonfire)}/context", body=body), "a context")
         text = out.get("context")
-        return text if isinstance(text, str) else ""
+        return (text if isinstance(text, str) else ""), out.get("degraded") is True
+
+    async def health(self) -> dict[str, JsonValue]:
+        """``GET /healthz``. A 503 (mk is warming) with an object body is an answer, not an error; nothing is retried."""
+        response = await self._send("GET", "/healthz", None, 5.0)
+        try:
+            body: JsonValue = response.json()
+        except ValueError:
+            body = None
+        if response.status_code in (200, 503) and isinstance(body, dict):
+            return body
+        raise KernelDown(f"mk serve answered GET /healthz with {response.status_code}")
 
     # -- transport --------------------------------------------------------------------------------------------------
 
@@ -230,6 +254,8 @@ class MkClient:
         detail = _detail(response)
         if status == 404 and plan_route:
             raise PlanGone(detail)
+        if status == 404:
+            raise NotFounded(detail)
         if status == 403:
             raise NotTeacher(detail)
         if status in (400, 404, 409, 422):
