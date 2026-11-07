@@ -46,8 +46,8 @@ def env(tmp_path, monkeypatch):
     monkeypatch.delenv("HERMES_HOME", raising=False)
     shared.reset_shared()
     sh = shared.get_shared()
-    sh.client = FakeClient()  # type: ignore[assignment]
-    sh.made_capture = FakeCapture()  # type: ignore[assignment]
+    sh.client = FakeClient()  # pyright: ignore[reportAttributeAccessIssue]
+    sh.made_capture = FakeCapture()  # pyright: ignore[reportAttributeAccessIssue]
     yield sh
     shared.reset_shared()
 
@@ -109,13 +109,61 @@ def test_on_session_end_and_reset_close_the_session(env):
     provider = start("s1", platform="cli")
     provider.on_session_end([])
     assert env.made_capture.closed == ["cli:s1"]
-    provider.on_session_switch("s2", parent_session_id="s1", reset=True)  # Hermes ends, then switches: once
-    assert env.made_capture.closed == ["cli:s1"]
-    provider.initialize("s2", platform="cli")
+    provider.on_session_switch("s2", parent_session_id="s1", reset=True)  # a second close is harmless
+    assert env.made_capture.closed == ["cli:s1", "cli:s1"]
     provider.on_session_switch("s2", parent_session_id="s2", rewound=True)
-    assert env.made_capture.closed == ["cli:s1"]
+    assert len(env.made_capture.closed) == 2
     provider.on_session_switch("s3", parent_session_id="s2", reset=True)
-    assert env.made_capture.closed == ["cli:s1", "cli:s2"]
+    assert env.made_capture.closed[-1] == "cli:s2"
+
+
+def test_a_switch_without_reset_keeps_the_conversation_and_keeps_capturing(env):
+    provider = start("s1", platform="cli")
+    provider.sync_turn("a", "b", session_id="s1")
+    provider.on_session_switch("s2", parent_session_id="s1", reset=False)  # compression: no initialize
+    provider.sync_turn("c", "d", session_id="s2")
+    assert provider.prefetch("q", session_id="s2") == env.client.answer
+    assert [t[0] for t in env.made_capture.turns] == ["cli:s1", "cli:s1"]
+    assert env.made_capture.turns[1][5] == 2  # the turn count carries over
+    assert env.made_capture.closed == []
+
+
+def test_a_reset_switch_closes_the_old_conversation_and_starts_another(env):
+    cli = start("s1", platform="cli")
+    cli.on_session_switch("s2", parent_session_id="s1", reset=True)
+    cli.sync_turn("a", "b", session_id="s2")
+    assert env.made_capture.closed == ["cli:s1"]
+    assert env.made_capture.turns[0][0] == "cli:s2"
+    chat = start("t1", platform="telegram", chat_id="12")
+    chat.on_session_switch("t2", parent_session_id="t1", reset=True)
+    chat.sync_turn("a", "b", session_id="t2")
+    assert env.made_capture.closed[-1] == "telegram:12" and env.made_capture.turns[-1][0] == "telegram:12"
+
+
+def test_two_session_ends_with_a_turn_between_both_close(env):
+    provider = start("s1", platform="cli")
+    provider.on_session_end([])  # compression commits in place
+    provider.sync_turn("a", "b", session_id="s1")
+    provider.on_session_end([])
+    assert env.made_capture.closed == ["cli:s1", "cli:s1"]
+
+
+def test_repeated_ok_gets_distinct_turn_numbers_without_messages(env):
+    provider = start("s1")
+    for _ in range(3):
+        provider.sync_turn("ok", "ok", session_id="s1")
+    assert [t[5] for t in env.made_capture.turns] == [1, 2, 3]
+
+
+def test_search_memory_uses_the_same_speaker_as_prefetch(env):
+    provider = start(user_id="uid:1", user_name="Kira")
+    provider.handle_tool_call("search_memory", {"query": "cat"})
+    assert env.client.calls[-1][1] == "Kira"
+
+
+def test_the_context_bound_is_a_wide_safety_limit(env):
+    assert MAX_KERNEL_CHARS == 20000
+    assert cut_kernel_block("x" * 10_500) == "x" * 10_500
 
 
 def test_not_configured_is_visible(monkeypatch):

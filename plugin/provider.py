@@ -19,7 +19,8 @@ from .shared import CONFIG_FILE, DEFAULT_URL, get_shared
 
 log = logging.getLogger(__name__)
 
-MAX_KERNEL_CHARS = 8000
+# A safety bound only: mk bounds its own context (about 10 KB), and a tighter cut could drop the relevant line.
+MAX_KERNEL_CHARS = 20000
 CONTEXT_TIMEOUT_S = 6.0
 SPOOL_NAME = "hermes-kernel-spool.jsonl"
 
@@ -52,7 +53,6 @@ class KernelMemory(MemoryProvider):
     def __init__(self) -> None:
         self._author: str | None = None  # last on_turn_start author; the provider is per agent, not per session
         self._session_id = ""
-        self._last_closed = ""  # Hermes ends a session and then switches with reset: close it once
 
     @property
     def name(self) -> str:
@@ -75,21 +75,23 @@ class KernelMemory(MemoryProvider):
     def initialize(self, session_id: str, **kwargs: Any) -> None:
         shared = get_shared()
         self._session_id = session_id
-        info = {
+        info: dict[str, Any] = {
             "agent_context": kwargs.get("agent_context") or "primary",
             "platform": kwargs.get("platform") or "cli",
             "user_id": kwargs.get("user_id"),
             "user_name": kwargs.get("user_name"),
             "chat_id": kwargs.get("chat_id"),
             "agent_identity": kwargs.get("agent_identity"),
+            "turns": 0,
         }
+        info["conversation_id"] = self._derive(info, session_id)
         with shared.lock:
             shared.sessions[session_id] = info
         home = kwargs.get("hermes_home")
         if home:
             capture = shared.capture(Path(home) / SPOOL_NAME)
             if capture is not None:
-                capture.set_agent_handle(info["agent_identity"] or "hermes")
+                capture.set_agent_handle(str(info["agent_identity"] or "hermes"))
 
     def shutdown(self) -> None:
         pass  # durability does not depend on it; the shared Capture outlives any one provider
@@ -103,6 +105,10 @@ class KernelMemory(MemoryProvider):
         return info if info is not None and info["agent_context"] == "primary" else None
 
     def _conversation(self, info: dict[str, Any], session_id: str) -> str:
+        return str(info.get("conversation_id") or self._derive(info, session_id))
+
+    @staticmethod
+    def _derive(info: dict[str, Any], session_id: str) -> str:
         chat = info.get("chat_id")
         return conversation_id(info["platform"], str(chat) if chat else "", session_id)
 
@@ -154,7 +160,9 @@ class KernelMemory(MemoryProvider):
             return
         author = (turn_author or {}).get("name") or (turn_author or {}).get("id")
         speaker = author or self._speaker(info) or "user"
-        turn_number = sum(1 for m in messages or [] if m.get("role") == "user")
+        with shared.lock:
+            info["turns"] += 1
+            turn_number = info["turns"]
         capture.turn(
             self._conversation(info, session_id), str(speaker), user_content, assistant_content, session_id, turn_number
         )
@@ -172,16 +180,25 @@ class KernelMemory(MemoryProvider):
         rewound: bool = False,
         **kwargs: Any,
     ) -> None:
+        shared = get_shared()
         old = self._session_id
         self._session_id = new_session_id
+        with shared.lock:
+            source = shared.sessions.get(old) or shared.sessions.get(parent_session_id)
+            if not isinstance(source, dict):
+                return
+            info = dict(source)
+            if reset:
+                info["turns"] = 0
+                info["conversation_id"] = self._derive(info, new_session_id)
+            shared.sessions.setdefault(new_session_id, info)
         if reset:
             self._close(parent_session_id or old)
 
     def _close(self, session_id: str) -> None:
         info = self._primary(session_id)
         capture = get_shared().made_capture
-        if info is not None and capture is not None and session_id != self._last_closed:
-            self._last_closed = session_id
+        if info is not None and capture is not None:
             capture.close(self._conversation(info, session_id))
 
     # tools
@@ -198,10 +215,10 @@ class KernelMemory(MemoryProvider):
             return json.dumps({"error": "give a query to search for"})
         if client is None:
             return json.dumps({"error": "memory is not set up: HERMES_KERNEL_TOKEN is missing"})
+        info = self._session(self._session_id)
+        speaker = self._speaker(info) if info is not None else self._author
         try:
-            return json.dumps(
-                {"results": cut_kernel_block(client.context(query, self._author, timeout=CONTEXT_TIMEOUT_S))}
-            )
+            return json.dumps({"results": cut_kernel_block(client.context(query, speaker, timeout=CONTEXT_TIMEOUT_S))})
         except Unauthorized:
             return json.dumps({"error": "memory refused the token: check HERMES_KERNEL_TOKEN"})
         except (Unavailable, Refused):
