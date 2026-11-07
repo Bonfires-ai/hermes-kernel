@@ -10,6 +10,8 @@ import plugin
 from plugin.command import status_line
 
 TOOLS = ["run_phrase", "offer_phrase", "teach_phrase", "confirm_phrase", "phrase_continue"]
+#: the call log's `post_tool_call` and the card's
+HOOKS = ["post_tool_call", "post_tool_call", "pre_gateway_dispatch", "pre_llm_call"]
 
 
 class GeneralCtx:
@@ -83,7 +85,7 @@ def impl_shared(tmp_path, monkeypatch):
 def test_register_on_the_general_path_wires_hooks_and_tools(impl_shared, tmp_path, monkeypatch):
     ctx = GeneralCtx()
     plugin.register(ctx)
-    assert ctx.events == ["pre_gateway_dispatch", "pre_llm_call", *TOOLS, "post_tool_call"]
+    assert ctx.events == ["pre_gateway_dispatch", "pre_llm_call", *TOOLS, "post_tool_call", "post_tool_call"]
     assert list(ctx.commands) == ["kernel"]
     assert ctx.providers == []
     name, path = ctx.skills[0]
@@ -93,6 +95,28 @@ def test_register_on_the_general_path_wires_hooks_and_tools(impl_shared, tmp_pat
     assert not ledger.unsure
     ledger.record("k", "v", "web_search")
     assert (tmp_path / sys.modules["hermes_kernel_impl.runs"].LEDGER_FILENAME).exists()
+
+
+class HookCtx(GeneralCtx):
+    """Keeps the callbacks too."""
+
+    def __init__(self):
+        super().__init__()
+        self.callbacks = []
+
+    def register_hook(self, name, fn):
+        super().register_hook(name, fn)
+        self.callbacks.append((name, fn))
+
+
+def test_the_cards_hook_is_the_book_the_tools_hold_on_every_load(impl_shared):
+    for _ in range(2):  # a reload unloads the registrations, and the module and its state stay
+        ctx = HookCtx()
+        plugin.register(ctx)
+        shared = impl_shared.get_shared()
+        assert shared.cards is not None and shared.tools._cards is shared.cards
+        assert ("post_tool_call", shared.cards.on_post_tool_call) in ctx.callbacks
+        assert ("post_tool_call", shared.call_log.on_post_tool_call) in ctx.callbacks
 
 
 def test_register_on_the_provider_path_never_needs_dispatch_tool(impl_shared):
@@ -159,7 +183,7 @@ def test_a_reload_after_the_token_brings_the_hooks_and_tools_and_ends_the_restar
     reloaded = GeneralCtx()  # `hermes plugins enable`: the running gateway rediscovers its plugins
     plugin.register(reloaded)
     assert reloaded.tools == TOOLS
-    assert sorted(reloaded.hooks) == ["post_tool_call", "pre_gateway_dispatch", "pre_llm_call"]
+    assert sorted(reloaded.hooks) == HOOKS
     assert reloaded.skills
     monkeypatch.setattr(impl_shared.get_shared().client, "status", lambda **_: STATUS)
     assert "Phrases are off" not in reloaded.commands["kernel"]("")
@@ -180,7 +204,7 @@ def test_a_second_register_after_a_reload_still_has_the_five_tools(impl_shared):
     plugin.register(second)  # Hermes unloaded the first registrations; the module and its state stayed
     for ctx in (first, second):
         assert ctx.tools == TOOLS
-        assert sorted(ctx.hooks) == ["post_tool_call", "pre_gateway_dispatch", "pre_llm_call"]
+        assert sorted(ctx.hooks) == HOOKS
 
 
 def test_one_hook_failing_costs_only_that_hook(impl_shared, caplog):
@@ -188,7 +212,7 @@ def test_one_hook_failing_costs_only_that_hook(impl_shared, caplog):
     ctx.fail_hook = "pre_llm_call"
     with caplog.at_level(logging.WARNING):
         plugin.register(ctx)
-    assert ctx.hooks == ["pre_gateway_dispatch", "post_tool_call"]
+    assert ctx.hooks == ["pre_gateway_dispatch", "post_tool_call", "post_tool_call"]
     assert ctx.tools == TOOLS
     assert "kernel" in ctx.commands and ctx.skills
 

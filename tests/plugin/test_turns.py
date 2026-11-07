@@ -388,3 +388,76 @@ def test_the_call_shape_of_a_phrase_read_with_no_roles_has_empty_args():
 
     block = frames_block({"frames": [{"name": "t.1"}], "affordances": ["other.2"]})
     assert '{"phrase": "other.2", "args": {}}' in block
+
+
+# -- is the chat known to be private? (`LocalTurn.private`: the card is for one person's own chat)
+
+
+def private_of(env, platform="telegram", chat="42", user="42", said=True, **source):
+    session(env, platform=platform, conversation_id=f"{platform}:{chat}", user_id=user, chat_id=chat)
+    turns = KernelTurns(FakeClient())
+    message = event(platform=platform, chat=chat, user=user)
+    message.source.__dict__.update(source)
+    if said:
+        turns.on_gateway_dispatch(message)
+    turns.on_pre_llm_call(**hook(platform=platform, sender_id=user))
+    local = turns.current("s1")
+    assert local is not None
+    return local.private
+
+
+def test_a_telegram_private_chat_is_private(env):
+    assert private_of(env, chat_type="dm") is True
+
+
+@pytest.mark.parametrize("kind", ["group", "forum", "channel", "thread", "", None, "DM "])
+def test_a_telegram_chat_of_any_other_type_is_not(env, kind):
+    assert private_of(env, chat_type=kind) is False
+
+
+def test_a_chat_with_no_type_is_not(env):
+    assert private_of(env) is False
+
+
+def test_a_telegram_dm_whose_chat_is_not_the_persons_own_is_not(env):
+    """Hermes's chat type defaults to "dm", and a missing Telegram type normalises to it: the id is the second check."""
+    assert private_of(env, chat="-100777", user="42", chat_type="dm") is False
+
+
+@pytest.mark.parametrize("platform", ["slack", "teams", "discord", "whatsapp", "ntfy", "raft", "a2a", "weird"])
+def test_another_platforms_dm_is_unknown_here_so_it_is_not(env, platform):
+    """Slack's group DMs are `dm`, Teams calls an unknown conversation `dm`, an ntfy topic and a Raft channel are always."""
+    assert private_of(env, platform=platform, chat_type="dm") is False
+
+
+def test_a_telegram_turn_with_no_message_matched_is_not(env):
+    assert private_of(env, said=False) is False
+
+
+@pytest.mark.parametrize("platform", ["cli", "tui", "CLI"])
+def test_a_local_session_is_private(env, platform):
+    session(env, platform=platform, conversation_id=f"{platform}:s1")
+    turns = KernelTurns(FakeClient())
+    turns.on_pre_llm_call(**hook(platform=platform))
+    local = turns.current("s1")
+    assert local is not None and local.private is True
+
+
+def test_a_turn_whose_platform_nothing_named_is_not_private_though_it_reads_as_cli(env):
+    client = FakeClient()
+    turns = KernelTurns(client)
+    turns.on_pre_llm_call(
+        **hook(platform="")
+    )  # no session record either: the `cli` of the fallback is not a local session
+    local = turns.current("s1")
+    assert local is not None and local.private is False
+    assert client.calls[0][0]["platform"] == "cli"
+
+
+def test_a_cron_or_api_session_is_not_private(env):
+    for platform in ("cron", "api_server", "webhook", "local"):
+        session(env, platform=platform, conversation_id=f"{platform}:s1")
+        turns = KernelTurns(FakeClient())
+        turns.on_pre_llm_call(**hook(platform=platform))
+        local = turns.current("s1")
+        assert local is not None and local.private is False

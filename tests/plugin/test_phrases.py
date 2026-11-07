@@ -11,6 +11,7 @@ from typing import Any, cast
 import pytest
 
 from plugin import shared
+from plugin.card import CHOICES, CardBook, question
 from plugin.client import Refused, Unauthorized, Unavailable
 from plugin.guide import Editor, GuideData
 from plugin.ledger import FENCE_ALL, StepLedger
@@ -126,6 +127,7 @@ def build(
     local: Any = None,
     read: bool = True,
     ledger: Any = None,
+    cards: Any = None,
 ):
     source = source or Source()
     calls = []
@@ -139,7 +141,8 @@ def build(
         local.affordances = ["research", "web_search", "teach_phrase"]
         local.native = {"web_search"}
     runs = PhraseRun(client, source, run, ledger or StepLedger(None))
-    tools = KernelTools(client, cast(Any, Turns(local if read else None)), runs, source, Editor(source, GuideData()))
+    turns = cast(Any, Turns(local if read else None))
+    tools = KernelTools(client, turns, runs, source, Editor(source, GuideData()), cards)
     return tools, calls, local, source
 
 
@@ -644,3 +647,209 @@ def test_a_failed_first_save_still_leaves_the_next_start_unsure(tmp_path, monkey
         patched.setattr("plugin.ledger.os.replace", lambda *_: (_ for _ in ()).throw(OSError("full")))
         ledger.carry("c1", "web_search", "lost")
     assert StepLedger(path).unsure
+
+
+# -- a card to keep a phrase --------------------------------------------------------------------------------------------
+
+TEACH = {"forms": ["research {X}"], "body": ["look {X} up"]}
+PLAIN = "research {X}: look {X} up"
+YES_ANSWER = (
+    f'Draft d1: {PLAIN}. Answer with just "yes" to keep it.\n'
+    'Read this back to Ana; keep it with confirm_phrase only when they say yes (ask for a plain "yes").'
+)
+
+
+class CardClient(Client):
+    def __init__(self):
+        super().__init__()
+        self.confirmed: list[tuple[str, dict[str, Any]]] = []
+        self.confirm_error: Exception | None = None
+        self.draft: dict[str, Any] = {
+            "draft_id": "d1",
+            "read_back": f'{PLAIN}. Answer with just "yes" to keep it.',
+            "plain": PLAIN,
+            "problems": [],
+        }
+
+    def teach(self, body, *, timeout=30.0):
+        return self.draft
+
+    def confirm(self, draft_id, body, *, timeout=30.0):
+        self.confirmed.append((draft_id, body))
+        if self.confirm_error:
+            raise self.confirm_error
+        return {"phrases": ["research.d1.0"]}
+
+
+def private_turn(**over: Any) -> LocalTurn:
+    return LocalTurn(
+        "h1", "s1", "telegram", "g", "g", "Ana", turn_id="m1", known_platform="telegram", private=True, **over
+    )
+
+
+def card_build(*, local: Any = None) -> tuple[Any, CardClient, CardBook]:
+    client = CardClient()
+    cards = CardBook(cast(Any, client))
+    tools, _, _, _ = build(client, local=local or private_turn(), cards=cards)
+    return tools, client, cards
+
+
+def click(cards: CardBook, choice: str = "Keep it") -> None:
+    response = {
+        "question": question(PLAIN),
+        "choices_offered": list(CHOICES),
+        "status": "answered",
+        "user_response": choice,
+    }
+    cards.on_post_tool_call(
+        tool_name="clarify", result=json.dumps({"responses": [response]}), session_id="s1", status="ok"
+    )
+
+
+def test_a_private_chat_gets_the_card_and_its_exact_questions_value(env):
+    tools, client, cards = card_build()
+    answer = ask(tools, "teach_phrase", TEACH)
+    assert answer.startswith(f"Draft d1: {PLAIN}\n")
+    assert json.loads(answer.split("as JSON: ", 1)[1].split("\n", 1)[0]) == [
+        {"question": question(PLAIN), "choices": list(CHOICES)}
+    ]
+    assert 'just "yes"' not in answer.split("\n", 1)[0]  # the card's read-back is the plain one
+    assert "confirm_phrase" in answer and "Throw it away" in answer and 'plain "yes"' in answer
+    click(cards)  # the card is open: a real answer to it keeps the phrase
+    assert [c[1] for c in client.confirmed] == [
+        {"platform": "telegram", "group": "g", "turn_id": "m1", "by": "Ana", "card": True}
+    ]
+
+
+def test_the_card_keeps_the_kernels_notes(env):
+    tools, client, _ = card_build()
+    client.draft = {
+        **client.draft,
+        "problems": ["form 'research {X}': a note"],
+        "competes": {"research {X}": [{"name": "look", "roles": {"x": "it"}}]},
+    }
+    answer = ask(tools, "teach_phrase", TEACH)
+    assert "a note" in answer and "also reads as" in answer and "as JSON: " in answer
+
+
+def test_a_group_or_unknown_chat_gets_todays_answer_and_opens_no_card(env):
+    local = LocalTurn("h1", "s1", "telegram", "g", "g", "Ana", turn_id="m1", known_platform="telegram")
+    assert local.private is False  # unknown by default
+    tools, client, cards = card_build(local=local)
+    assert ask(tools, "teach_phrase", TEACH) == YES_ANSWER
+    click(cards)
+    assert client.confirmed == []
+
+
+def test_a_draft_with_no_plain_read_back_opens_no_card(env):
+    tools, client, cards = card_build()
+    client.draft = {**client.draft, "plain": ""}
+    assert ask(tools, "teach_phrase", TEACH) == YES_ANSWER
+    click(cards)
+    assert client.confirmed == []
+
+
+def test_with_no_card_book_a_private_chat_gets_todays_answer(env):
+    client = CardClient()
+    tools, _, _, _ = build(client, local=private_turn())
+    assert ask(tools, "teach_phrase", TEACH) == YES_ANSWER
+
+
+def test_a_refused_draft_opens_no_card(env):
+    tools, client, cards = card_build()
+    client.draft = {"draft_id": "", "read_back": "x", "plain": "", "problems": ["no"]}
+    assert "did not take this draft" in ask(tools, "teach_phrase", TEACH)
+    click(cards)
+    assert client.confirmed == []
+
+
+def test_confirm_phrase_has_one_parameter(env):
+    assert list(SCHEMAS["confirm_phrase"]["parameters"]["properties"]) == ["draft_id"]
+    assert SCHEMAS["confirm_phrase"]["parameters"]["additionalProperties"] is False
+
+
+def test_a_card_argument_from_the_model_is_ignored(env):
+    tools, client, cards = card_build()
+    ask(tools, "teach_phrase", TEACH)
+    answer = ask(tools, "confirm_phrase", {"draft_id": "d1", "card": True})
+    assert client.confirmed == [
+        ("d1", {"platform": "telegram", "group": "g", "turn_id": "m1", "by": "Ana"})
+    ]  # today's path, the service judges it; no `card` went out
+    assert answer == "Kept: the phrase is live (research.d1.0)."
+    assert cards.decision("d1") is None
+
+
+def test_after_keep_it_confirm_phrase_says_so_with_no_service_call(env):
+    tools, client, cards = card_build()
+    ask(tools, "teach_phrase", TEACH)
+    click(cards)
+    assert len(client.confirmed) == 1
+    answer = ask(tools, "confirm_phrase", {"draft_id": "d1"})
+    assert len(client.confirmed) == 1
+    assert "research.d1.0" in answer and "live" in answer
+
+
+@pytest.mark.parametrize("choice", ["Throw it away", "Change it"])
+def test_a_draft_turned_down_on_the_card_is_refused_with_no_service_call(env, choice):
+    tools, client, cards = card_build()
+    ask(tools, "teach_phrase", TEACH)
+    click(cards, choice)
+    answer = ask(tools, "confirm_phrase", {"draft_id": "d1"})
+    assert client.confirmed == []
+    assert "turned this draft down" in answer and "Kept" not in answer
+
+
+def test_keep_it_with_the_service_down_then_confirm_phrase_confirms_on_the_retry(env):
+    tools, client, cards = card_build()
+    ask(tools, "teach_phrase", TEACH)
+    client.confirm_error = Unavailable("away")
+    click(cards)
+    assert len(client.confirmed) == 1
+    client.confirm_error = None
+    answer = ask(tools, "confirm_phrase", {"draft_id": "d1"})
+    assert answer == "Kept: the phrase is live (research.d1.0)."
+    assert client.confirmed[1] == client.confirmed[0]  # the same card: same person, same turn
+    assert client.confirmed[1][1]["card"] is True
+    again = ask(tools, "confirm_phrase", {"draft_id": "d1"})
+    assert len(client.confirmed) == 2 and "research.d1.0" in again  # kept now: no third call
+
+
+def test_the_retry_carries_the_identity_of_the_click_not_the_current_turn(env):
+    tools, client, cards = card_build()
+    ask(tools, "teach_phrase", TEACH)
+    client.confirm_error = Unavailable("away")
+    click(cards)
+    client.confirm_error = None
+    later = LocalTurn("h2", "s1", "telegram", "g", "g", "Ana", turn_id="m2", known_platform="telegram")
+    tools._turns.local = later
+    ask(tools, "confirm_phrase", {"draft_id": "d1"})
+    assert client.confirmed[-1][1] == {
+        "platform": "telegram",
+        "group": "g",
+        "turn_id": "m1",
+        "by": "Ana",
+        "card": True,
+    }
+
+
+def test_a_retry_with_the_service_still_down_says_so_and_can_be_retried(env):
+    tools, client, cards = card_build()
+    ask(tools, "teach_phrase", TEACH)
+    client.confirm_error = Unavailable("away")
+    click(cards)
+    assert "not reachable" in ask(tools, "confirm_phrase", {"draft_id": "d1"})
+    client.confirm_error = None
+    assert ask(tools, "confirm_phrase", {"draft_id": "d1"}).startswith("Kept")
+
+
+def test_only_the_recorded_choice_sends_card(env):
+    tools, client, cards = card_build()
+    ask(tools, "teach_phrase", TEACH)
+    client.confirm_error = Unavailable("away")
+    click(cards)
+    client.confirm_error = None
+    ask(tools, "confirm_phrase", {"draft_id": "another"})  # a draft nobody chose goes today's way
+    assert client.confirmed[-1] == (
+        "another",
+        {"platform": "telegram", "group": "g", "turn_id": "m1", "by": "Ana"},
+    )

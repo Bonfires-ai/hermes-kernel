@@ -93,6 +93,7 @@ def register(ctx) -> None:
         from . import guide
         from .agent_source import AgentSource, HermesRegistry, load_read_only
         from .call_log import CallLog
+        from .card import CardBook
         from .ledger import StepLedger
         from .runs import PhraseRun
         from .tools import KernelTools, register_tools
@@ -111,11 +112,14 @@ def register(ctx) -> None:
                 shared.source = source
                 shared.call_log = call_log
                 shared.editor = guide.Editor(source, guide.load())
+                shared.cards = CardBook(shared.client)
                 shared.turns = KernelTurns(shared.client, source=source, call_log=call_log)
             if shared.tools is None and shared.turns is not None and shared.client is not None:
                 shared.runs = PhraseRun(shared.client, shared.source, ctx.dispatch_tool, StepLedger(_ledger_path()))
-                shared.tools = KernelTools(shared.client, shared.turns, shared.runs, shared.source, shared.editor)
-            turns, call_log, tools = shared.turns, shared.call_log, shared.tools
+                shared.tools = KernelTools(
+                    shared.client, shared.turns, shared.runs, shared.source, shared.editor, shared.cards
+                )
+            turns, call_log, tools, cards = shared.turns, shared.call_log, shared.tools, shared.cards
         if turns is not None:
             _fenced("the gateway hook", ctx.register_hook, "pre_gateway_dispatch", turns.on_gateway_dispatch)
             _fenced("the prompt hook", ctx.register_hook, "pre_llm_call", turns.on_pre_llm_call)
@@ -123,6 +127,8 @@ def register(ctx) -> None:
             register_tools(ctx, tools)  # Hermes defers them behind `tool_search` (v0.23.0)
         if call_log is not None:
             _fenced("the tool-call hook", ctx.register_hook, "post_tool_call", call_log.on_post_tool_call)
+        if cards is not None:
+            _fenced("the card hook", ctx.register_hook, "post_tool_call", cards.on_post_tool_call)
         _fenced("the /kernel command", _register_command, ctx)  # with no token too: that is when it is needed
         if turns is not None:
             _fenced("the skill", _register_skill, ctx)

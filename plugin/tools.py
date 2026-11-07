@@ -26,6 +26,11 @@ kernel read, deduped, refused with a sentence). So the tools here are exactly
 - `confirm_phrase(draft_id)` -> `POST /v1/teaching/{id}/confirm` with `by` = the speaker: the phrase ids, or the
   refusal ("not the teacher") verbatim. Only the teacher's yes keeps a phrase; the turn service enforces it.
 
+In a chat known to be private (`LocalTurn.private`), `teach_phrase` opens a card and tells the model to ask with Hermes's
+`clarify` tool. A person's choice on it reaches the plugin directly, from the tool's real result (`card.py`), and never
+through these handlers: `confirm_phrase` then only says what became of the draft, and `card` is never read from the
+model's args.
+
 Hermes calls a handler as `handler(args, task_id=..., session_id=..., user_task=...)` and accepts only a `str` back
 (`tools/registry.py` `dispatch`; a dict becomes a tool error). The speaker, the group and the chat come from the
 session's current turn (`KernelTurns.current`), never from the model's args. Every handler catches everything: a tool
@@ -45,6 +50,7 @@ from typing import Any
 import httpx
 
 from .agent_source import THINK, AgentSource
+from .card import CardBook, card_lines, question
 from .client import Refused, ServiceClient, ServiceError, Unauthorized, Unavailable
 from .fence import BOUND_STEP, closed, fenced, fenced_input, fenced_job
 from .guide import Editor
@@ -85,6 +91,10 @@ NOTHING_WAITING = "Nothing is waiting for you to continue: no phrase of this per
 DROPPED = "Dropped: the phrase will not go on, and no later message shows it waiting. Nothing more of it ran."
 BUSY = "Another call is still working on that phrase, so nothing was dropped. Ask again in a moment."
 NOTHING_TO_DROP = "That phrase does not wait at a step of yours any more, so there was nothing to drop (nothing ran)."
+TURNED_DOWN = (
+    "{person} turned this draft down on the card, so it was not kept and it cannot be kept now. Say so; if they want "
+    "the phrase after all, draft it again with teach_phrase."
+)
 STEP_SHAPE = 'each step is a sentence or a call {"call": "<tool>", "args": {"<param>": "<value>"}} with text values'
 CANNOT_CHECK = "Step {n}: I couldn't check that step's tool, so nothing was sent."
 
@@ -176,8 +186,8 @@ SCHEMAS: dict[str, dict[str, Any]] = {
         'E.g. research {X}: [{"call": "web_search", "args": {"query": "{X}"}}, {"call": "think", "args": '
         '{"instruction": "summarise it in three lines", "input": "it"}}]. '
         "When asked to make a phrase of what you did, draft its steps from the calls your context lists. Nothing is "
-        "kept yet: read the returned read-back to the person teaching it, and keep it with confirm_phrase only when "
-        "they say yes. Phrases are read-only in this version: a step that changes something is refused.",
+        "kept yet: the answer says how to ask the person teaching it (a card to choose on, or read it back and ask "
+        "for a plain yes). Phrases are read-only in this version: a step that changes something is refused.",
         {
             "forms": {**_STRINGS, "description": 'how the person will say it, e.g. "research {X}"'},
             "body": {**_STEPS, "description": _BODY},
@@ -187,8 +197,8 @@ SCHEMAS: dict[str, dict[str, Any]] = {
     ),
     "confirm_phrase": _schema(
         "confirm_phrase",
-        "Keep a drafted phrase, after the person who taught it said yes to its read-back. Only their yes counts: "
-        "anyone else's is refused.",
+        "Keep a drafted phrase, after the person who taught it said yes to its read-back; after a card, hear what "
+        "became of the draft. Only their yes or their own choice on the card counts: anyone else's is refused.",
         {"draft_id": {"type": "string", "description": "the draft id teach_phrase returned"}},
         ["draft_id"],
     ),
@@ -343,12 +353,14 @@ class KernelTools:
         runs: PhraseRun,
         source: AgentSource | None,
         editor: Editor,
+        cards: CardBook | None = None,
     ) -> None:
         self._client = client
         self._turns = turns
         self._runs = runs
         self._source = source
         self._editor = editor
+        self._cards = cards
         self._lock = threading.Lock()
         #: Hermes turns with a teach in flight (or one that ran out of time: the service may still be drafting)
         self._teaching: OrderedDict[str, None] = OrderedDict()
@@ -633,10 +645,15 @@ class KernelTools:
             told = self._editor.lines("teach_phrase", steps, problems)  # the structured step, where it failed
             if not isinstance(draft_id, str) or not draft_id:
                 return "\n".join(["The kernel did not take this draft:", *(f"- {p}" for p in problems), *told])
-            lines = [
-                f"Draft {draft_id}: {draft.get('read_back')}",
-                f'Read this back to {turn.speaker}; keep it with confirm_phrase only when they say yes (ask for a plain "yes").',
-            ]
+            plain = draft.get("plain")
+            if self._cards is not None and turn.private and isinstance(plain, str) and plain:
+                self._cards.open(turn.session_id, draft_id, turn, question(plain))
+                lines = card_lines(draft_id, plain, turn.speaker)
+            else:
+                lines = [
+                    f"Draft {draft_id}: {draft.get('read_back')}",
+                    f'Read this back to {turn.speaker}; keep it with confirm_phrase only when they say yes (ask for a plain "yes").',
+                ]
             if problems:
                 lines += ["The kernel noted:", *(f"- {p}" for p in problems), *told]
             competes = draft.get("competes")
@@ -656,6 +673,13 @@ class KernelTools:
                 return NO_SPEAKER
             if not draft_id:
                 return "Say which draft to keep (the id teach_phrase returned)."
+            cards = self._cards
+            decided = cards.decision(draft_id) if cards is not None else None
+            if decided is not None and decided.kept:
+                ids = ", ".join(decided.phrases) or draft_id
+                return f"Kept: {decided.card.speaker} chose Keep it on the card, and the phrase is live ({ids})."
+            if decided is not None and not decided.chosen:
+                return TURNED_DOWN.format(person=decided.card.speaker)
             if not turn.turn_id:
                 return NO_TURN
             key = f"confirm:{turn.hermes_turn}" if turn.hermes_turn else ""
@@ -663,11 +687,14 @@ class KernelTools:
                 return STILL_CONFIRMING
             timed_out = False
             try:
-                kept = client.confirm(
-                    draft_id,
-                    {"platform": turn.platform, "group": turn.group, "turn_id": turn.turn_id, "by": turn.speaker},
-                    timeout=_TEACH_TIMEOUT_S,
-                )
+                if cards is not None and decided is not None:  # the hook saw their choice: nothing the model passed
+                    kept = cards.resend(decided, timeout=_TEACH_TIMEOUT_S)
+                else:
+                    kept = client.confirm(
+                        draft_id,
+                        {"platform": turn.platform, "group": turn.group, "turn_id": turn.turn_id, "by": turn.speaker},
+                        timeout=_TEACH_TIMEOUT_S,
+                    )
             except Unavailable as exc:
                 timed_out = _is_timeout(exc)  # the service may still keep it: never retried within the turn
                 raise

@@ -35,6 +35,8 @@ class Shared:
         #: the phrase runner and the phrase tools, built once by the general path's `register`; None before
         self.runs: Any = None
         self.tools: Any = None
+        #: the cards to keep a phrase, built with the turn reader; None before
+        self.cards: Any = None
 
     def capture(self, spool_path: Path) -> Capture | None:
         """The one Capture, made on first call (it starts no thread until first use). None without a client."""

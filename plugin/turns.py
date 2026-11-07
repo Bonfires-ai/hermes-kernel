@@ -16,6 +16,13 @@ session id, matched to the turn by the sender's id and the text, each message us
 `None`. With no gateway (the CLI) no such hook fires: the message id is Hermes' `turn_id` and the speaker is the
 session record's `user_name`, then `sender_id`, then "user".
 
+The same event says whether the chat is known to be private (`LocalTurn.private`), which is what a card to keep a phrase
+needs: on a card nothing says who clicked. A local session is private, and so is a Telegram chat of the type `dm` whose
+id is the person's own. Anything else, a turn with no message matched included, is not known to be, and gets the plain
+yes. Hermes's `chat_type` alone does not show it: it defaults to `dm`, Telegram's reading of a missing type is `dm`,
+Slack's group DMs are `dm`, Teams calls a conversation of an unknown type `dm`, and an ntfy topic and a Raft channel are
+always `dm`.
+
 ## The turn
 
 - Only a `primary` session reads: a delegated subagent (`agent_context` in the session record, or a
@@ -62,6 +69,8 @@ _MAX_NAME_CHARS = 80
 _MAX_INBOUND_CHARS = 4000
 #: the two affordances that are tools of their own, not phrases to run
 OWN_TOOLS = ("teach_phrase", "confirm_phrase")
+#: the sessions that hold only the person at this machine (`LocalTurn.known_platform`, never the `cli` fallback)
+LOCAL_PLATFORMS = frozenset({"cli", "tui"})
 
 # Bounded: a long-lived process must not keep one entry per turn forever.
 _TURNS_KEPT = 256
@@ -106,6 +115,8 @@ class Inbound:
     user_id: str | None = None
     #: a turn took this message: no other turn takes it
     used: bool = False
+    #: the chat is known to hold only this person and this Hermes (`_private_chat`)
+    private: bool = False
 
 
 @dataclass
@@ -131,6 +142,8 @@ class LocalTurn:
     #: what the reading afforded the model, and the afforded tools it calls natively (`None`: not read)
     affordances: list[str] | None = None
     native: set[str] = field(default_factory=set)
+    #: the chat is known to be private (the module docstring); unknown is False
+    private: bool = False
 
 
 def _as_str(value: Any) -> str:
@@ -138,6 +151,15 @@ def _as_str(value: Any) -> str:
     if value is None:
         return ""
     return str(getattr(value, "value", value))
+
+
+def _private_chat(platform: str, chat: str, source: Any) -> bool:
+    """Telegram's private chat with this person: of the type `dm`, and its id is theirs (a group's is its own)."""
+    return (
+        platform == "telegram"
+        and _as_str(getattr(source, "chat_type", None)) == "dm"
+        and chat == _as_str(getattr(source, "user_id", None))
+    )
 
 
 def speaker_of(event: Any) -> str | None:
@@ -398,6 +420,7 @@ class KernelTurns:
             at=_iso(getattr(event, "timestamp", None)),
             chat=chat,
             user_id=_as_str(getattr(source, "user_id", None)) or None,
+            private=_private_chat(platform, chat, source),
         )
         with self._lock:
             events = self._inbound.pop(key, None) or []
@@ -486,7 +509,17 @@ class KernelTurns:
         speaker = speaker or info.get("user_name") or sender_id or "user"
         speaker = _as_str(speaker)
         participants = self._note_speaker(conversation, speaker)
-        local = LocalTurn(hermes_turn, session_id, platform, conversation, conversation, speaker, known_platform=known)
+        private = known in LOCAL_PLATFORMS or (inbound is not None and inbound.private)
+        local = LocalTurn(
+            hermes_turn,
+            session_id,
+            platform,
+            conversation,
+            conversation,
+            speaker,
+            known_platform=known,
+            private=private,
+        )
         self._remember(local)
         if self._source is not None:
             try:
