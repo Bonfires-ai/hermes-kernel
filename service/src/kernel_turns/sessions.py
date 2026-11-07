@@ -295,7 +295,7 @@ class MongoSessionStore:
             },
         )
         if counted.matched_count == 0:  # closed since we opened it: the message belongs in the next session
-            await self._messages.delete_one({"_id": message.message_id})
+            await self._messages.delete_one({"_id": message.message_id, "session_id": session.id})
             raise SessionClosed(session.id)
         return seq
 
@@ -386,8 +386,9 @@ class SessionTake:
             return await self._store.close_open(conversation_id, self._clock())
 
     async def close_idle(self) -> int:
-        now = self._clock()
-        return await self._store.close_quiet(now - self._idle, now)
+        async with self._lock:  # never between an add's insert and its update
+            now = self._clock()
+            return await self._store.close_quiet(now - self._idle, now)
 
     async def retry(self, session_id: str) -> Retry:
         return await self._store.retry(session_id)

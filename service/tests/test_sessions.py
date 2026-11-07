@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -139,6 +140,41 @@ async def test_a_resend_after_the_writer_removed_the_text_is_still_a_duplicate()
     result = await take.add([_msg("m1")], HANDLES)
     assert (result.accepted, result.duplicates) == (0, 1)
     assert len(store.sessions) == 1
+
+
+class _Gated(MemorySessionStore):
+    """Holds an add inside the store until released."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.inside, self.release = asyncio.Event(), asyncio.Event()
+
+    async def append(
+        self, session: Session, message: MessageIn, timestamp: datetime, agent_handles: list[str], now: datetime
+    ) -> int | None:
+        self.inside.set()
+        await self.release.wait()
+        return await super().append(session, message, timestamp, agent_handles, now)
+
+
+async def test_a_close_waits_for_an_add_in_flight() -> None:
+    store, clock = _Gated(), Clock()
+    take = SessionTake(store, 1800, 100, clock, bonfire_id="b1")
+    adding = asyncio.create_task(take.add([_msg("m1")], HANDLES))
+    await store.inside.wait()
+    clock.now = T0 + timedelta(seconds=1800)
+    sweeping = asyncio.create_task(take.close_idle())
+    closing = asyncio.create_task(take.close("telegram:1"))
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert not sweeping.done()
+    assert not closing.done()
+    store.release.set()
+    await adding
+    await asyncio.gather(sweeping, closing)
+    (session,) = store.sessions.values()
+    assert (session.state, session.message_count) == ("closed", 1)
+    assert store.messages["m1"].session_id == session.id
 
 
 @pytest.fixture
