@@ -41,31 +41,70 @@ usage() {
 
 # ---------------------------------------------------------------- small file helpers
 
-# env_get FILE KEY: the first value of KEY in FILE, without surrounding spaces or quotes; nothing if absent.
-env_get() {
-  [ -f "$1" ] || return 0
-  grep -E "^$2=" "$1" | head -n 1 | cut -d= -f2- |
-    sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"\(.*\)"$/\1/' -e "s/^'\\(.*\\)'\$/\\1/" || true
+# Temp files live next to their target; one is tracked here so an interrupt or a failure never leaves a copy of a
+# secrets file behind.
+HK_TMP=""
+cleanup() {
+  if [ -n "$HK_TMP" ]; then rm -f "$HK_TMP"; fi
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# new_tmp DIR: a private temp file in DIR, tracked for cleanup.
+new_tmp() {
+  HK_TMP=$(mktemp "$1/$2.XXXXXX") || die "could not create a temporary file in $1"
+  chmod 600 "$HK_TMP"
 }
 
-# env_fill FILE KEY VALUE: set KEY only when it is absent or blank. Returns 0 when it wrote, 1 when it kept the value.
-# The value travels in the environment of awk, never on a command line.
+# env_get FILE KEY: the value compose reads for KEY: the last matching line (an "export " prefix and leading spaces
+# are fine), a quoted value up to its closing quote, an unquoted one up to " #". Nothing if absent.
+env_get() {
+  [ -f "$1" ] || return 0
+  HK_K=$2 awk '
+    BEGIN { k = ENVIRON["HK_K"]; found = 0 }
+    {
+      if (match($0, "^[ \t]*(export[ \t]+)?" k "=")) { line = substr($0, RLENGTH + 1); found = 1 }
+    }
+    END {
+      if (!found) exit
+      v = line
+      sub(/\r$/, "", v)
+      sub(/^[ \t]+/, "", v)
+      c = substr(v, 1, 1)
+      if (c == "\"" || c == "\047") {
+        rest = substr(v, 2); i = index(rest, c)
+        v = (i ? substr(rest, 1, i - 1) : rest)
+      } else {
+        if (v ~ /^#/) v = ""
+        sub(/[ \t]+#.*$/, "", v)
+        sub(/[ \t]+$/, "", v)
+      }
+      print v
+    }
+  ' "$1"
+}
+
+# env_fill FILE KEY VALUE: set KEY only when its value is blank or the key is absent, replacing the last matching
+# line in place. Returns 0 when it wrote, 1 when it kept the value. The value travels in the environment of awk.
 env_fill() {
   _file=$1
   [ -z "$(env_get "$_file" "$2")" ] || return 1
-  _tmp=$(mktemp "$(dirname "$_file")/.hk.XXXXXX")
-  chmod 600 "$_tmp"
+  new_tmp "$(dirname "$_file")" .hk
   if HK_K=$2 HK_V=$3 awk '
-      BEGIN { k = ENVIRON["HK_K"]; v = ENVIRON["HK_V"]; done = 0 }
+      BEGIN { k = ENVIRON["HK_K"]; v = ENVIRON["HK_V"]; last = 0 }
       {
-        if (!done && index($0, k "=") == 1) { print k "=" v; done = 1; next }
-        print
+        L[NR] = $0
+        if (match($0, "^[ \t]*(export[ \t]+)?" k "=")) last = NR
       }
-      END { if (!done) print k "=" v }
-    ' "$_file" >"$_tmp"; then
-    mv "$_tmp" "$_file"
+      END {
+        for (i = 1; i <= NR; i++) { if (i == last) print k "=" v; else print L[i] }
+        if (!last) print k "=" v
+      }
+    ' "$_file" >"$HK_TMP"; then
+    mv "$HK_TMP" "$_file" || die "could not update $_file"
+    HK_TMP=""
   else
-    rm -f "$_tmp"
     die "could not update $_file"
   fi
 }
@@ -80,7 +119,7 @@ check_hermes() {
   command -v "$HERMES_BIN" >/dev/null 2>&1 ||
     die "hermes was not found. This script never installs Hermes: install Hermes $WANT_HERMES first, then run it again."
   _ver=$("$HERMES_BIN" --version 2>&1 | head -n 1) || true
-  if ! printf '%s\n' "$_ver" | grep -Eq "v0\\.23\\.0([^0-9.]|\$)"; then
+  if ! printf '%s\n' "$_ver" | grep -Eq "v0\\.23\\.0([[:space:]]|\$)"; then
     die "this needs Hermes $WANT_HERMES, and hermes says \"$_ver\". This script never installs or upgrades Hermes."
   fi
 }
@@ -210,7 +249,7 @@ install_plugin() {
   fi
   _src=$PLUGIN_SOURCE
   if [ -z "$_src" ]; then
-    if [ -d "$ROOT/.git" ]; then _src="file://$ROOT#plugin"; else _src="Bonfires-ai/hermes-kernel/plugin"; fi
+    if [ -e "$ROOT/.git" ]; then _src="file://$ROOT#plugin"; else _src="Bonfires-ai/hermes-kernel/plugin"; fi
   fi
   case "$_src" in
     file://*)
@@ -225,19 +264,18 @@ write_hermes_token() {
   [ -n "${1:-}" ] || die "write_hermes_token needs a token."
   mkdir -p "$HERMES_HOME"
   _file=$HERMES_HOME/.env
-  _tmp=$(mktemp "$HERMES_HOME/.env.XXXXXX")
-  chmod 600 "$_tmp"
+  new_tmp "$HERMES_HOME" .env
   if [ -f "$_file" ]; then _src=$_file; else _src=/dev/null; fi
   if HK_V=$1 awk '
       BEGIN { v = ENVIRON["HK_V"]; done = 0 }
       /^(export[ \t]+)?HERMES_KERNEL_TOKEN=/ { if (!done) { print "HERMES_KERNEL_TOKEN=" v; done = 1 } next }
       { print }
       END { if (!done) print "HERMES_KERNEL_TOKEN=" v }
-    ' "$_src" >"$_tmp"; then
-    mv "$_tmp" "$_file"
+    ' "$_src" >"$HK_TMP"; then
+    mv "$HK_TMP" "$_file" || die "could not write the token to $_file"
+    HK_TMP=""
     chmod 600 "$_file"
   else
-    rm -f "$_tmp"
     die "could not write the token to $_file"
   fi
 }
@@ -248,10 +286,10 @@ write_url() {
     *[\"\\]*) die "the URL cannot contain quotes or backslashes." ;;
   esac
   mkdir -p "$HERMES_HOME"
-  _tmp=$(mktemp "$HERMES_HOME/.hermes-kernel.XXXXXX")
-  printf '{"url": "%s"}\n' "$1" >"$_tmp"
-  chmod 600 "$_tmp"
-  mv "$_tmp" "$HERMES_HOME/hermes-kernel.json"
+  new_tmp "$HERMES_HOME" .hermes-kernel
+  printf '{"url": "%s"}\n' "$1" >"$HK_TMP"
+  mv "$HK_TMP" "$HERMES_HOME/hermes-kernel.json" || die "could not write $HERMES_HOME/hermes-kernel.json"
+  HK_TMP=""
 }
 
 finish() {
@@ -261,10 +299,26 @@ finish() {
   say "Start a new Hermes session and type /kernel"
 }
 
+# resolve_profile: Hermes re-homes onto the sticky profile (hermes profile use) unless the exported home is already a
+# profile directory. Do the same, so the plugin, the token and the URL all land in the one home Hermes will read.
+resolve_profile() {
+  [ "$(basename "$(dirname "$HERMES_HOME")")" != profiles ] || return 0
+  [ -f "$HERMES_HOME/active_profile" ] || return 0
+  _name=$(head -n 1 "$HERMES_HOME/active_profile" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+  case "$_name" in
+    '' | default) return 0 ;;
+    */* | *\\* | *..*) die "the active Hermes profile name \"$_name\" is not usable (no slashes or \"..\")." ;;
+  esac
+  HERMES_HOME=$HERMES_HOME/profiles/$_name
+  export HERMES_HOME
+  say "using the active Hermes profile \"$_name\" ($HERMES_HOME)"
+}
+
 # ---------------------------------------------------------------- the local path
 
 run_local() {
   ENV_FILE=$(dirname "$COMPOSE_FILE")/.env
+  resolve_profile
   check_hermes
   check_local
   resolve_secrets

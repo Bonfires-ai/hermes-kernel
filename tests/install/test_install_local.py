@@ -1,7 +1,14 @@
 import json
+import os
 import re
+import shutil
+import signal
 import stat
+import subprocess
+import time
+from pathlib import Path
 
+REPO = Path(__file__).resolve().parents[2]
 KEYS = {"OPENROUTER_API_KEY": "key-SENTINEL-one", "VOYAGE_API_KEY": "key-SENTINEL-two"}
 
 
@@ -195,3 +202,186 @@ def test_a_local_source_warns_once_that_it_installs_head(rig):
     assert result.returncode == 0, result.stderr
     assert result.stdout.count("installs HEAD") == 1
     assert "hermes plugins install file:///somewhere#plugin --enable" in rig.log
+
+
+# ---- fix round 1
+
+
+def _profile_files(home):
+    return home / ".env", home / "hermes-kernel.json", home / "plugins" / "hermes-kernel"
+
+
+def test_sticky_profile_gets_the_whole_install(rig):
+    (rig.home / "active_profile").write_text("work\n")
+    result = rig.run(env=KEYS)
+    assert result.returncode == 0, result.stderr
+    assert "work" in result.stdout
+    profile = rig.home / "profiles" / "work"
+    token_file, url_file, plugin_dir = _profile_files(profile)
+    assert plugin_dir.is_dir()
+    token = parse_env(rig.root / ".env")["KT_TOKEN"]
+    assert token_file.read_text().splitlines() == [f"HERMES_KERNEL_TOKEN={token}"]
+    assert json.loads(url_file.read_text()) == {"url": "http://127.0.0.1:8787"}
+    assert rig.token_at_enable == f"HERMES_KERNEL_TOKEN={token}"
+    for stray in _profile_files(rig.home):
+        assert not stray.exists()
+
+
+def test_sticky_profile_second_run_updates(rig):
+    (rig.home / "active_profile").write_text("work")
+    assert rig.run(env=KEYS).returncode == 0
+    start = len(rig.log)
+    result = rig.run()
+    assert result.returncode == 0, result.stderr
+    second = rig.log[start:]
+    assert any(line.startswith("hermes plugins update hermes-kernel") for line in second)
+    assert not any("plugins install" in line for line in second)
+
+
+def test_profile_named_default_is_the_root_home(rig):
+    (rig.home / "active_profile").write_text("default\n")
+    result = rig.run(env=KEYS)
+    assert result.returncode == 0, result.stderr
+    assert (rig.home / ".env").exists()
+    assert not (rig.home / "profiles").exists()
+
+
+def test_home_already_under_profiles_is_trusted(rig):
+    inner = rig.home / "profiles" / "x"
+    inner.mkdir(parents=True)
+    (inner / "active_profile").write_text("zzz")
+    result = rig.run(env={**KEYS, "HERMES_HOME": str(inner)})
+    assert result.returncode == 0, result.stderr
+    assert (inner / ".env").exists()
+    assert not (inner / "profiles").exists()
+
+
+def test_profile_name_with_a_slash_or_dots_is_refused(rig):
+    for name in ("../evil", "a/b", ".."):
+        (rig.home / "active_profile").write_text(name)
+        result = rig.run(env=KEYS)
+        assert result.returncode != 0
+        assert "profile" in result.stderr
+        assert not (rig.root / ".env").exists()
+        assert sorted(p.name for p in rig.home.iterdir()) == ["active_profile"]
+
+
+def env_with(rig, text, shell=None):
+    (rig.root / ".env").write_text(text)
+    (rig.root / ".env").chmod(0o600)
+    return rig.run(env={**KEYS, **(shell or {})})
+
+
+EXAMPLE_BLANKS = "OPENROUTER_API_KEY=\nVOYAGE_API_KEY=\nKT_BONFIRE_ID=hermes\nMK_VERSION=2.0.1\n"
+
+
+def test_export_prefixed_value_is_kept(rig):
+    result = env_with(rig, "export NEO4J_PASSWORD=mine\nKT_TOKEN=tok\n" + EXAMPLE_BLANKS)
+    assert result.returncode == 0, result.stderr
+    text = (rig.root / ".env").read_text()
+    assert text.count("NEO4J_PASSWORD") == 1
+    assert "export NEO4J_PASSWORD=mine" in text
+
+
+def test_indented_value_is_kept(rig):
+    result = env_with(rig, "NEO4J_PASSWORD=pw\n  KT_TOKEN=abc\n" + EXAMPLE_BLANKS)
+    assert result.returncode == 0, result.stderr
+    text = (rig.root / ".env").read_text()
+    assert text.count("KT_TOKEN") == 1
+    assert rig.token_at_enable == "HERMES_KERNEL_TOKEN=abc"
+
+
+def test_trailing_comment_is_not_part_of_the_token(rig):
+    result = env_with(rig, "NEO4J_PASSWORD=pw\nKT_TOKEN=abc # note\n" + EXAMPLE_BLANKS)
+    assert result.returncode == 0, result.stderr
+    assert rig.token_at_enable == "HERMES_KERNEL_TOKEN=abc"
+
+
+def test_quoted_token_with_comment_after_the_quote(rig):
+    result = env_with(rig, 'NEO4J_PASSWORD=pw\nKT_TOKEN="abc" # q\n' + EXAMPLE_BLANKS)
+    assert result.returncode == 0, result.stderr
+    assert rig.token_at_enable == "HERMES_KERNEL_TOKEN=abc"
+
+
+def test_last_duplicate_wins_and_a_blank_one_is_filled_in_place(rig):
+    result = env_with(rig, "NEO4J_PASSWORD=pw\nKT_TOKEN=first\nKT_TOKEN=\n" + EXAMPLE_BLANKS)
+    assert result.returncode == 0, result.stderr
+    lines = (rig.root / ".env").read_text().splitlines()
+    assert lines[1] == "KT_TOKEN=first"
+    assert lines.count("KT_TOKEN=") == 0
+    assert sum(line.startswith("KT_TOKEN=") for line in lines) == 2
+    assert lines[2] == f"KT_TOKEN={rig.token_at_enable.split('=', 1)[1]}"
+
+
+def test_blank_export_line_is_replaced_not_appended(rig):
+    result = env_with(rig, "export NEO4J_PASSWORD=\nKT_TOKEN=t\n" + EXAMPLE_BLANKS)
+    assert result.returncode == 0, result.stderr
+    text = (rig.root / ".env").read_text()
+    assert text.count("NEO4J_PASSWORD") == 1
+    assert parse_env(rig.root / ".env")["NEO4J_PASSWORD"]
+
+
+def test_version_gate_is_exact(rig):
+    for version in ("v0.23.0+45.gabc", "v0.23.0-rc1", "v0.23.0.1", "v0.23.01"):
+        result = rig.run(env={**KEYS, "HK_HERMES_VERSION": f"Hermes Agent {version}"})
+        assert result.returncode != 0, version
+        assert not (rig.root / ".env").exists()
+    ok = rig.run(env={**KEYS, "HK_HERMES_VERSION": "Hermes Agent v0.23.0"})
+    assert ok.returncode == 0, ok.stderr
+
+
+def test_git_file_counts_as_a_checkout(rig):
+    (rig.root / ".git").write_text("gitdir: /elsewhere\n")
+    result = rig.run(env=KEYS)
+    assert result.returncode == 0, result.stderr
+    assert f"hermes plugins install file://{rig.root}#plugin --enable" in rig.log
+
+
+def test_git_directory_counts_as_a_checkout(rig):
+    (rig.root / ".git").mkdir()
+    result = rig.run(env=KEYS)
+    assert result.returncode == 0, result.stderr
+    assert f"hermes plugins install file://{rig.root}#plugin --enable" in rig.log
+
+
+def test_failed_mv_is_an_error_and_leaves_no_temp_file(rig):
+    (rig.tools / "mv").unlink()
+    (rig.tools / "mv").write_text("#!/bin/sh\nexit 1\n")
+    (rig.tools / "mv").chmod(0o755)
+    result = rig.run(env=KEYS)
+    assert result.returncode != 0
+    assert "could not" in result.stderr
+    assert "kept" not in result.stdout.replace("kept /", "")
+    assert list(rig.root.glob(".hk.*")) == []
+
+
+def test_interrupt_between_awk_and_mv_leaves_no_copy_of_env(rig):
+    real_mv = shutil.which("mv")
+    (rig.tools / "mv").unlink()
+    (rig.tools / "mv").write_text(f'#!/bin/sh\nsleep 30\nexec {real_mv} "$@"\n')
+    (rig.tools / "mv").chmod(0o755)
+    proc = subprocess.Popen(
+        [str(rig.root / "install.sh")],
+        cwd=str(rig.root),
+        env=rig.child_env(KEYS),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    try:
+        deadline = time.time() + 20
+        while not list(rig.root.glob(".hk.*")) and time.time() < deadline:
+            time.sleep(0.05)
+        assert list(rig.root.glob(".hk.*")), "the temp copy never appeared"
+        os.killpg(proc.pid, signal.SIGINT)
+        proc.wait(timeout=20)
+    finally:
+        if proc.poll() is None:
+            os.killpg(proc.pid, signal.SIGKILL)
+    assert list(rig.root.glob(".hk.*")) == []
+
+
+def test_gitignore_covers_the_temp_copies():
+    ignore = (REPO / ".gitignore").read_text().splitlines()
+    assert ".hk.*" in ignore

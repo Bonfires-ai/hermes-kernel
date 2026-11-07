@@ -25,6 +25,11 @@ TOOLS = [
 
 HERMES = """#!/bin/sh
 {log_line}
+# Hermes re-homes onto the sticky profile unless the exported home is already a profile directory.
+if [ "$(basename "$(dirname "$HERMES_HOME")")" != profiles ] && [ -f "$HERMES_HOME/active_profile" ]; then
+  _p=$(cat "$HERMES_HOME/active_profile")
+  if [ -n "$_p" ] && [ "$_p" != default ]; then HERMES_HOME="$HERMES_HOME/profiles/$_p"; fi
+fi
 if [ "$1" = --version ]; then echo "${{HK_HERMES_VERSION:-Hermes Agent v0.23.0 (test)}}"; fi
 if [ "$1" = plugins ] && [ "$2" = install ]; then
   mkdir -p "$HERMES_HOME/plugins/hermes-kernel"
@@ -118,7 +123,7 @@ class Rig:
         assert self.home.resolve().is_relative_to(self.base.resolve()), "HERMES_HOME is outside the throwaway tree"
         assert self.user_home.resolve() != Path.home().resolve()
 
-    def run(self, *args: str, env: dict | None = None, input: str | None = None) -> subprocess.CompletedProcess:
+    def child_env(self, env: dict | None = None) -> dict:
         self.assert_contained()
         child = {
             "PATH": self.path,
@@ -133,6 +138,10 @@ class Rig:
         for key, value in child.items():
             if key == "HERMES_BIN" and value:
                 assert Path(value).resolve().is_relative_to(self.base.resolve()), "HERMES_BIN escaped"
+        return child
+
+    def run(self, *args: str, env: dict | None = None, input: str | None = None) -> subprocess.CompletedProcess:
+        child = self.child_env(env)
         stdin = {"input": input} if input is not None else {"stdin": subprocess.DEVNULL}
         return subprocess.run(
             [str(self.root / "install.sh"), *args],
