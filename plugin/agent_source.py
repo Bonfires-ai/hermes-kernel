@@ -25,6 +25,12 @@ come from the tools this Hermes offers its model:
   (`AgentSource.unavailable`, left out of the context) and a phrase step on it stops with a sentence
   (`AgentSource.tool` is `None`).
 
+Two checks guard a step, and both are needed. The catalogue is one per install, so the registry view subtracts
+`agent.disabled_toolsets` from everything (what no platform may use). Hermes also selects the *enabled* toolsets
+per platform first, and `dispatch_tool` goes straight to the registry, so a person who turned a toolset off for one
+platform could still have a phrase run its tool there: `enabled_for(platform, tool)` answers that at step time, and
+fails closed. `side_effecting` lets a caller refuse a step on a tool Hermes offers that is not read-only.
+
 `AgentSource.sync` PUTs the rows only when the tool set changed since the last set the service took (every install
 drops the bonfire's in-flight plans): the digest is over the rows sorted by name, so the same tools in another order
 are no change. A set the service refused (a 4xx) is not sent again until it changes. `sync_soon` runs `sync` on a
@@ -99,6 +105,8 @@ class RegistryView(Protocol):
     """The tools Hermes offers now (`HermesRegistry`)."""
 
     def offered(self) -> Sequence[ToolView]: ...
+
+    def enabled_tools(self, platform: str) -> set[str]: ...
 
 
 class SourceApi(Protocol):
@@ -247,6 +255,19 @@ def _hermes_disabled() -> set[str]:
     return {str(part) for part in value} if isinstance(value, list) else set()
 
 
+def _hermes_platform_toolsets(platform: str) -> set[str]:
+    from hermes_cli.config import load_config_readonly  # pyright: ignore[reportMissingImports]
+    from hermes_cli.tools_config import _get_platform_tools  # pyright: ignore[reportMissingImports]
+
+    return {str(t) for t in _get_platform_tools(load_config_readonly(), platform)}
+
+
+def _hermes_resolve(toolset: str) -> Iterable[str]:
+    from toolsets import resolve_toolset  # pyright: ignore[reportMissingImports]
+
+    return [str(n) for n in resolve_toolset(toolset)]
+
+
 def _hermes_disabled_tools(toolsets: Collection[str]) -> set[str]:
     """The tool names Hermes itself subtracts for the disabled `toolsets` (`toolsets.resolve_toolset`, which follows a
     composite toolset's includes). Without Hermes' resolver the toolset names alone decide."""
@@ -276,11 +297,15 @@ class HermesRegistry:
         entries: Callable[[], Iterable[object]] | None = None,
         disabled: Callable[[], set[str]] | None = None,
         disabled_tools: Callable[[Collection[str]], set[str]] | None = None,
+        platform_toolsets: Callable[[str], set[str]] | None = None,
+        resolve: Callable[[str], Iterable[str]] | None = None,
         check: Callable[[Callable[[], object], dict[object, bool]], bool] | None = None,
     ) -> None:
         self._entries = entries or _hermes_entries
         self._disabled = disabled or _hermes_disabled
         self._disabled_tools = disabled_tools or _hermes_disabled_tools
+        self._platform_toolsets = platform_toolsets or _hermes_platform_toolsets
+        self._resolve = resolve or _hermes_resolve
         self._check = check or _hermes_check
 
     def _available(self, entry: object, memo: dict[object, bool]) -> bool:
@@ -292,6 +317,14 @@ class HermesRegistry:
         except Exception:  # noqa: BLE001 — a check that cannot answer: Hermes would not offer the tool either
             logger.warning("hermes-kernel: the availability check of %s failed", getattr(entry, "name", "?"))
             return False
+
+    def enabled_tools(self, platform: str) -> set[str]:
+        """The tools `platform` may use: the names of its enabled toolsets, expanded as Hermes does, less the disabled
+        toolsets (only tools `offered` returns count). Raises when Hermes cannot answer."""
+        enabled: set[str] = set()
+        for toolset in self._platform_toolsets(platform):
+            enabled.update(self._resolve(toolset))
+        return enabled & {tool.name for tool in self.offered()}
 
     def offered(self) -> list[ToolView]:
         off = self._disabled()
@@ -352,6 +385,8 @@ class AgentSource:
         self._rows: list[JsonObject] | None = None
         #: the composable tools Hermes did not offer at that read (their check fails), by catalogue name
         self._unavailable: set[str] = set()
+        #: a failure of `enabled_for` was logged
+        self._enabled_failed = False
         #: by catalogue name, the real name of every row read in this process (kept when the tool goes away: a result
         #: held for it is still fenced by it)
         self._real: dict[str, str] = {}
@@ -362,7 +397,8 @@ class AgentSource:
         rows, kept = _rows_of(self._registry.offered(), self._read_only, self._params)
         with self._lock:
             self._rows = rows
-            self._unavailable = {name for name, tool in kept.items() if not tool.available}
+            gone = set(self._real) - set(kept)  # was a row, no longer offered
+            self._unavailable = {name for name, tool in kept.items() if not tool.available} | gone
             self._real.update({name: tool.name for name, tool in kept.items()})
             self._catalogue = {tool.name: name for name, tool in kept.items()}
         return rows, kept
@@ -428,6 +464,32 @@ class AgentSource:
         finally:
             with self._lock:
                 self._syncing = False
+
+    def side_effecting(self, names: Iterable[str]) -> set[str]:
+        """Those of `names` (catalogue or real names) that Hermes offers now but the data file does not list as
+        read-only: a phrase step may not call them. A registry read that raises is raised: the caller treats a raise
+        as a refusal, never as allowed."""
+        real = {name: self.real_name(name) or name for name in names if name != THINK}
+        asked = {n for n, r in real.items() if r not in self._read_only}
+        if not asked:
+            return set()
+        offered = {tool.name for tool in self._registry.offered()}
+        return {n for n in asked if real[n] in offered}
+
+    def enabled_for(self, platform: str, tool_name: str) -> bool:
+        """Whether a phrase step may run `tool_name` (a catalogue or real name) on `platform`: the tool is in the
+        platform's enabled toolsets and not in a disabled one. Fails closed: any error is False, logged once."""
+        try:
+            real = self.real_name(tool_name) or tool_name
+            return real in self._registry.enabled_tools(platform)
+        except Exception:  # noqa: BLE001 — unknown means not allowed
+            with self._lock:
+                first = not self._enabled_failed
+                self._enabled_failed = True
+            (logger.warning if first else logger.debug)(
+                "hermes-kernel: could not resolve the enabled tools of %s; no step runs there", platform, exc_info=True
+            )
+            return False
 
     def tool(self, name: str) -> ToolView | None:
         """The tool behind the catalogue row `name` (its `name` the real one), as Hermes offers it now; `None` when

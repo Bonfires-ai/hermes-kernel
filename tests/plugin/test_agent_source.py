@@ -4,6 +4,8 @@ import threading
 import time
 from types import SimpleNamespace
 
+import pytest
+
 from plugin.agent_source import AgentSource, HermesRegistry, ToolView, load_read_only
 from plugin.call_log import CallLog
 
@@ -20,6 +22,9 @@ class Registry:
 
     def offered(self):
         return list(self.tools)
+
+    def enabled_tools(self, platform):
+        return {"telegram": {"web_search"}}[platform]
 
 
 class Client:
@@ -167,4 +172,52 @@ def test_the_call_log_block_shows_names_and_parameter_names_only():
 
 def test_load_read_only_lists_only_tools_hermes_registers():
     names, _ = load_read_only()
-    assert names == {"web_search", "session_search", "vision_analyze"}
+    assert names == {"web_search"}
+
+
+def test_side_effecting_names_a_write_tool_hermes_offers_and_nothing_else():
+    registry = Registry(tool("web_search"), tool("write_file", "file"), tool("mcp__srv__poke", "mcp-srv"))
+    source = AgentSource(Client(), registry, {"web_search"})
+    assert source.side_effecting(["web_search", "write_file", "nope", "think"]) == {"write_file"}
+
+    class Broken(Registry):
+        def offered(self):
+            raise RuntimeError("registry unreadable")
+
+    with pytest.raises(RuntimeError):
+        AgentSource(Client(), Broken(), {"web_search"}).side_effecting(["write_file"])
+
+
+def test_enabled_for_follows_the_platforms_enabled_toolsets_and_fails_closed():
+    source = AgentSource(Client(), Registry(tool("web_search"), tool("session_x", "x")), {"web_search"})
+    assert source.enabled_for("telegram", "web_search") is True
+    assert source.enabled_for("telegram", "session_x") is False
+
+    class Raising(Registry):
+        def enabled_tools(self, platform):
+            raise RuntimeError("no resolver")
+
+    assert AgentSource(Client(), Raising(), {"web_search"}).enabled_for("telegram", "web_search") is False
+
+
+def test_hermes_registry_enabled_tools_is_enabled_set_less_disabled():
+    entries = [entry("web_search", "web"), entry("terminal", "terminal"), entry("vision_analyze", "vision")]
+    registry = HermesRegistry(
+        entries=lambda: entries,
+        disabled=lambda: {"vision"},
+        disabled_tools=lambda names: set(),
+        platform_toolsets=lambda platform: {"web", "vision"},
+        resolve=lambda toolset: {"web": ["web_search"], "vision": ["vision_analyze"]}[toolset],
+        check=lambda fn, memo: True,
+    )
+    assert registry.enabled_tools("telegram") == {"web_search"}
+
+
+def test_a_tool_that_was_a_row_and_is_gone_is_unavailable():
+    registry = Registry(tool("web_search"))
+    source = AgentSource(Client(), registry, {"web_search"})
+    source.sync()
+    assert source.unavailable() == set()
+    registry.tools.clear()
+    source.sync()
+    assert source.unavailable() == {"web_search"}

@@ -1,8 +1,6 @@
 {
-  "about": "Hermes tools that read and change nothing, by their registry names (an MCP tool is mcp__<server>__<tool>). Only these go into the kernel's catalogue, so a taught phrase can use them as steps. A tool runs as a step only while Hermes offers it to the model: one in a disabled toolset, one whose availability check fails, or one that is not registered is left out. A step gives the tool's required text parameters, or the ones `params` names. A tool that changes anything never belongs here. Add a name to allow another read-only tool.",
+  "about": "Hermes tools a taught phrase may call as steps, by their registry names (an MCP tool is mcp__<server>__<tool>). A tool belongs here only if it changes nothing, does not read across chats or people (no search of other conversations), and is safe when its arguments come from a person's words (no local paths or file URLs, no spend without a cap), with a result that is fenced as untrusted when it carries outside text. `think` is added in code. A tool runs as a step only while Hermes offers it on that platform: one in a disabled toolset, one whose availability check fails, or one that is not registered is left out. A step gives the tool's required text parameters, or the ones `params` names.",
   "tools": [
-    { "name": "web_search" },
-    { "name": "session_search", "params": ["query"] },
-    { "name": "vision_analyze" }
+    { "name": "web_search" }
   ]
 }
