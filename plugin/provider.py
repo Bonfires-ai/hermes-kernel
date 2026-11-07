@@ -82,10 +82,15 @@ class KernelMemory(MemoryProvider):
             "user_name": kwargs.get("user_name"),
             "chat_id": kwargs.get("chat_id"),
             "agent_identity": kwargs.get("agent_identity"),
-            "turns": 0,
         }
-        info["conversation_id"] = self._derive(info, session_id)
         with shared.lock:
+            old = shared.sessions.get(session_id)
+            if isinstance(old, dict):  # a rebuilt provider, or a switch's record: keep the counter and conversation
+                info["turns"] = old.get("turns", 0)
+                info["conversation_id"] = old.get("conversation_id") or self._derive(info, session_id)
+            else:
+                info["turns"] = 0
+                info["conversation_id"] = self._derive(info, session_id)
             shared.sessions[session_id] = info
         home = kwargs.get("hermes_home")
         if home:

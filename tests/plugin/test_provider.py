@@ -183,3 +183,14 @@ def test_a_wrong_token_shows_in_system_status(env):
     assert provider.is_available() and provider.unavailable_reason() == ""
     env.made_capture.last_error = "the turn service rejected the token: check HERMES_KERNEL_TOKEN"
     assert "rejected the token" in provider.unavailable_reason()
+
+
+def test_a_rebuilt_provider_keeps_the_counter_and_the_carried_conversation(env):
+    start("s1", platform="cli").sync_turn("ok", "ok", session_id="s1")
+    again = start("s1", platform="cli")  # Hermes rebuilds providers for the same session
+    again.sync_turn("ok", "ok", session_id="s1")
+    assert [t[5] for t in env.made_capture.turns] == [1, 2]
+    again.on_session_switch("s2", parent_session_id="s1", reset=False)
+    rebuilt = start("s2", platform="cli")
+    rebuilt.sync_turn("ok", "ok", session_id="s2")
+    assert env.made_capture.turns[-1][0] == "cli:s1" and env.made_capture.turns[-1][5] == 3
