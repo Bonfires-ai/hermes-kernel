@@ -6,12 +6,15 @@ document: a built session keeps its message ids (only ``text`` goes), so a resen
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any, TypedDict
 
 from pymongo import ASCENDING, ReturnDocument
 from pymongo.database import Database
+
+log = logging.getLogger(__name__)
 
 
 class Claimed(TypedDict):
@@ -31,6 +34,7 @@ class Queue:
         self._sessions = db["sessions"]
         self._messages = db["messages"]
         self._clock = clock or (lambda: datetime.now(UTC))
+        self._pending_release_at: datetime | None = None
 
     def reset_running(self) -> int:
         """After a restart nothing is running: put those sessions back (attempts unchanged)."""
@@ -47,18 +51,13 @@ class Queue:
         if doc is None:
             return None
         # Neither contiguous ``seq`` nor an exact ``message_count`` is assumed, and ``last_ts`` is ignored.
-        found = self._messages.find({"session_id": doc["_id"]}).sort([("timestamp", ASCENDING), ("seq", ASCENDING)])
-        messages = [
-            {
-                "message_id": str(m["_id"]),
-                "speaker": m["speaker"],
-                "text": m["text"],
-                "timestamp": _utc(m["timestamp"]).isoformat(),
-                "addressees": list(m.get("addressees") or []),
-            }
-            for m in found
-            if m.get("text")
-        ]
+        try:
+            found = self._messages.find({"session_id": doc["_id"]}).sort([("timestamp", ASCENDING), ("seq", ASCENDING)])
+            messages = [m for m in (self._message(d) for d in found) if m is not None]
+        except Exception:
+            # The state is already ``running``: put it back, so a failed read leaves nothing stuck.
+            self._sessions.update_one({"_id": doc["_id"]}, {"$set": {"state": "closed"}})
+            raise
         return {
             "id": doc["_id"],
             "conversation_id": doc["conversation_id"],
@@ -66,8 +65,28 @@ class Queue:
             "messages": messages,
         }
 
-    def built(self, session_id: str) -> None:
-        self._sessions.update_one({"_id": session_id}, {"$set": {"state": "built", "built_at": self._clock()}})
+    @staticmethod
+    def _message(m: dict[str, Any]) -> dict[str, Any] | None:
+        """A message in the kernel's shape; None for one with no text (built) or a missing field (warned)."""
+        if not m.get("text"):
+            return None
+        try:
+            return {
+                "message_id": str(m["_id"]),
+                "speaker": m["speaker"],
+                "text": m["text"],
+                "timestamp": _utc(m["timestamp"]).isoformat(),
+                "addressees": list(m.get("addressees") or []),
+            }
+        except (KeyError, TypeError, AttributeError, ValueError):
+            log.warning("message %s of session %s is malformed and skipped", m.get("_id"), m.get("session_id"))
+            return None
+
+    def built(self, session_id: str, reason: str | None = None) -> None:
+        fields: dict[str, Any] = {"state": "built", "built_at": self._clock()}
+        if reason:
+            fields["reason"] = reason
+        self._sessions.update_one({"_id": session_id}, {"$set": fields})
         self._messages.update_many({"session_id": session_id}, {"$unset": {"text": ""}})
 
     def stopped(self, session_id: str, reason: str) -> int:
@@ -84,7 +103,22 @@ class Queue:
         self._sessions.update_one({"_id": session_id}, {"$set": {"state": "closed", "reason": reason}})
 
     def failed(self, session_id: str, reason: str) -> None:
-        self._sessions.update_one({"_id": session_id}, {"$set": {"state": "failed", "reason": reason}})
+        self._sessions.update_one(
+            {"_id": session_id}, {"$set": {"state": "failed", "reason": reason, "failed_at": self._clock()}}
+        )
+
+    def last_failed(self) -> str | None:
+        """The id of the session that failed most recently, if any."""
+        doc = self._sessions.find_one({"state": "failed"}, sort=[("failed_at", -1)])
+        return str(doc["_id"]) if doc else None
+
+    def pending_release_due(self, every_s: float) -> bool:
+        """True at most once per ``every_s`` seconds (and marks the time)."""
+        now = self._clock()
+        if self._pending_release_at is not None and now - self._pending_release_at < timedelta(seconds=every_s):
+            return False
+        self._pending_release_at = now
+        return True
 
     def held(self, session_id: str, reason: str) -> None:
         self._sessions.update_one(

@@ -24,7 +24,6 @@ class Settings(BaseSettings):
 
     # The kernel's own record (spend holds, the append lease).
     ops_uri: SecretStr = Field(default=SecretStr("mongodb://mongo:27017"), validation_alias="MK_OPS_URI")
-    ops_db: str = Field(default="mk_ops", validation_alias="MK_OPS_DB")
     data_dir: Path = Field(default=Path("/opt/mk"), validation_alias="MK_DATA_DIR")
     neo4j_uri: str = Field(default="bolt://neo4j:7687", validation_alias="NEO4J_URI")
     neo4j_password: SecretStr | None = Field(default=None, validation_alias="NEO4J_PASSWORD")

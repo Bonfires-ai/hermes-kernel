@@ -201,3 +201,136 @@ def test_every_append_uses_the_one_owner(settings):
         result = build_session(fresh, claimed, api=api, ops=object(), parse=None)
         assert result.kind == "built"
     assert owners == [OWNER, OWNER] == ["hermes-writer"] * 2
+
+
+# --- fix round 1 ---------------------------------------------------------------------------------------------------
+
+
+def _claimed() -> Claimed:
+    return {
+        "id": "A",
+        "conversation_id": "c",
+        "agent_handles": [],
+        "messages": [
+            {"message_id": "m1", "speaker": "me", "text": "hi", "timestamp": "2026-11-01T00:00:00+00:00"},
+            {"message_id": "m2", "speaker": "me", "text": "BAD", "timestamp": "2026-11-01T00:00:01+00:00"},
+            {"message_id": "m3", "speaker": "me", "text": "ok", "timestamp": "2026-11-01T00:00:02+00:00"},
+        ],
+    }
+
+
+async def _parse(text: str) -> list[dict[str, str]]:
+    if "BAD" in text:
+        raise ValueError("unreadable")
+    return [{"tree": text}]
+
+
+def _api(append_session: Any, exists: bool = True) -> SimpleNamespace:
+    return SimpleNamespace(
+        bonfire_exists=lambda bonfire_id, overrides: exists,
+        SessionInput=lambda **kw: SimpleNamespace(**kw),
+        append_session=append_session,
+    )
+
+
+def _raising(name: str, text: str, *bases: type[Exception]) -> Exception:
+    return type(name, bases or (Exception,), {})(text)
+
+
+def _boom(exc: Exception) -> Any:
+    def append_session(*args: Any, **kw: Any) -> Any:
+        raise exc
+
+    return append_session
+
+
+def test_a_stopped_result_carries_mks_stage_and_reason(settings):
+    out = {"status": "stopped", "result": {"stage": "capture", "reason": f"syntax failed {KEY}"}}
+    api = _api(lambda *a, **kw: out)
+    result = build_session(settings, _claimed(), api=api, ops=object(), parse=None)
+    assert result.kind == "stopped" and result.reason
+    assert "capture" in result.reason and "syntax failed" in result.reason and KEY not in result.reason
+
+
+def test_a_claim_survives_a_bad_message_and_a_failed_read(db):
+    add_session(db, "A", 1, messages=0)
+    db.messages.insert_one({"_id": "ok", "session_id": "A", "seq": 0, "speaker": "me", "text": "t", "timestamp": T0})
+    db.messages.insert_one({"_id": "no-speaker", "session_id": "A", "seq": 1, "text": "t", "timestamp": T0})
+    claimed = Queue(db).claim()
+    assert claimed is not None and [m["message_id"] for m in claimed["messages"]] == ["ok"]
+
+    add_session(db, "B", 2)
+    queue = Queue(db)
+
+    def broken(*a: Any, **kw: Any) -> Any:
+        raise OSError("mongo went away")
+
+    queue._messages = SimpleNamespace(find=broken)  # pyright: ignore[reportAttributeAccessIssue]
+    db.sessions.update_one({"_id": "A"}, {"$set": {"state": "built"}})
+    with pytest.raises(OSError):
+        queue.claim()
+    assert state(db, "B")["state"] == "closed"  # not left running
+
+
+def test_nothing_readable_fails_and_a_partial_drop_is_noted(db, settings):
+    api = _api(lambda *a, **kw: {"status": "appended"})
+    partial = build_session(settings, _claimed(), api=api, ops=object(), parse=_parse)
+    assert partial.kind == "built" and partial.reason == "dropped 1 of 3 messages"
+
+    allbad = _claimed()
+    allbad["messages"] = [{**m, "text": "BAD"} for m in allbad["messages"]]
+    nothing = build_session(settings, allbad, api=api, ops=object(), parse=_parse)
+    assert nothing.kind == "refused" and nothing.reason == "nothing readable after cleaning: 3 messages dropped"
+    mk_empty = build_session(
+        settings, _claimed(), api=_api(lambda *a, **kw: {"status": "empty"}), ops=object(), parse=None
+    )
+    assert mk_empty.kind == "refused"
+
+    add_session(db, "A", 1)
+    run_once(Queue(db), Script(partial), Release(), settings)
+    assert state(db, "A")["state"] == "built" and state(db, "A")["reason"] == "dropped 1 of 3 messages"
+
+
+def test_a_pending_session_tries_release_once_per_interval(db, settings):
+    add_session(db, "F", 1, state="failed")
+    db.sessions.update_one({"_id": "F"}, {"$set": {"failed_at": T0}})
+    add_session(db, "B", 2)
+    now = [T0 + timedelta(hours=2)]
+    queue = Queue(db, clock=lambda: now[0])
+    pending = BuildResult("busy", "PendingSession: run 1 stopped", pending=True)
+    build, release = Script(pending, pending, pending), Release()
+    assert not run_once(queue, build, release, settings)
+    assert not run_once(queue, build, release, settings)
+    assert release.calls == 1
+    assert state(db, "B")["state"] == "closed" and "F" in state(db, "B")["reason"]
+    now[0] += timedelta(seconds=601)
+    run_once(queue, build, release, settings)
+    assert release.calls == 2 and state(db, "B")["attempts"] == 0
+
+
+def test_a_missing_key_holds_and_a_stale_commit_is_busy(settings):
+    bare = Settings(bonfire_id="bf", openrouter_api_key=None, voyage_api_key=None, neo4j_password=None)
+    api = _api(lambda *a, **kw: {"status": "appended"}, exists=False)
+    held = build_session(bare, _claimed(), api=api, ops=object(), parse=None)
+    assert held.kind == "held" and held.reason and "OPENROUTER_API_KEY" in held.reason
+
+    stale = _raising("StaleCommit", "the commit went stale", _raising("BonfireError", "").__class__)
+    for exc in (stale, _raising("BonfireError", "could not take the lease on bonfire 'bf': it kept changing")):
+        result = build_session(settings, _claimed(), api=_api(_boom(exc)), ops=object(), parse=None)
+        assert result.kind == "busy"
+
+
+def test_an_outage_counts_no_attempt(db, settings):
+    for name in (
+        "ServiceUnavailable",
+        "SessionExpired",
+        "AutoReconnect",
+        "ServerSelectionTimeoutError",
+        "ConnectionError",
+    ):
+        exc = _raising(name, "connection refused")
+        result = build_session(settings, _claimed(), api=_api(_boom(exc)), ops=object(), parse=None)
+        assert result.kind == "busy" and not result.pending and name in (result.reason or "")
+    add_session(db, "A", 1)
+    run_once(Queue(db), Script(BuildResult("busy", "ServiceUnavailable: down")), Release(), settings)
+    assert state(db, "A")["state"] == "closed" and state(db, "A")["attempts"] == 0

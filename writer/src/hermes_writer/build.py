@@ -17,6 +17,7 @@ import importlib
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 from collections.abc import Callable, Iterable, Mapping
@@ -53,6 +54,17 @@ FIRST_WRITE_REFUSED = ("first write refused", "group holds data no 2.0 seed star
 _CAP_STOP = "build cap:"
 _CEILING_REFUSED = "bonfire spend ceiling reached"
 _STOPPED_BEFORE_SEAL = "stopped before seal"
+_LEASE_CHANGING = "it kept changing"
+#: Errors of Neo4j, Mongo and the network, matched by class name (those packages are not imported here): the
+#: session waits and no attempt is counted.
+_OUTAGE_NAMES = (
+    "ServiceUnavailable",
+    "SessionExpired",
+    "AutoReconnect",
+    "ServerSelectionTimeoutError",
+    "NetworkTimeout",
+    "ConnectionError",
+)
 #: (Settings field, the variable it comes from): the keys every founding build needs.
 SEED_KEYS: tuple[tuple[str, str], ...] = (
     ("openrouter_api_key", "OPENROUTER_API_KEY"),
@@ -83,11 +95,13 @@ _MONTHS = (
 @dataclass(frozen=True)
 class BuildResult:
     """``built``: done (a duplicate or empty session counts). ``stopped``: a stop before seal, tried again. ``held``: at
-    the spend ceiling, waits. ``busy``: the lease or a pending session blocked it, no attempt counted. ``refused``:
-    mk will never take it."""
+    the spend ceiling or a key is unset, waits. ``busy``: the lease, a pending session or an outage blocked it, no
+    attempt counted. ``refused``: mk will never take it (or nothing readable is left)."""
 
     kind: Literal["built", "stopped", "held", "busy", "refused"]
     reason: str | None = None
+    #: busy because an earlier run is pending (mk's ``PendingSession``): a release may clear it
+    pending: bool = False
 
 
 class ReleaseRefused(RuntimeError):
@@ -99,7 +113,7 @@ class FoundingFailed(RuntimeError):
 
 
 class FoundingRefused(FoundingFailed):
-    """A founding that cannot work until an operator sets a key."""
+    """A founding that cannot work until an operator sets a key (the session waits, held)."""
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -173,8 +187,13 @@ def founding_error(exc: BaseException, secrets: Iterable[str]) -> BuildResult:
     detail = _detail(exc, secrets)
     if _CEILING_REFUSED in text:
         return BuildResult("held", detail)
-    if "AppendBusy" in names or "PendingSession" in names:
+    if "PendingSession" in names:
+        return BuildResult("busy", detail, pending=True)
+    if "AppendBusy" in names or "StaleCommit" in names or _LEASE_CHANGING in text:
         return BuildResult("busy", detail)
+    down = next((n for n in _OUTAGE_NAMES if n in names), None)
+    if down:
+        return BuildResult("busy", f"a service is down ({down}): {detail}")
     if any(words in text for words in FIRST_WRITE_REFUSED):
         return BuildResult("refused", f"the bonfire's graph group holds data no 2.0 seed started: {detail}")
     if _STOPPED_BEFORE_SEAL in text and _CAP_STOP in text:
@@ -210,9 +229,8 @@ def build_overrides(settings: Settings) -> dict[str, object]:
 def open_ops(settings: Settings) -> object:
     """A ``MongoKernelOps`` on ``MK_OPS_URI`` (spend holds, the append lease)."""
     mongo = importlib.import_module("memory_kernel.ops.mongo")
-    return mongo.MongoKernelOps.from_uri(
-        settings.ops_uri.get_secret_value(), db=settings.ops_db, collection="kernel_ops"
-    )
+    # The default database (``mk_ops``): ``mk bonfire release`` and ``mk serve`` read that one only.
+    return mongo.MongoKernelOps.from_uri(settings.ops_uri.get_secret_value(), collection="kernel_ops")
 
 
 def to_build_config(build: FoundingBuild, settings: Settings) -> BuildConfig:
@@ -309,6 +327,8 @@ def found_bonfire(
             neo4j_uri=settings.neo4j_uri,
             cap_usd=float(settings.founding_cap_usd),
         )
+        # ``seed`` takes its own lease owner (``seed-<uuid>``, 3600 s), not ``OWNER``: a writer killed hard mid-founding
+        # is busy until that lease runs out (up to an hour), then the founding is sent again.
         out = seed(build) if seed is not None else _graph_seed(build, settings)
         status = out.get("status")
         if status == "seeded":
@@ -345,14 +365,18 @@ def build_session(
             )
         )
         messages: list[dict[str, Any]] = cleaned["messages"]
-        if not messages:  # nothing to build: as good as built
-            return BuildResult("built", "empty")
+        total = len(claimed["messages"])
+        kept = {re.sub(r"~\d+$", "", str(m["message_id"])) for m in messages}
+        dropped = total - len({str(m["message_id"]) for m in claimed["messages"]} & kept)
+        if not messages:
+            return BuildResult("refused", f"nothing readable after cleaning: {dropped} messages dropped")
+        note = f"dropped {dropped} of {total} messages" if dropped else None
         if api is None:
             api = importlib.import_module("memory_kernel.api")
         overrides = build_overrides(settings)
         if not api.bonfire_exists(settings.bonfire_id, overrides=overrides):
             if found_bonfire(settings, claimed, messages, seed=seed):
-                return BuildResult("built", "founded")
+                return BuildResult("built", note)
             # Founded already by an earlier, interrupted attempt: this session is an ordinary append.
         if ops is None:
             ops = open_ops(settings)
@@ -374,13 +398,16 @@ def build_session(
         )
         status = out.get("status")
         if status == "stopped":
-            return BuildResult(
-                "stopped", redact(str(out.get("reason") or "stopped before seal"), secrets)[:_DETAIL_MAX]
-            )
-        # appended; duplicate and empty ran nothing and leave nothing to do
-        return BuildResult("built", str(status))
+            detail = out.get("result")
+            info = cast("Mapping[str, object]", detail) if isinstance(detail, Mapping) else {}
+            text = f"stopped at {info.get('stage') or 'an unknown stage'}: {info.get('reason') or 'no reason given'}"
+            return BuildResult("stopped", redact(text, secrets)[:_DETAIL_MAX])
+        if status == "empty":
+            return BuildResult("refused", "mk found nothing to build in the session (empty)")
+        # appended; a duplicate ran nothing and leaves nothing to do
+        return BuildResult("built", note)
     except FoundingFailed as exc:
-        kind = "refused" if isinstance(exc, FoundingRefused) else "stopped"
+        kind = "held" if isinstance(exc, FoundingRefused) else "stopped"
         return BuildResult(kind, redact(str(exc), secrets)[:_DETAIL_MAX])
     except Exception as exc:  # noqa: BLE001 - classified by name, never raised
         return founding_error(exc, secrets)
@@ -395,7 +422,7 @@ def release(settings: Settings) -> None:
     """``mk bonfire release <id>``. Raises ``ReleaseRefused`` when mk refuses (a lease that still looks live)."""
     uri = settings.ops_uri.get_secret_value()
     done = subprocess.run(
-        ["mk", "bonfire", "release", settings.bonfire_id, "--ops-uri", uri],
+        ["mk", "bonfire", "release", settings.bonfire_id],  # the address comes from MK_OPS_URI, never argv
         capture_output=True,
         text=True,
         timeout=120,

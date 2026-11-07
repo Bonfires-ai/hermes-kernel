@@ -31,7 +31,7 @@ def run_once(
     log.info("session %s: %s%s", sid, result.kind, f" ({reason})" if reason else "")
     match result.kind:
         case "built":
-            queue.built(sid)
+            queue.built(sid, reason)
         case "stopped":
             attempts = queue.stopped(sid, reason or "stopped")
             if attempts >= settings.max_tries:
@@ -44,7 +44,21 @@ def run_once(
         case "held":
             queue.held(sid, reason or "held")
         case "busy":
-            queue.requeue(sid, reason or "busy")
+            note = reason or "busy"
+            if result.pending:
+                # A failed session whose release was refused leaves a lease naming an uncommitted run: without a
+                # release every later session would be busy for ever.
+                failed = queue.last_failed()
+                note += f"; waiting on failed session {failed}" if failed else ""
+                if queue.pending_release_due(settings.held_retry_s):
+                    try:
+                        release()
+                        log.warning("released the lease behind a pending session (%s)", sid)
+                    except Exception as exc:  # noqa: BLE001 - the lease may still look live
+                        log.warning(
+                            "release for pending session refused: %s", redact(f"{type(exc).__name__}: {exc}", secrets)
+                        )
+            queue.requeue(sid, note)
             return False
         case "refused":
             queue.failed(sid, reason or "refused")
