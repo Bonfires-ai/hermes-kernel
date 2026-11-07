@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import pytest
 
-from kernel_turns.groups import SingleBonfire
 from kernel_turns.mk_client import KernelBusy, Refused
 from kernel_turns.models import JsonValue
 from kernel_turns.store import MemoryTurnStore
@@ -43,72 +42,74 @@ def _names(catalogue: dict[str, JsonValue]) -> list[str]:
     return [str(t["name"]) for t in tools if isinstance(t, dict)]
 
 
-async def test_a_failed_agent_install_is_retried(groups: SingleBonfire) -> None:
+async def test_a_failed_agent_install_is_retried() -> None:
     mk, store = FakeMk(), MemoryTurnStore()
-    teaching = Teaching(mk, store, groups)
-    await teaching.put_catalogue("telegram", "-100777", CATALOGUE)
+    teaching = Teaching(mk, store)
+    await teaching.put_catalogue(BONFIRE, "telegram", "-100777", CATALOGUE)
     mk.busy = True
     with pytest.raises(KernelBusy):
-        await teaching.put_catalogue("telegram", "-100777", AGENT, "agent")
-    assert "web_search" not in _names(await store.catalogue("telegram", "-100777") or {})  # the engine reads no phantom
+        await teaching.put_catalogue(BONFIRE, "telegram", "-100777", AGENT, "agent")
+    assert "web_search" not in _names(
+        await store.catalogue(BONFIRE, "telegram", "-100777") or {}
+    )  # the engine reads no phantom
     mk.busy = False
-    await teaching.put_catalogue("telegram", "-100777", AGENT, "agent")  # the identical retry installs
+    await teaching.put_catalogue(BONFIRE, "telegram", "-100777", AGENT, "agent")  # the identical retry installs
     assert "web_search" in _names(mk.catalogues[BONFIRE])
-    assert "web_search" in _names(await store.catalogue("telegram", "-100777") or {})
+    assert "web_search" in _names(await store.catalogue(BONFIRE, "telegram", "-100777") or {})
 
 
-async def test_agent_put_without_change_installs_nothing(groups: SingleBonfire) -> None:
+async def test_agent_put_without_change_installs_nothing() -> None:
     mk, store = FakeMk(), MemoryTurnStore()
-    teaching = Teaching(mk, store, groups)
-    await teaching.put_catalogue("telegram", "-100777", CATALOGUE)
-    await teaching.put_catalogue("telegram", "-100777", AGENT, "agent")
+    teaching = Teaching(mk, store)
+    await teaching.put_catalogue(BONFIRE, "telegram", "-100777", CATALOGUE)
+    await teaching.put_catalogue(BONFIRE, "telegram", "-100777", AGENT, "agent")
     assert len(mk.calls_of("put_catalogue")) == 2
-    await teaching.put_catalogue("telegram", "-100777", AGENT, "agent")  # same rows again
+    await teaching.put_catalogue(BONFIRE, "telegram", "-100777", AGENT, "agent")  # same rows again
     assert len(mk.calls_of("put_catalogue")) == 2
     await teaching.put_catalogue(
-        "telegram", "-100777", {**AGENT, "tools": [*AGENT["tools"], {**WEB_SEARCH, "name": "fetch"}]}, "agent"
+        BONFIRE, "telegram", "-100777", {**AGENT, "tools": [*AGENT["tools"], {**WEB_SEARCH, "name": "fetch"}]}, "agent"
     )
     assert len(mk.calls_of("put_catalogue")) == 3
 
 
-async def test_agent_put_in_another_row_order_installs_nothing(groups: SingleBonfire) -> None:
+async def test_agent_put_in_another_row_order_installs_nothing() -> None:
     mk, store = FakeMk(), MemoryTurnStore()
-    teaching = Teaching(mk, store, groups)
+    teaching = Teaching(mk, store)
     tools: list[JsonValue] = [WEB_SEARCH, {**WEB_SEARCH, "name": "fetch"}]
     two: dict[str, JsonValue] = {**AGENT, "tools": tools}
-    await teaching.put_catalogue("telegram", "-100777", two, "agent")
+    await teaching.put_catalogue(BONFIRE, "telegram", "-100777", two, "agent")
     n = len(mk.calls_of("put_catalogue"))
-    await teaching.put_catalogue("telegram", "-100777", {**two, "tools": list(reversed(tools))}, "agent")
+    await teaching.put_catalogue(BONFIRE, "telegram", "-100777", {**two, "tools": list(reversed(tools))}, "agent")
     assert len(mk.calls_of("put_catalogue")) == n
 
 
-async def _engine(mk: FakeMk, groups: SingleBonfire) -> tuple[TurnEngine, MemoryTurnStore]:
+async def _engine(mk: FakeMk) -> tuple[TurnEngine, MemoryTurnStore]:
     store = MemoryTurnStore()
-    teaching = Teaching(mk, store, groups)
-    await teaching.put_catalogue("telegram", "-100777", CATALOGUE)
-    await teaching.put_catalogue("telegram", "-100777", AGENT, "agent")
-    return TurnEngine(mk, store, groups), store
+    teaching = Teaching(mk, store)
+    await teaching.put_catalogue(BONFIRE, "telegram", "-100777", CATALOGUE)
+    await teaching.put_catalogue(BONFIRE, "telegram", "-100777", AGENT, "agent")
+    return TurnEngine(mk, store), store
 
 
-async def test_a_waiting_phrase_shows_on_the_next_turn(groups: SingleBonfire) -> None:
+async def test_a_waiting_phrase_shows_on_the_next_turn() -> None:
     mk = FakeMk({"sitrep": Script(steps=[("think", {"instruction": "summarise"})], phrase="sitrep.d1.0")})
-    engine, _ = await _engine(mk, groups)
-    child = await engine.begin(team_turn("sitrep", message_id="9:call:0"), parent="9")
+    engine, _ = await _engine(mk)
+    child = await engine.begin(BONFIRE, team_turn("sitrep", message_id="9:call:0"), parent="9")
     assert child.pending is not None and child.pending.runner == "agent"
 
-    mine = await engine.begin(team_turn("so?", message_id="10", at=later(2)))  # the same speaker
+    mine = await engine.begin(BONFIRE, team_turn("so?", message_id="10", at=later(2)))  # the same speaker
     assert mine.waiting is not None and mine.waiting.turn_id == child.turn_id
     assert mine.waiting.step.tool == "think" and "think" in mine.context and "phrase_continue" in mine.context
-    other = await engine.begin(team_turn("so?", message_id="11", speaker="Milo", at=later(3)))
+    other = await engine.begin(BONFIRE, team_turn("so?", message_id="11", speaker="Milo", at=later(3)))
     assert other.waiting is None  # another speaker's turn does not see it
-    assert (await engine.get(mine.turn_id)).waiting is not None
+    assert (await engine.get(BONFIRE, mine.turn_id)).waiting is not None
 
-    await engine.report(child.turn_id, child.pending.step_id, "committed", "three lines")
-    assert (await engine.begin(team_turn("so?", message_id="12", at=later(4)))).waiting is None  # it went on
+    await engine.report(BONFIRE, child.turn_id, child.pending.step_id, "committed", "three lines")
+    assert (await engine.begin(BONFIRE, team_turn("so?", message_id="12", at=later(4)))).waiting is None  # it went on
 
 
-async def test_think_is_not_a_call(groups: SingleBonfire) -> None:
-    engine, _ = await _engine(FakeMk(), groups)
-    view = await engine.begin(team_turn("hello"))
+async def test_think_is_not_a_call() -> None:
+    engine, _ = await _engine(FakeMk())
+    view = await engine.begin(BONFIRE, team_turn("hello"))
     with pytest.raises(Refused, match="phrase_continue"):
-        await engine.call(view.turn_id, "think", {"instruction": "x"})
+        await engine.call(BONFIRE, view.turn_id, "think", {"instruction": "x"})

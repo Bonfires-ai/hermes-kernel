@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from kernel_turns.affordances import afford, open_frames, render_form
-from kernel_turns.groups import SingleBonfire
 from kernel_turns.models import ChildCall, Frame, JsonValue
 from kernel_turns.store import MemoryTurnStore
 from kernel_turns.turns import TurnEngine
+from tests.conftest import BONFIRE
 from tests.fakes import CATALOGUE, FakeMk, Script, cli_turn, frame, later, team_turn
 
 READ_ONLY = ["look", "read", "search"]
@@ -17,11 +17,11 @@ def _frames(*rows: dict[str, JsonValue]) -> list[Frame]:
     return [Frame.model_validate(r) for r in rows]
 
 
-async def _engine(mk: FakeMk, groups: SingleBonfire) -> tuple[TurnEngine, MemoryTurnStore]:
+async def _engine(mk: FakeMk) -> tuple[TurnEngine, MemoryTurnStore]:
     store = MemoryTurnStore()
-    await store.save_catalogue("telegram", "-100777", CATALOGUE)
-    await store.save_catalogue("cli", "session-1", CATALOGUE)
-    return TurnEngine(mk, store, groups), store
+    await store.save_catalogue(BONFIRE, "telegram", "-100777", CATALOGUE)
+    await store.save_catalogue(BONFIRE, "cli", "session-1", CATALOGUE)
+    return TurnEngine(mk, store), store
 
 
 def test_partial_frame_affords_its_tool() -> None:
@@ -43,17 +43,17 @@ def test_editor_and_confirm_affordances() -> None:
     assert afford(yes, CATALOGUE, "talk_only", False) == READ_ONLY  # no staged draft of the speaker's: no confirm
 
 
-async def test_confirm_needs_the_speakers_own_staged_draft(groups: SingleBonfire) -> None:
+async def test_confirm_needs_the_speakers_own_staged_draft() -> None:
     mk = FakeMk({"yes": Script(steps=[], partial=True, frames=[frame("yes", "reply", complete=True)])})
-    engine, _ = await _engine(mk, groups)
+    engine, _ = await _engine(mk)
     staged = {"id": "fetch.d2.0", "kind": "taught", "status": "staged", "provenance": {"teacher": "Kira Dace"}}
     mk.rows = [staged]
-    kira = await engine.begin(team_turn("yes", message_id="1"))
+    kira = await engine.begin(BONFIRE, team_turn("yes", message_id="1"))
     assert "confirm_phrase" in kira.affordances
-    milo = await engine.begin(team_turn("yes", message_id="2", speaker="Milo"))  # yes from someone else
+    milo = await engine.begin(BONFIRE, team_turn("yes", message_id="2", speaker="Milo"))  # yes from someone else
     assert "confirm_phrase" not in milo.affordances
     mk.rows = [{**staged, "status": "live"}]
-    later_yes = await engine.begin(team_turn("yes", message_id="3", at=later(1)))
+    later_yes = await engine.begin(BONFIRE, team_turn("yes", message_id="3", at=later(1)))
     assert "confirm_phrase" not in later_yes.affordances
 
 
@@ -65,28 +65,28 @@ def test_render_form_fills_slots_from_args_then_defaults() -> None:
     assert render_form(forms, {"X": "JUJ-3"}, {}) == ("triage JUJ-3", "")  # the second form needs no R
 
 
-async def test_context_is_the_speakers_uncommitted_frames(groups: SingleBonfire) -> None:
+async def test_context_is_the_speakers_uncommitted_frames() -> None:
     both = Script(steps=[], partial=True, frames=[frame("take", ticket=None), frame("look", place="inbox")])
     mk = FakeMk({"take the new one then look at the inbox": both, "JUJ-3": NO_TOOLS})
-    engine, _ = await _engine(mk, groups)
-    first = await engine.begin(team_turn("take the new one then look at the inbox", message_id="1"))
+    engine, _ = await _engine(mk)
+    first = await engine.begin(BONFIRE, team_turn("take the new one then look at the inbox", message_id="1"))
     assert mk.calls_of("plan")[-1]["context"] == []  # nothing before it
-    looked = await engine.call(first.turn_id, "look", {"place": "inbox"})
+    looked = await engine.call(BONFIRE, first.turn_id, "look", {"place": "inbox"})
     assert looked.step is not None
-    await engine.report(first.turn_id, looked.step.step_id, "committed", ["JUJ-1"])
+    await engine.report(BONFIRE, first.turn_id, looked.step.step_id, "committed", ["JUJ-1"])
 
     # the same speaker in another chat of the group: the take left open in the first chat is never context there
-    await engine.begin(team_turn("JUJ-3", message_id="9", at=later(1)).model_copy(update={"chat": "-100888"}))
+    await engine.begin(BONFIRE, team_turn("JUJ-3", message_id="9", at=later(1)).model_copy(update={"chat": "-100888"}))
     assert mk.calls_of("plan")[-1]["context"] == []
 
-    await engine.begin(team_turn("JUJ-3", message_id="2", at=later(1)))
+    await engine.begin(BONFIRE, team_turn("JUJ-3", message_id="2", at=later(1)))
     context = mk.calls_of("plan")[-1]["context"]
     assert [f["name"] for f in context] == ["take"]  # look committed: no composition for it
     assert context[0]["roles"] == {"ticket": None}
 
-    await engine.begin(team_turn("JUJ-3", message_id="3", speaker="Milo", at=later(2)))
+    await engine.begin(BONFIRE, team_turn("JUJ-3", message_id="3", speaker="Milo", at=later(2)))
     assert mk.calls_of("plan")[-1]["context"] == []  # another speaker's turn is never context
-    await engine.begin(team_turn("JUJ-3", message_id="4", at=later(3)))
+    await engine.begin(BONFIRE, team_turn("JUJ-3", message_id="4", at=later(3)))
     assert mk.calls_of("plan")[-1]["context"] == []  # Kira's previous turn (JUJ-3) had no frames of its own
 
 
@@ -97,25 +97,25 @@ def test_a_phrase_called_is_not_open() -> None:
     assert [f.name for f in open_frames(frames, [], called)] == ["take"]  # the phrase was called: nothing waits on it
 
 
-async def test_a_group_with_no_catalogue_still_has_frames(groups: SingleBonfire) -> None:
+async def test_a_group_with_no_catalogue_still_has_frames() -> None:
     mk = FakeMk({"make onboard sam": Script(steps=[], partial=True, frames=[frame("make", title=None)])})
-    engine = TurnEngine(mk, MemoryTurnStore(), groups)
-    view = await engine.begin(team_turn("make onboard sam"))
+    engine = TurnEngine(mk, MemoryTurnStore())
+    view = await engine.begin(BONFIRE, team_turn("make onboard sam"))
     assert view.affordances == ["make"]  # the fake kernel has no tools installed either
-    cli = await engine.begin(cli_turn("hello"))
+    cli = await engine.begin(BONFIRE, cli_turn("hello"))
     assert cli.affordances == [] and cli.status == "unread"
 
 
-async def test_a_failed_tool_call_leaves_its_frame_open(groups: SingleBonfire) -> None:
+async def test_a_failed_tool_call_leaves_its_frame_open() -> None:
     mk = FakeMk(
         {"take the new one": Script(steps=[], partial=True, frames=[frame("take", ticket=None)]), "JUJ-3": NO_TOOLS}
     )
-    engine, _ = await _engine(mk, groups)
-    first = await engine.begin(team_turn("take the new one", message_id="1"))
-    called = await engine.call(first.turn_id, "take", {"ticket": "the new one"})
+    engine, _ = await _engine(mk)
+    first = await engine.begin(BONFIRE, team_turn("take the new one", message_id="1"))
+    called = await engine.call(BONFIRE, first.turn_id, "take", {"ticket": "the new one"})
     assert called.step is not None  # in flight: still open
-    await engine.report(first.turn_id, called.step.step_id, "precondition_failed", None, "no such ticket")
-    await engine.begin(team_turn("JUJ-3", message_id="2", at=later(1)))
+    await engine.report(BONFIRE, first.turn_id, called.step.step_id, "precondition_failed", None, "no such ticket")
+    await engine.begin(BONFIRE, team_turn("JUJ-3", message_id="2", at=later(1)))
     assert [f["name"] for f in mk.calls_of("plan")[-1]["context"]] == ["take"]  # asked "which ticket?": JUJ-3 answers
 
 
@@ -139,10 +139,10 @@ class _RepairingMk(FakeMk):
         }
 
 
-async def test_a_kernel_repair_on_a_message_turn_is_not_a_failure(groups: SingleBonfire) -> None:
+async def test_a_kernel_repair_on_a_message_turn_is_not_a_failure() -> None:
     mk = _RepairingMk({"put it on Doing": Script(steps=[], partial=True)})
-    engine, _ = await _engine(mk, groups)
-    view = await engine.begin(team_turn("put it on Doing"))
+    engine, _ = await _engine(mk)
+    view = await engine.begin(BONFIRE, team_turn("put it on Doing"))
     assert view.status == "unread" and view.repair is None
     assert [f.name for f in view.frames] == ["put"] and "put" in view.affordances
     assert "put(" in view.context  # the model is given the frame to act on

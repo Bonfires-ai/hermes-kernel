@@ -65,15 +65,15 @@ class CallsMixin:
         _store: TurnStore
 
         def _lock(self, turn_id: str) -> asyncio.Lock: ...
-        async def _load(self, turn_id: str) -> TurnRecord: ...
+        async def _load(self, bonfire_id: str, turn_id: str) -> TurnRecord: ...
         async def _catalogue(self, turn: TurnRecord) -> dict[str, JsonValue] | None: ...
         async def _plan(self, turn: TurnRecord, ledger: list[LedgerRow]) -> TurnRecord: ...
-        async def get(self, turn_id: str) -> object: ...
+        async def get(self, bonfire_id: str, turn_id: str) -> object: ...
 
-    async def call(self, turn_id: str, tool: str, args: dict[str, JsonValue]) -> CallView:
+    async def call(self, bonfire_id: str, turn_id: str, tool: str, args: dict[str, JsonValue]) -> CallView:
         """Admit the model's call of an afforded tool or phrase (see the module docstring)."""
         async with self._lock(turn_id):
-            turn = await self._load(turn_id)
+            turn = await self._load(bonfire_id, turn_id)
             if tool in (TEACH, CONFIRM):
                 raise Refused(f"{tool} is not a call: it has its own route and the teacher's yes", "own_route")
             if tool == THINK:
@@ -84,7 +84,7 @@ class CallsMixin:
                 return await self._again(turn, earlier)
             asked = next((c for c in turn.children if canon_key(c.tool, c.args) == wanted), None)
             if asked is not None:
-                return await self._child_view(asked.turn_id)
+                return await self._child_view(bonfire_id, asked.turn_id)
             row = tool_row(await self._catalogue(turn), tool)
             phrase = any(f.kind == "phrase" and f.name == tool for f in turn.frames)
             if tool not in turn.affordances:
@@ -100,7 +100,7 @@ class CallsMixin:
 
     async def _again(self, turn: TurnRecord, same: PendingStep) -> CallView:
         """The first result of a tool call made before: its value once committed, else the same step."""
-        mine = [r for r in await self._store.ledger(turn.turn_id) if r.step_id == same.step_id]
+        mine = [r for r in await self._store.ledger(turn.bonfire_id, turn.turn_id) if r.step_id == same.step_id]
         done = next((r for r in mine if r.verdict == "committed"), None)
         if done is not None:
             return CallView(kind="done", step=same, value=done.value)
@@ -111,8 +111,8 @@ class CallsMixin:
             )
         return CallView(kind="step", step=same)
 
-    async def _child_view(self, child_id: str) -> CallView:
-        child = await self._store.get_turn(child_id)
+    async def _child_view(self, bonfire_id: str, child_id: str) -> CallView:
+        child = await self._store.get_turn(bonfire_id, child_id)
         return CallView(kind="turn", step=child.pending if child else None, turn_id=child_id)
 
     async def _call_tool(self, turn: TurnRecord, row: dict[str, JsonValue], args: dict[str, JsonValue]) -> CallView:
@@ -120,7 +120,7 @@ class CallsMixin:
         problem = missing_args(row, args)
         if problem is not None:
             raise Refused(problem, "bad_args")
-        ledger = await self._store.ledger(turn.turn_id)
+        ledger = await self._store.ledger(turn.bonfire_id, turn.turn_id)
         occurrence = sum(
             1
             for r in ledger
@@ -160,7 +160,7 @@ class CallsMixin:
         # the phrase's effect is the sentence it renders: args spelled another way (a slot's case, a default given)
         # that render a recorded child's text are that call again
         for called in turn.children:
-            child = await self._store.get_turn(called.turn_id)
+            child = await self._store.get_turn(turn.bonfire_id, called.turn_id)
             if child is not None and child.text == text and child.phrase in verb.ids:
                 return CallView(kind="turn", step=child.pending, turn_id=child.turn_id)
         # the next free child id; a stored child is reused only for the same rendered text (a child the kernel read as
@@ -168,17 +168,17 @@ class CallsMixin:
         n = len(turn.calls) + len(turn.children)
         while True:
             message_id = f"{turn.message_id}:call:{n}"
-            child_id = keys.turn_id(turn.platform, turn.group, turn.chat, message_id)
-            stored = await self._store.get_turn(child_id)
+            child_id = keys.turn_id(turn.bonfire_id, turn.platform, turn.group, turn.chat, message_id)
+            stored = await self._store.get_turn(turn.bonfire_id, child_id)
             if stored is None or stored.text == text:
                 break
             n += 1
         async with self._lock(child_id):
-            child = await self._store.get_turn(child_id)
+            child = await self._store.get_turn(turn.bonfire_id, child_id)
             if child is None:
                 child = turn.child(child_id, message_id, text)
             if child.status not in FINISHED:
-                child = await self._plan(child, await self._store.ledger(child_id))
+                child = await self._plan(child, await self._store.ledger(turn.bonfire_id, child_id))
         if child.status == "unread":
             raise Refused(
                 f"{tool} did not read as {text!r} just now: {'; '.join(child.problems) or 'the kernel read nothing'}",

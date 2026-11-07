@@ -2,12 +2,16 @@
 
 ``MongoTurnStore`` keeps four collections in its database (``KT_MONGO_DB``, default ``kernel_turns``):
 
-* ``turns``: one document per turn (``_id`` = the turn id);
-* ``ledger``: one row per ``(turn_id, step_id, verdict)`` (a unique index makes ``add_ledger`` idempotent), read back
-  in insertion order (``_id``: the driver's ObjectIds grow within the one service process, and across restarts);
+* ``turns``: one document per turn (``_id`` = the turn id, whose hash holds the bonfire);
+* ``ledger``: one row per ``(bonfire_id, turn_id, step_id, verdict)`` (a unique index makes ``add_ledger`` idempotent),
+  read back in insertion order (``_id``: the driver's ObjectIds grow within the one service process, and across
+  restarts);
 * ``uses``: one row per finished use of a taught phrase;
 * ``catalogues``: the merged catalogue last installed for each group, and each source's rows as last PUT
-  (``agent``).
+  (``agent``), both keyed from the bonfire down.
+
+Every read and write names a bonfire, and one bonfire's id reaches nothing of another's: a turn of another bonfire is
+None, as if it did not exist. With ``retention_days`` set, ``turns`` and ``ledger`` rows expire on ``at``.
 
 What the kernel or a tool hands back unchanged (a ``TurnPlan``, a tool's value, a catalogue) is stored as JSON text:
 its keys are not ours (``$``-prefixed or dotted names are legal JSON) and it is never queried, only returned whole.
@@ -21,22 +25,32 @@ from typing import Protocol
 
 from pydantic import TypeAdapter
 from pymongo import ASCENDING, DESCENDING, AsyncMongoClient
-from pymongo.errors import DuplicateKeyError
+from pymongo.asynchronous.collection import AsyncCollection
+from pymongo.errors import DuplicateKeyError, OperationFailure
 
+from kernel_turns.keys import SEP
 from kernel_turns.models import JsonValue, LedgerRow, Runner, TurnRecord, UseRecord
 
 Doc = dict[str, object]
 
+#: what dropping an index that is not there answers
+_NAMESPACE_NOT_FOUND, _INDEX_NOT_FOUND = 26, 27
+_SECONDS_A_DAY = 86400
+#: the TTL index on ``turns`` and ``ledger``
+RETENTION = "retention"
+
 
 class TurnStore(Protocol):
-    async def get_turn(self, turn_id: str) -> TurnRecord | None: ...
+    async def get_turn(self, bonfire_id: str, turn_id: str) -> TurnRecord | None:
+        """The bonfire's turn; None for a turn of another bonfire."""
+        ...
 
     async def save_turn(self, turn: TurnRecord) -> None: ...
 
     async def add_ledger(self, row: LedgerRow) -> None:
-        """Idempotent on ``(turn_id, step_id, verdict)``: the same report twice is one row."""
+        """Idempotent on ``(bonfire_id, turn_id, step_id, verdict)``: the same report twice is one row."""
 
-    async def ledger(self, turn_id: str) -> list[LedgerRow]:
+    async def ledger(self, bonfire_id: str, turn_id: str) -> list[LedgerRow]:
         """The turn's rows in the order they were written (issue order)."""
 
     async def record_use(self, use: UseRecord) -> None: ...
@@ -50,18 +64,24 @@ class TurnStore(Protocol):
     async def previous_turn(self, turn: TurnRecord) -> TurnRecord | None:
         """The speaker's latest earlier message turn in the same chat (a child turn is never one), or None."""
 
-    async def save_catalogue(self, platform: str, group: str, catalogue: dict[str, JsonValue]) -> None: ...
+    async def save_catalogue(
+        self, bonfire_id: str, platform: str, group: str, catalogue: dict[str, JsonValue]
+    ) -> None: ...
 
-    async def catalogue(self, platform: str, group: str) -> dict[str, JsonValue] | None:
+    async def catalogue(self, bonfire_id: str, platform: str, group: str) -> dict[str, JsonValue] | None:
         """The merged catalogue installed for the group (what the turn engine reads)."""
 
-    async def save_source(self, platform: str, group: str, source: Runner, catalogue: dict[str, JsonValue]) -> None:
+    async def save_source(
+        self, bonfire_id: str, platform: str, group: str, source: Runner, catalogue: dict[str, JsonValue]
+    ) -> None:
         """One catalogue source's rows as last PUT (the agent's): the merge is rebuilt from these."""
 
-    async def source(self, platform: str, group: str, source: Runner) -> dict[str, JsonValue] | None: ...
+    async def source(
+        self, bonfire_id: str, platform: str, group: str, source: Runner
+    ) -> dict[str, JsonValue] | None: ...
 
-    async def kept_groups(self, source: Runner) -> list[tuple[str, str]]:
-        """The (platform, group) pairs that have a stored ``source``."""
+    async def kept_groups(self, bonfire_id: str, source: Runner) -> list[tuple[str, str]]:
+        """The bonfire's (platform, group) pairs that have a stored ``source``."""
         ...
 
     async def waiting_turn(self, turn: TurnRecord) -> TurnRecord | None:
@@ -69,33 +89,33 @@ class TurnStore(Protocol):
         in the agent, other than ``turn``'s own children, begun no later than ``turn``; or None."""
 
 
-def _ledger_key(row: LedgerRow) -> tuple[str, str, str]:
-    return (row.turn_id, row.step_id, row.verdict)
+def _ledger_key(row: LedgerRow) -> tuple[str, str, str, str]:
+    return (row.bonfire_id, row.turn_id, row.step_id, row.verdict)
 
 
 class MemoryTurnStore:
     """``TurnStore`` in process memory. Everything handed out is a copy, as a database's would be."""
 
     def __init__(self) -> None:
-        self._turns: dict[str, TurnRecord] = {}
+        self._turns: dict[tuple[str, str], TurnRecord] = {}
         self._ledger: list[LedgerRow] = []
         self._uses: list[UseRecord] = []
-        self._catalogues: dict[tuple[str, str], dict[str, JsonValue]] = {}
-        self._sources: dict[tuple[str, str, str], dict[str, JsonValue]] = {}
+        self._catalogues: dict[tuple[str, str, str], dict[str, JsonValue]] = {}
+        self._sources: dict[tuple[str, str, str, str], dict[str, JsonValue]] = {}
 
-    async def get_turn(self, turn_id: str) -> TurnRecord | None:
-        turn = self._turns.get(turn_id)
+    async def get_turn(self, bonfire_id: str, turn_id: str) -> TurnRecord | None:
+        turn = self._turns.get((bonfire_id, turn_id))
         return turn.model_copy(deep=True) if turn is not None else None
 
     async def save_turn(self, turn: TurnRecord) -> None:
-        self._turns[turn.turn_id] = turn.model_copy(deep=True)
+        self._turns[(turn.bonfire_id, turn.turn_id)] = turn.model_copy(deep=True)
 
     async def add_ledger(self, row: LedgerRow) -> None:
         if all(_ledger_key(r) != _ledger_key(row) for r in self._ledger):
             self._ledger.append(row.model_copy(deep=True))
 
-    async def ledger(self, turn_id: str) -> list[LedgerRow]:
-        return [r.model_copy(deep=True) for r in self._ledger if r.turn_id == turn_id]
+    async def ledger(self, bonfire_id: str, turn_id: str) -> list[LedgerRow]:
+        return [r.model_copy(deep=True) for r in self._ledger if r.bonfire_id == bonfire_id and r.turn_id == turn_id]
 
     async def record_use(self, use: UseRecord) -> None:
         self._uses.append(use.model_copy(deep=True))
@@ -122,22 +142,24 @@ class MemoryTurnStore:
         earlier.sort(key=lambda t: (t.at, t.turn_id), reverse=True)
         return earlier[0].model_copy(deep=True) if earlier else None
 
-    async def save_catalogue(self, platform: str, group: str, catalogue: dict[str, JsonValue]) -> None:
-        self._catalogues[(platform, group)] = json.loads(json.dumps(catalogue))
+    async def save_catalogue(self, bonfire_id: str, platform: str, group: str, catalogue: dict[str, JsonValue]) -> None:
+        self._catalogues[(bonfire_id, platform, group)] = json.loads(json.dumps(catalogue))
 
-    async def catalogue(self, platform: str, group: str) -> dict[str, JsonValue] | None:
-        found = self._catalogues.get((platform, group))
+    async def catalogue(self, bonfire_id: str, platform: str, group: str) -> dict[str, JsonValue] | None:
+        found = self._catalogues.get((bonfire_id, platform, group))
         return json.loads(json.dumps(found)) if found is not None else None
 
-    async def save_source(self, platform: str, group: str, source: Runner, catalogue: dict[str, JsonValue]) -> None:
-        self._sources[(platform, group, source)] = json.loads(json.dumps(catalogue))
+    async def save_source(
+        self, bonfire_id: str, platform: str, group: str, source: Runner, catalogue: dict[str, JsonValue]
+    ) -> None:
+        self._sources[(bonfire_id, platform, group, source)] = json.loads(json.dumps(catalogue))
 
-    async def source(self, platform: str, group: str, source: Runner) -> dict[str, JsonValue] | None:
-        found = self._sources.get((platform, group, source))
+    async def source(self, bonfire_id: str, platform: str, group: str, source: Runner) -> dict[str, JsonValue] | None:
+        found = self._sources.get((bonfire_id, platform, group, source))
         return json.loads(json.dumps(found)) if found is not None else None
 
-    async def kept_groups(self, source: Runner) -> list[tuple[str, str]]:
-        return sorted((p, g) for p, g, s in self._sources if s == source)
+    async def kept_groups(self, bonfire_id: str, source: Runner) -> list[tuple[str, str]]:
+        return sorted((p, g) for b, p, g, s in self._sources if b == bonfire_id and s == source)
 
     async def waiting_turn(self, turn: TurnRecord) -> TurnRecord | None:
         waiting = [
@@ -172,19 +194,33 @@ def _dumps(value: JsonValue) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
+async def drop_index_if_there(collection: AsyncCollection[Doc], name: str) -> None:
+    """Drop an index that may be gone, or whose collection may not exist yet; any other failure stops the start."""
+    try:
+        await collection.drop_index(name)
+    except OperationFailure as exc:
+        if exc.code not in (_NAMESPACE_NOT_FOUND, _INDEX_NOT_FOUND):
+            raise
+
+
 class MongoTurnStore:
     """``TurnStore`` over MongoDB (``AsyncMongoClient``, pymongo>=4.13). Call ``ensure_indexes`` once at start."""
 
-    def __init__(self, client: AsyncMongoClient[Doc], db: str) -> None:
+    def __init__(self, client: AsyncMongoClient[Doc], db: str, retention_days: int | None = None) -> None:
         database = client[db]
         self._turns = database["turns"]
         self._ledger = database["ledger"]
         self._uses = database["uses"]
         self._catalogues = database["catalogues"]
+        self._retention_s = None if retention_days is None else retention_days * _SECONDS_A_DAY
 
     async def ensure_indexes(self) -> None:
+        # A new name, because a kept volume holds the old key: re-creating a name with other keys throws.
+        await drop_index_if_there(self._ledger, "ledger_key")
         await self._ledger.create_index(
-            [("turn_id", ASCENDING), ("step_id", ASCENDING), ("verdict", ASCENDING)], unique=True, name="ledger_key"
+            [("bonfire_id", ASCENDING), ("turn_id", ASCENDING), ("step_id", ASCENDING), ("verdict", ASCENDING)],
+            unique=True,
+            name="ledger_key_v2",
         )
         await self._turns.create_index([("bonfire_id", ASCENDING), ("at", DESCENDING)], name="bonfire_recent")
         await self._uses.create_index([("bonfire_id", ASCENDING)], name="bonfire_uses")
@@ -198,18 +234,31 @@ class MongoTurnStore:
             ],
             name="speaker_waiting",
         )
+        await self._ensure_retention(self._turns)
+        await self._ensure_retention(self._ledger)
+
+    async def _ensure_retention(self, collection: AsyncCollection[Doc]) -> None:
+        """A TTL on ``at`` when retention is set. A changed setting replaces the index: re-creating that name with
+        other options would throw, and a setting taken away must stop the deleting."""
+        held = (await collection.index_information()).get(RETENTION)
+        if (held.get("expireAfterSeconds") if held else None) == self._retention_s:
+            return
+        await drop_index_if_there(collection, RETENTION)
+        if self._retention_s is not None:
+            await collection.create_index([("at", ASCENDING)], expireAfterSeconds=self._retention_s, name=RETENTION)
 
     # -- turns -------------------------------------------------------------------------------------------------------
 
-    async def get_turn(self, turn_id: str) -> TurnRecord | None:
-        doc = await self._turns.find_one({"_id": turn_id})
+    async def get_turn(self, bonfire_id: str, turn_id: str) -> TurnRecord | None:
+        doc = await self._turns.find_one({"_id": turn_id, "bonfire_id": bonfire_id})
         return self._turn(doc) if doc is not None else None
 
     async def save_turn(self, turn: TurnRecord) -> None:
         doc: Doc = turn.model_dump(mode="python", exclude={"plan"})
         doc["_id"] = turn.turn_id
         doc["plan_json"] = _dumps(turn.plan) if turn.plan is not None else None
-        await self._turns.replace_one({"_id": turn.turn_id}, doc, upsert=True)
+        # with the bonfire in the filter a turn id held by another bonfire is a duplicate key, never an overwrite
+        await self._turns.replace_one({"_id": turn.turn_id, "bonfire_id": turn.bonfire_id}, doc, upsert=True)
 
     async def recent_turns(self, bonfire_id: str, limit: int) -> list[TurnRecord]:
         if limit <= 0:
@@ -248,8 +297,8 @@ class MongoTurnStore:
         except DuplicateKeyError:
             return  # the same report again: the row is already there
 
-    async def ledger(self, turn_id: str) -> list[LedgerRow]:
-        cursor = self._ledger.find({"turn_id": turn_id}).sort([("_id", ASCENDING)])
+    async def ledger(self, bonfire_id: str, turn_id: str) -> list[LedgerRow]:
+        cursor = self._ledger.find({"bonfire_id": bonfire_id, "turn_id": turn_id}).sort([("_id", ASCENDING)])
         rows: list[LedgerRow] = []
         async for doc in cursor:
             fields = {k: v for k, v in doc.items() if k not in ("_id", "value_json")}
@@ -269,19 +318,28 @@ class MongoTurnStore:
 
     # -- catalogues ----------------------------------------------------------------------------------------------------
 
-    async def save_catalogue(self, platform: str, group: str, catalogue: dict[str, JsonValue]) -> None:
-        key = f"{platform}\x1f{group}"
-        doc: Doc = {"_id": key, "platform": platform, "group": group, "catalogue_json": _dumps(catalogue)}
-        await self._catalogues.replace_one({"_id": key}, doc, upsert=True)
-
-    async def catalogue(self, platform: str, group: str) -> dict[str, JsonValue] | None:
-        doc = await self._catalogues.find_one({"_id": f"{platform}\x1f{group}"})
-        return _decode(doc.get("catalogue_json") if doc is not None else None)
-
-    async def save_source(self, platform: str, group: str, source: Runner, catalogue: dict[str, JsonValue]) -> None:
-        key = f"{platform}\x1f{group}\x1f{source}"
+    async def save_catalogue(self, bonfire_id: str, platform: str, group: str, catalogue: dict[str, JsonValue]) -> None:
+        key = SEP.join((bonfire_id, platform, group))
         doc: Doc = {
             "_id": key,
+            "bonfire_id": bonfire_id,
+            "platform": platform,
+            "group": group,
+            "catalogue_json": _dumps(catalogue),
+        }
+        await self._catalogues.replace_one({"_id": key}, doc, upsert=True)
+
+    async def catalogue(self, bonfire_id: str, platform: str, group: str) -> dict[str, JsonValue] | None:
+        doc = await self._catalogues.find_one({"_id": SEP.join((bonfire_id, platform, group))})
+        return _decode(doc.get("catalogue_json") if doc is not None else None)
+
+    async def save_source(
+        self, bonfire_id: str, platform: str, group: str, source: Runner, catalogue: dict[str, JsonValue]
+    ) -> None:
+        key = SEP.join((bonfire_id, platform, group, source))
+        doc: Doc = {
+            "_id": key,
+            "bonfire_id": bonfire_id,
             "platform": platform,
             "group": group,
             "source": source,
@@ -289,12 +347,12 @@ class MongoTurnStore:
         }
         await self._catalogues.replace_one({"_id": key}, doc, upsert=True)
 
-    async def source(self, platform: str, group: str, source: Runner) -> dict[str, JsonValue] | None:
-        doc = await self._catalogues.find_one({"_id": f"{platform}\x1f{group}\x1f{source}"})
+    async def source(self, bonfire_id: str, platform: str, group: str, source: Runner) -> dict[str, JsonValue] | None:
+        doc = await self._catalogues.find_one({"_id": SEP.join((bonfire_id, platform, group, source))})
         return _decode(doc.get("catalogue_json") if doc is not None else None)
 
-    async def kept_groups(self, source: Runner) -> list[tuple[str, str]]:
-        docs = self._catalogues.find({"source": source})
+    async def kept_groups(self, bonfire_id: str, source: Runner) -> list[tuple[str, str]]:
+        docs = self._catalogues.find({"bonfire_id": bonfire_id, "source": source})
         return sorted([(str(d["platform"]), str(d["group"])) async for d in docs])
 
     async def waiting_turn(self, turn: TurnRecord) -> TurnRecord | None:

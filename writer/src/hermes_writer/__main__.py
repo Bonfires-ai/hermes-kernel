@@ -24,7 +24,7 @@ def main() -> None:
     point_nltk(settings.data_dir)
     secrets = settings.secrets()
     client: MongoClient[dict[str, Any]] = MongoClient(settings.mongo_uri.get_secret_value())
-    queue = Queue(client[settings.mongo_db], stop_backoff_s=settings.stop_backoff_s)
+    queue = Queue(client[settings.mongo_db], settings.bonfire_id, stop_backoff_s=settings.stop_backoff_s)
     build = functools.partial(build_session, settings)
     free = functools.partial(release, settings)
     last_held = time.monotonic()

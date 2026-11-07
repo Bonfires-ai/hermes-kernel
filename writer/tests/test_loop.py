@@ -48,7 +48,9 @@ def add_session(db, sid: str, n: int, *, state: str = "closed", messages: int = 
     for seq in range(messages):
         db.messages.insert_one(
             {
-                "_id": f"{sid}-{seq}",
+                "_id": f"bf\x1f{sid}-{seq}",
+                "bonfire_id": "bf",
+                "message_id": f"{sid}-{seq}",
                 "session_id": sid,
                 "seq": seq,
                 "speaker": "me",
@@ -87,7 +89,7 @@ def state(db, sid: str) -> dict[str, Any]:
 
 def test_a_built_session_deletes_its_text(db, settings):
     add_session(db, "A", 1)
-    assert run_once(Queue(db), Script(BuildResult("built")), Release(), settings)
+    assert run_once(Queue(db, "bf"), Script(BuildResult("built")), Release(), settings)
     session = state(db, "A")
     assert session["state"] == "built" and session["built_at"]
     docs = list(db.messages.find({"session_id": "A"}))
@@ -100,7 +102,7 @@ def test_a_stop_retries_then_fails_and_releases(db, settings):
     stop = BuildResult("stopped", "stopped before seal")
     build, release = Script(stop, stop, stop, BuildResult("built")), Release()
     now = [T0]
-    queue = Queue(db, clock=lambda: now[0])
+    queue = Queue(db, "bf", clock=lambda: now[0])
     run_once(queue, build, release, settings)
     assert state(db, "A")["attempts"] == 1 and state(db, "A")["state"] == "closed"
     now[0] += timedelta(seconds=60)
@@ -119,7 +121,7 @@ def test_a_stop_waits_out_its_delay_before_the_next_try(db, settings):
     stop = BuildResult("stopped", "x")
     build = Script(stop, stop, BuildResult("built"))
     now = [T0]
-    queue = Queue(db, clock=lambda: now[0])
+    queue = Queue(db, "bf", clock=lambda: now[0])
     assert run_once(queue, build, Release(), settings)  # the stop itself is work done
     assert state(db, "A")["retry_after"].replace(tzinfo=UTC) == T0 + timedelta(seconds=60)
     now[0] = T0 + timedelta(seconds=59)
@@ -138,7 +140,7 @@ def test_while_a_stop_waits_no_other_session_is_claimed(db, settings):
     add_session(db, "B", 2)
     build = Script(BuildResult("stopped", "x"), BuildResult("built"), BuildResult("built"))
     now = [T0]
-    queue = Queue(db, clock=lambda: now[0])
+    queue = Queue(db, "bf", clock=lambda: now[0])
     run_once(queue, build, Release(), settings)
     now[0] = T0 + timedelta(seconds=30)
     assert queue.claim() is None and state(db, "B")["state"] == "closed"
@@ -150,7 +152,7 @@ def test_while_a_stop_waits_no_other_session_is_claimed(db, settings):
 
 def test_a_busy_or_held_result_sets_no_delay(db, settings):
     add_session(db, "A", 1)
-    run_once(Queue(db), Script(BuildResult("busy", "leased")), Release(), settings)
+    run_once(Queue(db, "bf"), Script(BuildResult("busy", "leased")), Release(), settings)
     assert "retry_after" not in state(db, "A")
 
 
@@ -159,7 +161,7 @@ def test_a_failed_release_still_fails_the_session_and_hides_keys(db, settings):
     stop = BuildResult("stopped", f"died with {KEY}")
     build = Script(stop, stop, stop)
     now = [T0]
-    queue = Queue(db, clock=lambda: now[0])
+    queue = Queue(db, "bf", clock=lambda: now[0])
     for _ in range(3):
         run_once(queue, build, Release(fail=True), settings)
         now[0] += timedelta(seconds=300)
@@ -173,7 +175,7 @@ def test_a_stopped_session_goes_first(db, settings):
     add_session(db, "B", 2)
     build = Script(BuildResult("stopped", "x"), BuildResult("built"), BuildResult("built"))
     now = [T0]
-    queue = Queue(db, clock=lambda: now[0])
+    queue = Queue(db, "bf", clock=lambda: now[0])
     run_once(queue, build, Release(), settings)
     now[0] += timedelta(seconds=60)
     run_once(queue, build, Release(), settings)
@@ -182,14 +184,14 @@ def test_a_stopped_session_goes_first(db, settings):
 
 def test_past_the_ceiling_waits(db, settings):
     add_session(db, "A", 1)
-    run_once(Queue(db), Script(BuildResult("held", "bonfire spend ceiling reached")), Release(), settings)
+    run_once(Queue(db, "bf"), Script(BuildResult("held", "bonfire spend ceiling reached")), Release(), settings)
     assert state(db, "A")["state"] == "held" and state(db, "A")["attempts"] == 0
 
 
 def test_held_sessions_are_tried_again(db):
     add_session(db, "A", 1)
     now = [T0]
-    queue = Queue(db, clock=lambda: now[0])
+    queue = Queue(db, "bf", clock=lambda: now[0])
     claimed = queue.claim()
     assert claimed is not None
     queue.held("A", "ceiling")
@@ -202,7 +204,7 @@ def test_a_refused_session_fails_at_once_and_does_not_release(db, settings):
     add_session(db, "A", 1)
     add_session(db, "B", 2)
     build, release = Script(BuildResult("refused", "malformed"), BuildResult("built")), Release()
-    queue = Queue(db)
+    queue = Queue(db, "bf")
     run_once(queue, build, release, settings)
     run_once(queue, build, release, settings)
     assert state(db, "A")["state"] == "failed" and release.calls == 0 and state(db, "B")["state"] == "built"
@@ -211,16 +213,23 @@ def test_a_refused_session_fails_at_once_and_does_not_release(db, settings):
 def test_restart_puts_running_back(db):
     add_session(db, "A", 1, state="running")
     db.sessions.update_one({"_id": "A"}, {"$set": {"attempts": 2}})
-    Queue(db).reset_running()
+    Queue(db, "bf").reset_running()
     assert state(db, "A")["state"] == "closed" and state(db, "A")["attempts"] == 2
 
 
 def test_messages_are_read_by_timestamp_then_seq_and_blank_ones_skipped(db):
     add_session(db, "A", 1, messages=0)
     for _id, seq, sec, text in [("m1", 5, 2, "last"), ("m2", 5, 1, "first"), ("m3", 1, 3, None)]:
-        doc = {"_id": _id, "session_id": "A", "seq": seq, "speaker": "me", "timestamp": T0 + timedelta(seconds=sec)}
+        doc = {
+            "_id": f"bf\x1f{_id}",
+            "message_id": _id,
+            "session_id": "A",
+            "seq": seq,
+            "speaker": "me",
+            "timestamp": T0 + timedelta(seconds=sec),
+        }
         db.messages.insert_one({**doc, "text": text} if text else doc)
-    claimed = Queue(db).claim()
+    claimed = Queue(db, "bf").claim()
     assert claimed is not None
     assert [m["message_id"] for m in claimed["messages"]] == ["m2", "m1"]
 
@@ -301,13 +310,32 @@ def test_a_stopped_result_carries_mks_stage_and_reason(settings):
 
 def test_a_claim_survives_a_bad_message_and_a_failed_read(db):
     add_session(db, "A", 1, messages=0)
-    db.messages.insert_one({"_id": "ok", "session_id": "A", "seq": 0, "speaker": "me", "text": "t", "timestamp": T0})
-    db.messages.insert_one({"_id": "no-speaker", "session_id": "A", "seq": 1, "text": "t", "timestamp": T0})
-    claimed = Queue(db).claim()
+    db.messages.insert_one(
+        {
+            "_id": "bf\x1fok",
+            "message_id": "ok",
+            "session_id": "A",
+            "seq": 0,
+            "speaker": "me",
+            "text": "t",
+            "timestamp": T0,
+        }
+    )
+    db.messages.insert_one(
+        {
+            "_id": "bf\x1fno-speaker",
+            "message_id": "no-speaker",
+            "session_id": "A",
+            "seq": 1,
+            "text": "t",
+            "timestamp": T0,
+        }
+    )
+    claimed = Queue(db, "bf").claim()
     assert claimed is not None and [m["message_id"] for m in claimed["messages"]] == ["ok"]
 
     add_session(db, "B", 2)
-    queue = Queue(db)
+    queue = Queue(db, "bf")
 
     def broken(*a: Any, **kw: Any) -> Any:
         raise OSError("mongo went away")
@@ -334,7 +362,7 @@ def test_nothing_readable_fails_and_a_partial_drop_is_noted(db, settings):
     assert mk_empty.kind == "refused"
 
     add_session(db, "A", 1)
-    run_once(Queue(db), Script(partial), Release(), settings)
+    run_once(Queue(db, "bf"), Script(partial), Release(), settings)
     assert state(db, "A")["state"] == "built" and state(db, "A")["reason"] == "dropped 1 of 3 messages"
 
 
@@ -343,7 +371,7 @@ def test_a_pending_session_tries_release_once_per_interval(db, settings):
     db.sessions.update_one({"_id": "F"}, {"$set": {"failed_at": T0}})
     add_session(db, "B", 2)
     now = [T0 + timedelta(hours=2)]
-    queue = Queue(db, clock=lambda: now[0])
+    queue = Queue(db, "bf", clock=lambda: now[0])
     pending = BuildResult("busy", "PendingSession: run 1 stopped", pending=True)
     build, release = Script(pending, pending, pending), Release()
     assert not run_once(queue, build, release, settings)
@@ -379,7 +407,7 @@ def test_an_outage_counts_no_attempt(db, settings):
         result = build_session(settings, _claimed(), api=_api(_boom(exc)), ops=object(), parse=None)
         assert result.kind == "busy" and not result.pending and name in (result.reason or "")
     add_session(db, "A", 1)
-    run_once(Queue(db), Script(BuildResult("busy", "ServiceUnavailable: down")), Release(), settings)
+    run_once(Queue(db, "bf"), Script(BuildResult("busy", "ServiceUnavailable: down")), Release(), settings)
     assert state(db, "A")["state"] == "closed" and state(db, "A")["attempts"] == 0
 
 
@@ -390,7 +418,8 @@ def test_tied_and_decreasing_timestamps_come_out_rising(db):
     db["messages"].insert_many(
         [
             {
-                "_id": f"m{i}",
+                "_id": f"bf\x1fm{i}",
+                "message_id": f"m{i}",
                 "session_id": "s1",
                 "seq": i,
                 "speaker": "a",
@@ -400,7 +429,7 @@ def test_tied_and_decreasing_timestamps_come_out_rising(db):
             for i, at in enumerate((0, 0, 0, 5, 3))
         ]
     )
-    claimed = Queue(db).claim()
+    claimed = Queue(db, "bf").claim()
     assert claimed is not None
     stamps = [datetime.fromisoformat(m["timestamp"]) for m in claimed["messages"]]
     assert [m["message_id"] for m in claimed["messages"]] == ["m0", "m1", "m2", "m4", "m3"]  # by time, then seq
@@ -408,5 +437,42 @@ def test_tied_and_decreasing_timestamps_come_out_rising(db):
     assert stamps == [T0, T0 + milli, T0 + 2 * milli, T0 + timedelta(seconds=3), T0 + timedelta(seconds=5)]
     assert all(later > earlier for earlier, later in zip(stamps, stamps[1:], strict=False))
     assert (
-        db["messages"].find_one({"_id": "m1"})["timestamp"].replace(tzinfo=UTC) == T0
+        db["messages"].find_one({"message_id": "m1"})["timestamp"].replace(tzinfo=UTC) == T0
     )  # the store keeps what was sent
+
+
+def test_claim_hands_the_plain_message_id(db) -> None:
+    add_session(db, "A", 0, messages=0)
+    db.messages.insert_one(
+        {
+            "_id": "bf\x1fm1",
+            "bonfire_id": "bf",
+            "message_id": "m1",
+            "session_id": "A",
+            "seq": 1,
+            "speaker": "me",
+            "text": "t",
+            "timestamp": T0,
+        }
+    )
+    claimed = Queue(db, "bf").claim()
+    assert claimed is not None and [m["message_id"] for m in claimed["messages"]] == ["m1"]
+
+
+def test_the_writer_never_touches_another_bonfires_sessions(db) -> None:
+    add_session(db, "theirs", 0)
+    add_session(db, "theirs-running", 1, state="running")
+    add_session(db, "theirs-failed", 2, state="failed")
+    add_session(db, "theirs-held", 3, state="held")
+    db.sessions.update_many({}, {"$set": {"bonfire_id": "other"}})
+    db.sessions.update_one({"_id": "theirs-held"}, {"$set": {"held_at": T0}})
+    db.sessions.update_one({"_id": "theirs"}, {"$set": {"retry_after": T0 + timedelta(hours=1)}})
+    before = list(db.sessions.find({}).sort("_id"))
+    add_session(db, "mine", 4)
+    queue = Queue(db, "bf", clock=lambda: T0)
+    assert queue.reset_running() == 0
+    assert queue.release_held(0) == 0
+    assert queue.last_failed() is None
+    claimed = queue.claim()  # the oldest closed session is theirs, and it is waiting out a delay: neither stops this
+    assert claimed is not None and claimed["id"] == "mine"
+    assert list(db.sessions.find({"bonfire_id": "other"}).sort("_id")) == before

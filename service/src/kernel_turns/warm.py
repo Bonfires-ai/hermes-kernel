@@ -55,7 +55,7 @@ class Warmer:
         if not is_founded(health, self._bonfire_id):
             return False
         if not self._installed:
-            self._installed = await self._teaching.install_kept()
+            self._installed = await self._teaching.install_kept(self._bonfire_id)
             if not self._installed:
                 return False
         await self.warm()

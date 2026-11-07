@@ -18,6 +18,7 @@ from kernel_turns.mk_client import KernelBusy, KernelDown, NotFounded, NotTeache
 from kernel_turns.models import JsonValue, LedgerRow, TurnRecord
 from kernel_turns.store import MemoryTurnStore
 from kernel_turns.turns import BeginTurn
+from tests.conftest import BONFIRE
 
 Args = dict[str, JsonValue]
 AT = datetime(2026, 10, 22, 18, 0, tzinfo=UTC)
@@ -381,7 +382,13 @@ CATALOGUE: dict[str, JsonValue] = {
 }
 
 
-async def afforded_turn(store: MemoryTurnStore, *names: str, speaker: str = "Kira Dace", turn_id: str = "t-aff") -> str:
+async def afforded_turn(
+    store: MemoryTurnStore,
+    *names: str,
+    speaker: str = "Kira Dace",
+    turn_id: str = "t-aff",
+    bonfire_id: str = BONFIRE,
+) -> str:
     """A saved message turn of the team chat that affords ``names`` (for the teaching routes)."""
     await store.save_turn(
         TurnRecord(
@@ -394,7 +401,7 @@ async def afforded_turn(store: MemoryTurnStore, *names: str, speaker: str = "Kir
             text="teach",
             at=AT,
             participants=[],
-            bonfire_id="65f0c0ffee0000000000abcd",
+            bonfire_id=bonfire_id,
             plan=None,
             status="unread",
             licence=None,

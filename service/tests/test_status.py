@@ -66,7 +66,7 @@ async def test_catalogue_before_founding_is_kept_and_answers_204(world: tuple[Wo
     answer = client.put("/v1/groups/telegram/-100777/catalogue/agent", json=CATALOGUE, headers=AUTH)
     assert answer.status_code == 204
     assert w.mk.catalogues == {}
-    assert await w.turns.source("telegram", "-100777", "agent") == CATALOGUE
+    assert await w.turns.source(BONFIRE, "telegram", "-100777", "agent") == CATALOGUE
     w.mk.unborn = False  # founded: the same catalogue is now installed, not skipped as unchanged
     assert client.put("/v1/groups/telegram/-100777/catalogue/agent", json=CATALOGUE, headers=AUTH).status_code == 204
     assert BONFIRE in w.mk.catalogues
@@ -74,7 +74,7 @@ async def test_catalogue_before_founding_is_kept_and_answers_204(world: tuple[Wo
 
 async def test_teach_before_founding_says_when_it_can_start(world: tuple[World, TestClient]) -> None:
     w, client = world
-    turn = await afforded_turn(w.turns, "teach_phrase")
+    turn = await afforded_turn(w.turns, "teach_phrase", bonfire_id=BONFIRE)
     w.mk.unborn = True
     body = {
         "turn_id": turn,

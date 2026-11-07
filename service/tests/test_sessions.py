@@ -11,12 +11,14 @@ from pydantic import SecretStr
 
 from kernel_turns.app import create_app
 from kernel_turns.config import Settings
+from kernel_turns.keys import message_key
 from kernel_turns.sessions import MemorySessionStore, MessageIn, Session, SessionTake
 from kernel_turns.store import MemoryTurnStore
 from tests.fakes import FakeMk
 
 T0 = datetime(2026, 11, 6, 10, 0, tzinfo=UTC)
 HANDLES = ["hermes"]
+BONFIRE = "b1"
 TOKEN = "s3cret-token"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
 
@@ -35,13 +37,13 @@ def _msg(message_id: str, chat: str = "telegram:1", ts: datetime = T0, text: str
 
 def _take(max_messages: int = 100) -> tuple[SessionTake, MemorySessionStore, Clock]:
     store, clock = MemorySessionStore(), Clock()
-    return SessionTake(store, 1800, max_messages, clock, bonfire_id="b1"), store, clock
+    return SessionTake(store, 1800, max_messages, clock), store, clock
 
 
 async def test_a_resend_is_the_same_message() -> None:
     take, store, _ = _take()
-    first = await take.add([_msg("m1")], HANDLES)
-    again = await take.add([_msg("m1")], HANDLES)
+    first = await take.add(BONFIRE, [_msg("m1")], HANDLES)
+    again = await take.add(BONFIRE, [_msg("m1")], HANDLES)
     assert (first.accepted, first.duplicates) == (1, 0)
     assert (again.accepted, again.duplicates) == (0, 1)
     (session,) = store.sessions.values()
@@ -50,7 +52,7 @@ async def test_a_resend_is_the_same_message() -> None:
 
 async def test_a_session_closes_after_the_quiet_window() -> None:
     take, store, clock = _take()
-    await take.add([_msg("m1")], HANDLES)
+    await take.add(BONFIRE, [_msg("m1")], HANDLES)
     clock.now = T0 + timedelta(seconds=1799)
     await take.close_idle()
     (session,) = store.sessions.values()
@@ -63,33 +65,33 @@ async def test_a_session_closes_after_the_quiet_window() -> None:
 
 async def test_a_session_closes_at_100_messages() -> None:
     take, store, _ = _take(100)
-    await take.add([_msg(f"m{i}") for i in range(100)], HANDLES)
+    await take.add(BONFIRE, [_msg(f"m{i}") for i in range(100)], HANDLES)
     (first,) = store.sessions.values()
     assert (first.state, first.message_count) == ("closed", 100)
     assert first.closed_at is not None
-    await take.add([_msg("m100")], HANDLES)
+    await take.add(BONFIRE, [_msg("m100")], HANDLES)
     states = sorted((s.state, s.message_count) for s in store.sessions.values())
     assert states == [("closed", 100), ("open", 1)]
 
 
 async def test_a_message_after_close_opens_a_new_session() -> None:
     take, store, _ = _take()
-    await take.add([_msg("m1"), _msg("m2")], HANDLES)
-    assert await take.close("telegram:1") is True
-    assert await take.close("telegram:1") is False  # nothing open
-    await take.add([_msg("m3")], HANDLES)
+    await take.add(BONFIRE, [_msg("m1"), _msg("m2")], HANDLES)
+    assert await take.close(BONFIRE, "telegram:1") is True
+    assert await take.close(BONFIRE, "telegram:1") is False  # nothing open
+    await take.add(BONFIRE, [_msg("m3")], HANDLES)
     counts = sorted((s.state, s.message_count) for s in store.sessions.values())
     assert counts == [("closed", 2), ("open", 1)]
 
 
 async def test_two_chats_keep_their_own_sessions() -> None:
     take, store, _ = _take()
-    await take.add([_msg("a1", "telegram:1"), _msg("b1", "telegram:2"), _msg("a2", "telegram:1")], HANDLES)
+    await take.add(BONFIRE, [_msg("a1", "telegram:1"), _msg("b1", "telegram:2"), _msg("a2", "telegram:1")], HANDLES)
     by_chat = {s.conversation_id: s for s in store.sessions.values()}
     assert {chat: s.message_count for chat, s in by_chat.items()} == {"telegram:1": 2, "telegram:2": 1}
     seqs = {m.message_id: m.seq for m in store.messages.values()}
     assert seqs == {"a1": 1, "b1": 1, "a2": 2}
-    assert store.messages["a2"].session_id == by_chat["telegram:1"].id
+    assert store.messages[message_key(BONFIRE, "a2")].session_id == by_chat["telegram:1"].id
 
 
 async def test_timestamps_never_run_backwards_in_a_session() -> None:
@@ -102,8 +104,8 @@ async def test_timestamps_never_run_backwards_in_a_session() -> None:
         _msg("m4", ts=T0 + timedelta(seconds=9) + sub[0]),
         _msg("m5", ts=T0 + timedelta(seconds=9) + sub[1]),
     ]
-    await take.add(batch, HANDLES)
-    stamps = [store.messages[f"m{i}"].timestamp for i in range(1, 6)]
+    await take.add(BONFIRE, batch, HANDLES)
+    stamps = [store.messages[message_key(BONFIRE, f"m{i}")].timestamp for i in range(1, 6)]
     assert all(a < b for a, b in zip(stamps, stamps[1:], strict=False))
     assert all(t.microsecond % 1000 == 0 for t in stamps)
 
@@ -118,15 +120,15 @@ class _SweepsBetween(MemorySessionStore):
     ) -> int | None:
         if not self.swept:
             self.swept = True
-            await self.close_session(session.id, now)
+            await self.close_session(session.bonfire_id, session.id, now)
         return await super().append(session, message, timestamp, agent_handles, now)
 
 
 async def test_a_message_never_lands_in_a_session_closed_under_it() -> None:
     store, clock = _SweepsBetween(), Clock()
-    take = SessionTake(store, 1800, 100, clock, bonfire_id="b1")
-    await take.add([_msg("m1")], HANDLES)  # opens S, S is closed before the append
-    await take.add([_msg("m2")], HANDLES)
+    take = SessionTake(store, 1800, 100, clock)
+    await take.add(BONFIRE, [_msg("m1")], HANDLES)  # opens S, S is closed before the append
+    await take.add(BONFIRE, [_msg("m2")], HANDLES)
     by_state = sorted((s.state, s.message_count) for s in store.sessions.values())
     assert by_state == [("closed", 0), ("open", 2)]
     assert len({m.session_id for m in store.messages.values()}) == 1
@@ -134,10 +136,10 @@ async def test_a_message_never_lands_in_a_session_closed_under_it() -> None:
 
 async def test_a_resend_after_the_writer_removed_the_text_is_still_a_duplicate() -> None:
     take, store, _ = _take()
-    await take.add([_msg("m1")], HANDLES)
-    await take.close("telegram:1")
-    store.messages["m1"].text = None  # the writer unsets `text` and keeps the rest
-    result = await take.add([_msg("m1")], HANDLES)
+    await take.add(BONFIRE, [_msg("m1")], HANDLES)
+    await take.close(BONFIRE, "telegram:1")
+    store.messages[message_key(BONFIRE, "m1")].text = None  # the writer unsets `text` and keeps the rest
+    result = await take.add(BONFIRE, [_msg("m1")], HANDLES)
     assert (result.accepted, result.duplicates) == (0, 1)
     assert len(store.sessions) == 1
 
@@ -159,12 +161,12 @@ class _Gated(MemorySessionStore):
 
 async def test_a_close_waits_for_an_add_in_flight() -> None:
     store, clock = _Gated(), Clock()
-    take = SessionTake(store, 1800, 100, clock, bonfire_id="b1")
-    adding = asyncio.create_task(take.add([_msg("m1")], HANDLES))
+    take = SessionTake(store, 1800, 100, clock)
+    adding = asyncio.create_task(take.add(BONFIRE, [_msg("m1")], HANDLES))
     await store.inside.wait()
     clock.now = T0 + timedelta(seconds=1800)
     sweeping = asyncio.create_task(take.close_idle())
-    closing = asyncio.create_task(take.close("telegram:1"))
+    closing = asyncio.create_task(take.close(BONFIRE, "telegram:1"))
     await asyncio.sleep(0)
     await asyncio.sleep(0)
     assert not sweeping.done()
@@ -174,13 +176,13 @@ async def test_a_close_waits_for_an_add_in_flight() -> None:
     await asyncio.gather(sweeping, closing)
     (session,) = store.sessions.values()
     assert (session.state, session.message_count) == ("closed", 1)
-    assert store.messages["m1"].session_id == session.id
+    assert store.messages[message_key(BONFIRE, "m1")].session_id == session.id
 
 
 @pytest.fixture
 def api() -> tuple[TestClient, MemorySessionStore]:
     store = MemorySessionStore()
-    settings = Settings(token=SecretStr(TOKEN), bonfire_id="b1")
+    settings = Settings(token=SecretStr(TOKEN), bonfire_id=BONFIRE)
     return TestClient(create_app(settings, mk=FakeMk(), store=MemoryTurnStore(), sessions=store)), store
 
 

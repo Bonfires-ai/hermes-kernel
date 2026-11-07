@@ -12,6 +12,8 @@ confirm then needs no ``yes`` frame, and everything else still holds.
 
 A group's catalogue is the agent's tools: installed in ``mk serve`` (``PUT …/catalogue``) and stored once the kernel
 accepts it. The turn engine reads the stored copy for what a turn affords.
+
+Every public method names the bonfire first: a turn of another bonfire is unknown here too.
 """
 
 from __future__ import annotations
@@ -22,7 +24,7 @@ import logging
 from pydantic import BaseModel, Field, ValidationError
 
 from kernel_turns.affordances import CONFIRM, TEACH, has_staged_draft
-from kernel_turns.groups import GroupFinder
+from kernel_turns.groups import group_of
 from kernel_turns.mk_client import NOT_FOUNDED_SAID, KernelApi, MkError, NotFounded, Refused
 from kernel_turns.models import BodyStep, Frame, JsonValue, Runner
 from kernel_turns.store import TurnStore
@@ -153,44 +155,43 @@ WAITING_FOR_YES = (
 
 
 class Teaching:
-    def __init__(self, mk: KernelApi, store: TurnStore, groups: GroupFinder) -> None:
+    def __init__(self, mk: KernelApi, store: TurnStore) -> None:
         self._mk = mk
         self._store = store
-        self._groups = groups
         self._installing: dict[tuple[str, str], asyncio.Lock] = {}
 
     async def _afforded(
         self,
+        bonfire_id: str,
         turn_id: str,
         platform: str,
         group: str,
         name: str,
         speaker: str,
         chat: str | None = None,
-        bonfire: str | None = None,
     ) -> None:
         """Refuse (409) unless ``name`` is afforded by that turn of this group, spoken by ``speaker`` (in ``chat``)."""
-        turn = await self._store.get_turn(turn_id)
+        turn = await self._store.get_turn(bonfire_id, turn_id)
         if turn is None:
             raise UnknownTurn(f"no turn {turn_id!r}")
         mine = turn.speaker == speaker and (chat is None or turn.chat == chat)
         if (turn.platform, turn.group) != (platform, group) or not mine or name not in turn.affordances:
             if any(NOT_FOUNDED_SAID in problem for problem in turn.problems):
                 raise Refused(NOT_YET)  # no first conversation yet: the turn had no frames, so nothing is afforded
-            if name == CONFIRM and bonfire is not None and await self._has_draft_waiting(bonfire, speaker):
+            if name == CONFIRM and await self._has_draft_waiting(bonfire_id, speaker):
                 raise Refused(WAITING_FOR_YES)
             afforded = ", ".join(turn.affordances) or "nothing"
             raise Refused(f"{name} is not afforded by this turn (afforded: {afforded})")
 
-    async def _card_afforded(self, req: ConfirmRequest, bonfire: str) -> None:
+    async def _card_afforded(self, bonfire_id: str, req: ConfirmRequest) -> None:
         """Refuse (409) a card's confirm unless the turn is this person's, in this group, and a draft of theirs waits.
         No ``yes`` frame is asked for; the kernel still refuses anyone but the draft's teacher (``NotTeacher``)."""
-        turn = await self._store.get_turn(req.turn_id)
+        turn = await self._store.get_turn(bonfire_id, req.turn_id)
         if turn is None:
             raise UnknownTurn(f"no turn {req.turn_id!r}")
         if (turn.platform, turn.group, turn.speaker) != (req.platform, req.group, req.by):
             raise Refused(f"{CONFIRM} is not afforded by this turn: it is not {req.by}'s in this group")
-        if not await self._has_draft_waiting(bonfire, req.by):
+        if not await self._has_draft_waiting(bonfire_id, req.by):
             raise Refused(f"{CONFIRM} is not afforded: {req.by} has no draft waiting")
 
     async def _has_draft_waiting(self, bonfire: str, speaker: str) -> bool:
@@ -199,9 +200,9 @@ class Teaching:
         except MkError:
             return False
 
-    async def begin(self, req: TeachDraft) -> DraftView:
-        group = await self._groups.find(req.platform, req.group)
-        await self._afforded(req.turn_id, req.platform, req.group, TEACH, req.teacher, req.chat)
+    async def begin(self, bonfire_id: str, req: TeachDraft) -> DraftView:
+        group = group_of(bonfire_id, req.platform, req.group)
+        await self._afforded(bonfire_id, req.turn_id, req.platform, req.group, TEACH, req.teacher, req.chat)
         body: dict[str, JsonValue] = {
             "forms": list(req.forms),
             "body": list(req.body),
@@ -216,7 +217,7 @@ class Teaching:
             raise Refused(NOT_YET) from exc
         draft_id = out.get("draft_id")
         if isinstance(draft_id, str) and draft_id:
-            await self._follow_offer(req.turn_id, draft_id)
+            await self._follow_offer(bonfire_id, req.turn_id, draft_id)
         plain = read_back(req.forms, req.body, req.defaults)
         return DraftView(
             draft_id=draft_id if isinstance(draft_id, str) else "",
@@ -226,11 +227,11 @@ class Teaching:
             competes=_competes(out.get("competes")),
         )
 
-    async def _follow_offer(self, turn_id: str, draft_id: str) -> None:
+    async def _follow_offer(self, bonfire_id: str, turn_id: str, draft_id: str) -> None:
         """Mark the open offer on the teacher's previous message turn as followed by this draft. Written without
         the turn engine's lock on that turn: the offer's turn is over by the time its answer is drafted, so only a
         redelivery of it races, and a lost mark costs at most a second draft offered, never an effect."""
-        turn = await self._store.get_turn(turn_id)
+        turn = await self._store.get_turn(bonfire_id, turn_id)
         previous = await self._store.previous_turn(turn) if turn is not None else None
         offer = previous.offer if previous is not None else None
         if turn is None or previous is None or offer is None or offer.to != turn.speaker or offer.drafted is not None:
@@ -239,14 +240,13 @@ class Teaching:
             previous.model_copy(update={"offer": offer.model_copy(update={"drafted": draft_id})})
         )
 
-    async def confirm(self, draft_id: str, req: ConfirmRequest) -> ConfirmView:
-        found = await self._groups.find(req.platform, req.group)
+    async def confirm(self, bonfire_id: str, draft_id: str, req: ConfirmRequest) -> ConfirmView:
         if req.card:
-            await self._card_afforded(req, found.bonfire_id)
+            await self._card_afforded(bonfire_id, req)
         else:
-            await self._afforded(req.turn_id, req.platform, req.group, CONFIRM, req.by, bonfire=found.bonfire_id)
+            await self._afforded(bonfire_id, req.turn_id, req.platform, req.group, CONFIRM, req.by)
         try:
-            out = await self._mk.confirm(found.bonfire_id, draft_id, req.by)  # NotTeacher for anyone but the teacher
+            out = await self._mk.confirm(bonfire_id, draft_id, req.by)  # NotTeacher for anyone but the teacher
         except NotFounded as exc:
             raise Refused(NOT_YET) from exc
         specs = out.get("specs")
@@ -257,54 +257,53 @@ class Teaching:
         ]
         return ConfirmView(draft_id=draft_id, phrases=phrases)
 
-    async def verbs(self, platform: str, group: str) -> list[Verb]:
-        found = await self._groups.find(platform, group)
-        rows = await self._mk.constructions(found.bonfire_id)
-        catalogue = await self._store.catalogue(platform, group)
+    async def verbs(self, bonfire_id: str, platform: str, group: str) -> list[Verb]:
+        rows = await self._mk.constructions(bonfire_id)
+        catalogue = await self._store.catalogue(bonfire_id, platform, group)
         if catalogue is None:  # never PUT through this service: the catalogue the kernel has installed
-            catalogue = await self._mk.get_catalogue(found.bonfire_id)
-        uses = await self._store.uses(found.bonfire_id)
+            catalogue = await self._mk.get_catalogue(bonfire_id)
+        uses = await self._store.uses(bonfire_id)
         return verb_book(rows, tool_names(catalogue), uses)
 
     async def put_catalogue(
-        self, platform: str, group: str, catalogue: dict[str, JsonValue], source: Runner = "agent"
+        self, bonfire_id: str, platform: str, group: str, catalogue: dict[str, JsonValue], source: Runner = "agent"
     ) -> None:
         """Install the agent's catalogue in the kernel, then store it as the agent source and as the merged catalogue.
         Stored only after the kernel accepts it, so a failed install is retried. A catalogue identical to the one the
         kernel last accepted installs nothing: every install drops the bonfire's in-flight plans. A bonfire that does
         not exist yet (``NotFounded``) keeps the agent source and answers as if installed; the merged catalogue is
         stored only once the kernel has it, so the same catalogue is installed after founding."""
-        found = await self._groups.find(platform, group)
         async with self._installing.setdefault((platform, group), asyncio.Lock()):
-            held = await self._store.source(platform, group, source)
+            held = await self._store.source(bonfire_id, platform, group, source)
             merged = merge_sources(catalogue)
-            installed = await self._store.catalogue(platform, group)  # stored only once the kernel has taken it
+            # stored only once the kernel has taken it
+            installed = await self._store.catalogue(bonfire_id, platform, group)
             if held is not None and _by_name(held) == _by_name(catalogue) and installed is not None:
                 return
             try:
-                await self._mk.put_catalogue(found.bonfire_id, merged)
+                await self._mk.put_catalogue(bonfire_id, merged)
             except NotFounded:
-                await self._store.save_source(platform, group, source, catalogue)
+                await self._store.save_source(bonfire_id, platform, group, source, catalogue)
                 return
-            await self._store.save_source(platform, group, source, catalogue)
-            await self._store.save_catalogue(platform, group, merged)
+            await self._store.save_source(bonfire_id, platform, group, source, catalogue)
+            await self._store.save_catalogue(bonfire_id, platform, group, merged)
 
-    async def install_kept(self) -> bool:
-        """Install every kept agent catalogue in the kernel and store the merged one. True when installed or when
-        nothing is kept; False when the bonfire does not exist yet, or the kernel refused or was away (retry later)."""
-        for platform, group in await self._store.kept_groups("agent"):
-            found = await self._groups.find(platform, group)
+    async def install_kept(self, bonfire_id: str) -> bool:
+        """Install the bonfire's kept agent catalogues in the kernel and store the merged ones. True when installed or
+        when nothing is kept; False when the bonfire does not exist yet, or the kernel refused or was away (retry
+        later)."""
+        for platform, group in await self._store.kept_groups(bonfire_id, "agent"):
             async with self._installing.setdefault((platform, group), asyncio.Lock()):
-                source = await self._store.source(platform, group, "agent")
+                source = await self._store.source(bonfire_id, platform, group, "agent")
                 if source is None:
                     continue
                 merged = merge_sources(source)
                 try:
-                    await self._mk.put_catalogue(found.bonfire_id, merged)
+                    await self._mk.put_catalogue(bonfire_id, merged)
                 except MkError as exc:  # not founded, refused, busy or away
                     log.info("kernel_turns.install_kept: %s/%s not installed: %s", platform, group, exc)
                     return False
-                await self._store.save_catalogue(platform, group, merged)
+                await self._store.save_catalogue(bonfire_id, platform, group, merged)
         return True
 
 

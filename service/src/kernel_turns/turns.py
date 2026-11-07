@@ -1,7 +1,8 @@
 """The turn engine: ``begin``, ``report``, ``retry``, ``get`` and the model's calls (``CallsMixin``).
 
-A conversation message becomes a turn (``keys.turn_id``); the kernel plans it (``mk serve`` ``POST …/plan``) and the turn
-is one of:
+A conversation message becomes a turn of the caller's bonfire (``keys.turn_id``), and every public method names that
+bonfire first: a turn of another bonfire is unknown, as if it did not exist. The kernel plans the turn (``mk serve``
+``POST …/plan``) and it is one of:
 
 * ``unread``: the text is over ``max_text``, the kernel cannot be reached or refused the request (an unknown bonfire
   included), or its plan is ``unread``. ``TurnView.problems`` says why. What the turn affords the model then follows
@@ -60,7 +61,7 @@ from kernel_turns.affordances import (
     with_offer,
 )
 from kernel_turns.calls import FINISHED, CallsMixin
-from kernel_turns.groups import GroupFinder
+from kernel_turns.groups import group_of
 from kernel_turns.mk_client import KernelApi, KernelBusy, KernelDown, MkError, PlanGone, Refused
 from kernel_turns.models import (
     BodyStep,
@@ -87,7 +88,7 @@ UNREAD_CONTEXT = "The kernel did not read this turn."
 
 
 class UnknownTurn(LookupError):
-    """No turn has this id."""
+    """This bonfire has no turn with this id."""
 
 
 class BeginTurn(BaseModel):
@@ -150,14 +151,13 @@ def _issued(issued: list[PendingStep], step: PendingStep | None) -> list[Pending
 
 
 class TurnEngine(CallsMixin):
-    """The turn service's rules over a ``KernelApi``, a ``TurnStore`` and a ``GroupFinder``.
+    """The turn service's rules over a ``KernelApi`` and a ``TurnStore``.
 
     One call per turn at a time (an ``asyncio.Lock`` per turn id): a second ``report`` waits for the first."""
 
-    def __init__(self, mk: KernelApi, store: TurnStore, groups: GroupFinder, *, max_text: int = 4000) -> None:
+    def __init__(self, mk: KernelApi, store: TurnStore, *, max_text: int = 4000) -> None:
         self._mk = mk
         self._store = store
-        self._groups = groups
         self._max_text = max_text
         self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
 
@@ -168,21 +168,21 @@ class TurnEngine(CallsMixin):
             self._locks[turn_id] = lock
         return lock
 
-    async def _load(self, turn_id: str) -> TurnRecord:
-        turn = await self._store.get_turn(turn_id)
+    async def _load(self, bonfire_id: str, turn_id: str) -> TurnRecord:
+        turn = await self._store.get_turn(bonfire_id, turn_id)
         if turn is None:
             raise UnknownTurn(f"no turn {turn_id!r}")
         return turn
 
     # -- begin -------------------------------------------------------------------------------------------------------
 
-    async def begin(self, req: BeginTurn, *, parent: str | None = None) -> TurnView:
+    async def begin(self, bonfire_id: str, req: BeginTurn, *, parent: str | None = None) -> TurnView:
         """Begin the turn of a platform message. ``parent`` is for the engine's own child turns (a phrase call) and for
         tests: a child runs the kernel's steps one at a time; a message turn issues nothing (``_apply``)."""
-        group = await self._groups.find(req.platform, req.group)
-        turn_id = keys.turn_id(req.platform, req.group, req.chat, req.message_id)
+        group = group_of(bonfire_id, req.platform, req.group)
+        turn_id = keys.turn_id(bonfire_id, req.platform, req.group, req.chat, req.message_id)
         async with self._lock(turn_id):
-            turn = await self._store.get_turn(turn_id)
+            turn = await self._store.get_turn(bonfire_id, turn_id)
             if turn is None:
                 turn = TurnRecord(
                     turn_id=turn_id,
@@ -204,23 +204,23 @@ class TurnEngine(CallsMixin):
                 )
                 turn = await self._plan(turn, [])
             elif turn.status not in FINISHED:
-                turn = await self._replan(turn, await self._store.ledger(turn_id))
+                turn = await self._replan(turn, await self._store.ledger(bonfire_id, turn_id))
             return await self._waiting_view(turn, group)
 
     # -- get ---------------------------------------------------------------------------------------------------------
 
-    async def get(self, turn_id: str) -> TurnView:
+    async def get(self, bonfire_id: str, turn_id: str) -> TurnView:
         async with self._lock(turn_id):
-            turn = await self._load(turn_id)
+            turn = await self._load(bonfire_id, turn_id)
             if turn.status == "licensed":
                 turn = await self._refresh(turn)
-            return await self._waiting_view(turn, await self._groups.find(turn.platform, turn.group))
+            return await self._waiting_view(turn, group_of(bonfire_id, turn.platform, turn.group))
 
     async def _refresh(self, turn: TurnRecord) -> TurnRecord:
         """A licensed turn as the kernel now holds it: re-planned when its plan is gone or behind the ledger; ended here
         when its ledger holds a verdict that ends it which the kernel never took (before the probe: a gone plan would
         be planned again, and issue the refused step again)."""
-        ledger = await self._store.ledger(turn.turn_id)
+        ledger = await self._store.ledger(turn.bonfire_id, turn.turn_id)
         ended = await self._end_unheard(turn, ledger)
         if ended is not None:
             return ended
@@ -247,12 +247,14 @@ class TurnEngine(CallsMixin):
 
     # -- offers ------------------------------------------------------------------------------------------------------
 
-    async def offer(self, turn_id: str, forms: list[str], body: list[BodyStep], defaults: dict[str, str]) -> TurnView:
+    async def offer(
+        self, bonfire_id: str, turn_id: str, forms: list[str], body: list[BodyStep], defaults: dict[str, str]
+    ) -> TurnView:
         """Record the agent's offer to teach a phrase on a message turn: no side effect. The turn shows it as an open
         editor frame (construction ``offer``) and affords nothing more; the speaker's yes on their next message turn in
         the chat affords ``teach_phrase``. A second offer on the turn replaces the first."""
         async with self._lock(turn_id):
-            turn = await self._load(turn_id)
+            turn = await self._load(bonfire_id, turn_id)
             if turn.parent is not None:
                 raise Refused(f"turn {turn_id} is a phrase's child turn: an offer is made on a message")
             if turn.speaker is None:
@@ -260,20 +262,22 @@ class TurnEngine(CallsMixin):
             offer = TeachOffer(forms=forms, body=body, defaults=defaults, to=turn.speaker, at=_now())
             turn = turn.model_copy(update={"offer": offer, "frames": with_offer(turn.frames, True)})
             await self._store.save_turn(turn)
-            return self._view(turn, await self._groups.find(turn.platform, turn.group))
+            return self._view(turn, group_of(bonfire_id, turn.platform, turn.group))
 
     # -- the trace ---------------------------------------------------------------------------------------------------
 
-    async def recent(self, platform: str, group: str, limit: int) -> list[tuple[TurnRecord, list[LedgerRow]]]:
+    async def recent(
+        self, bonfire_id: str, platform: str, group: str, limit: int
+    ) -> list[tuple[TurnRecord, list[LedgerRow]]]:
         """The group's latest turns (newest first), each with its ledger rows."""
-        found = await self._groups.find(platform, group)
-        turns = await self._store.recent_turns(found.bonfire_id, limit)
-        return [(turn, await self._store.ledger(turn.turn_id)) for turn in turns]
+        turns = await self._store.recent_turns(bonfire_id, limit)
+        return [(turn, await self._store.ledger(bonfire_id, turn.turn_id)) for turn in turns]
 
     # -- report ------------------------------------------------------------------------------------------------------
 
     async def report(
         self,
+        bonfire_id: str,
         turn_id: str,
         step_id: str,
         verdict: Verdict,
@@ -281,7 +285,7 @@ class TurnEngine(CallsMixin):
         detail: str | None = None,
     ) -> TurnView:
         async with self._lock(turn_id):
-            turn = await self._load(turn_id)
+            turn = await self._load(bonfire_id, turn_id)
             direct = next((c for c in turn.calls if c.step_id == step_id), None)
             if direct is not None:
                 return await self._report_direct(turn, direct, verdict, value, detail)
@@ -289,7 +293,7 @@ class TurnEngine(CallsMixin):
             if pending is None or pending.step_id != step_id:
                 waiting = f"the pending step is {pending.step_id}" if pending is not None else "no step is pending"
                 raise Refused(f"step {step_id} is not pending for turn {turn_id} ({waiting})")
-            ledger = await self._store.ledger(turn_id)
+            ledger = await self._store.ledger(bonfire_id, turn_id)
             refused = self._unheard(turn, ledger)
             if refused is not None and refused.verdict != verdict:
                 # the step was already refused (its turn's save was lost): the same report again completes it below,
@@ -297,6 +301,7 @@ class TurnEngine(CallsMixin):
                 await self._end_unheard(turn, ledger)
                 raise Refused(f"step {step_id} of turn {turn_id} was reported {refused.verdict}, which ended the turn")
             row = LedgerRow(
+                bonfire_id=bonfire_id,
                 turn_id=turn_id,
                 step_id=pending.step_id,
                 tool=pending.tool,
@@ -325,7 +330,7 @@ class TurnEngine(CallsMixin):
                 plan = await self._mk.resume(turn.bonfire_id, plan_id, [result])
             except (PlanGone, Refused) as exc:
                 if verdict == "committed":
-                    turn = await self._plan(turn, await self._store.ledger(turn_id))
+                    turn = await self._plan(turn, await self._store.ledger(bonfire_id, turn_id))
                 else:
                     turn = await self._settle(before, self._ended_here(turn, row, exc), verdict)
             except (KernelBusy, KernelDown) as exc:
@@ -338,9 +343,9 @@ class TurnEngine(CallsMixin):
                 else:
                     turn = await self._settle(before, self._ended_here(turn, row, exc), verdict)
             else:
-                applied = self._apply(turn, plan, await self._store.ledger(turn_id))
+                applied = self._apply(turn, plan, await self._store.ledger(bonfire_id, turn_id))
                 turn = await self._settle(before, applied, verdict)
-            return self._view(turn, await self._groups.find(turn.platform, turn.group))
+            return self._view(turn, group_of(bonfire_id, turn.platform, turn.group))
 
     async def _report_direct(
         self, turn: TurnRecord, step: PendingStep, verdict: Verdict, value: JsonValue, detail: str | None
@@ -348,13 +353,15 @@ class TurnEngine(CallsMixin):
         """A report of a step the model's call was admitted as: the ledger row only, the kernel is never resumed. The same
         verdict again is the same report; a step that committed, was declined or failed a precondition is final, a
         ``tool_error`` may still be reported again (the call returns the step to run once more under its key)."""
-        rows = [r for r in await self._store.ledger(turn.turn_id) if r.step_id == step.step_id]
+        group = group_of(turn.bonfire_id, turn.platform, turn.group)
+        rows = [r for r in await self._store.ledger(turn.bonfire_id, turn.turn_id) if r.step_id == step.step_id]
         if any(r.verdict == verdict for r in rows):
-            return self._view(turn, await self._groups.find(turn.platform, turn.group))
+            return self._view(turn, group)
         final = next((r for r in rows if r.verdict != "tool_error"), None)
         if final is not None:
             raise Refused(f"step {step.step_id} of turn {turn.turn_id} was already reported {final.verdict}")
         row = LedgerRow(
+            bonfire_id=turn.bonfire_id,
             turn_id=turn.turn_id,
             step_id=step.step_id,
             tool=step.tool,
@@ -365,7 +372,7 @@ class TurnEngine(CallsMixin):
             at=_now(),
         )
         await self._store.add_ledger(row)
-        return self._view(turn, await self._groups.find(turn.platform, turn.group))
+        return self._view(turn, group)
 
     @staticmethod
     def _ended_here(turn: TurnRecord, row: LedgerRow, exc: MkError) -> TurnRecord:
@@ -376,10 +383,10 @@ class TurnEngine(CallsMixin):
 
     # -- retry -------------------------------------------------------------------------------------------------------
 
-    async def retry(self, turn_id: str) -> TurnView:
+    async def retry(self, bonfire_id: str, turn_id: str) -> TurnView:
         async with self._lock(turn_id):
-            turn = await self._load(turn_id)
-            ledger = await self._store.ledger(turn_id)
+            turn = await self._load(bonfire_id, turn_id)
+            ledger = await self._store.ledger(bonfire_id, turn_id)
             last = ledger[-1] if ledger else None
             if turn.status != "repair" or last is None or last.verdict != "tool_error":
                 raise Refused(f"turn {turn_id} cannot be retried: a retry follows a tool_error, and only that")
@@ -392,7 +399,7 @@ class TurnEngine(CallsMixin):
                 turn = await self._plan(turn, ledger)
             else:
                 turn = await self._settle(turn.status, self._apply(turn, plan, ledger), None)
-            return self._view(turn, await self._groups.find(turn.platform, turn.group))
+            return self._view(turn, group_of(bonfire_id, turn.platform, turn.group))
 
     # -- planning ----------------------------------------------------------------------------------------------------
 
@@ -477,12 +484,12 @@ class TurnEngine(CallsMixin):
         previous = await self._store.previous_turn(turn)
         if previous is None:
             return []
-        ledger = await self._store.ledger(previous.turn_id)
+        ledger = await self._store.ledger(previous.bonfire_id, previous.turn_id)
         return open_frames(previous.frames, ledger, previous.children)
 
     async def _catalogue(self, turn: TurnRecord) -> dict[str, JsonValue] | None:
         """The catalogue last PUT for the group, else the one the kernel has installed (None when it cannot say)."""
-        stored = await self._store.catalogue(turn.platform, turn.group)
+        stored = await self._store.catalogue(turn.bonfire_id, turn.platform, turn.group)
         if stored is not None:
             return stored
         try:
@@ -512,7 +519,7 @@ class TurnEngine(CallsMixin):
         and its answer to an open offer to teach: a yes affords the editor."""
         if turn.parent is not None:
             return turn
-        unread = (await self._groups.find(turn.platform, turn.group)).unread
+        unread = group_of(turn.bonfire_id, turn.platform, turn.group).unread
         reply = await self._reply(turn)
         offered = reply is not None and reply.answer == YES
         catalogue = await self._catalogue(turn)

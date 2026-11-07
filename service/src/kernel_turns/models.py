@@ -177,8 +177,10 @@ class TurnRecord(BaseModel):
 
 
 class LedgerRow(BaseModel):
-    """What a step did, written BEFORE the kernel hears of it. One row per ``(turn_id, step_id, verdict)``."""
+    """What a step did, written BEFORE the kernel hears of it. One row per
+    ``(bonfire_id, turn_id, step_id, verdict)``."""
 
+    bonfire_id: str
     turn_id: str
     step_id: str
     tool: str

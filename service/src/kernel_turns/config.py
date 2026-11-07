@@ -34,3 +34,5 @@ class Settings(BaseSettings):
     # A chat's session closes after this many seconds of quiet, or at this many messages.
     session_idle_s: float = 1800
     session_max_messages: int = 100
+    # Turn and ledger rows expire after this many days. Unset keeps them.
+    retention_days: int | None = None

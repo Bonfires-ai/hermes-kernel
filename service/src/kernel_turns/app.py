@@ -25,7 +25,6 @@ from pymongo import AsyncMongoClient
 
 from kernel_turns.calls import CallView
 from kernel_turns.config import Settings
-from kernel_turns.groups import SingleBonfire
 from kernel_turns.mk_client import KernelApi, KernelBusy, KernelDown, MkClient, MkError, NotTeacher, Refused
 from kernel_turns.models import BodyStep, JsonValue, LedgerRow, Runner, TurnRecord, Verdict
 from kernel_turns.sessions import (
@@ -161,7 +160,6 @@ def create_app(
 ) -> FastAPI:
     """The app over ``settings``; ``mk`` and ``store`` are injected by tests (default: ``MkClient`` and
     ``MongoTurnStore``, owned and closed by the app)."""
-    groups = SingleBonfire(settings.bonfire_id)
     client: MkClient | None = None
     kernel: KernelApi
     if mk is None:
@@ -181,7 +179,7 @@ def create_app(
     session_store: SessionStore
     if store is None:
         mongo = AsyncMongoClient(settings.mongo_uri.get_secret_value(), tz_aware=True)
-        mongo_store = MongoTurnStore(mongo, settings.mongo_db)
+        mongo_store = MongoTurnStore(mongo, settings.mongo_db, retention_days=settings.retention_days)
         turns_store = mongo_store
         mongo_sessions = MongoSessionStore(mongo, settings.mongo_db)
         session_store = sessions or mongo_sessions
@@ -193,10 +191,9 @@ def create_app(
         settings.session_idle_s,
         settings.session_max_messages,
         clock or (lambda: datetime.now(UTC)),
-        bonfire_id=settings.bonfire_id,
     )
-    engine = TurnEngine(kernel, turns_store, groups)
-    teaching = Teaching(kernel, turns_store, groups)
+    engine = TurnEngine(kernel, turns_store)
+    teaching = Teaching(kernel, turns_store)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -227,16 +224,16 @@ def create_app(
 
     @v1.post("/turns")
     async def begin_turn(req: BeginTurn) -> TurnView:
-        return await engine.begin(req)
+        return await engine.begin(settings.bonfire_id, req)
 
     @v1.get("/turns/{turn_id}")
     async def get_turn(turn_id: str) -> TurnView:
-        return await engine.get(turn_id)
+        return await engine.get(settings.bonfire_id, turn_id)
 
     @v1.post("/turns/{turn_id}/calls")
     async def call_tool(turn_id: str, req: CallRequest) -> CallView:
         try:
-            return await engine.call(turn_id, req.tool, req.args)
+            return await engine.call(settings.bonfire_id, turn_id, req.tool, req.args)
         except MkError as exc:
             # The class and how many arguments, so a failure can be read from the logs: never `detail`, which can quote
             # what the person said.
@@ -248,32 +245,32 @@ def create_app(
 
     @v1.post("/turns/{turn_id}/offers")
     async def offer_phrase(turn_id: str, req: OfferRequest) -> TurnView:
-        return await engine.offer(turn_id, req.forms, req.body, req.defaults)
+        return await engine.offer(settings.bonfire_id, turn_id, req.forms, req.body, req.defaults)
 
     @v1.post("/turns/{turn_id}/report")
     async def report_step(turn_id: str, req: ReportRequest) -> TurnView:
-        return await engine.report(turn_id, req.step_id, req.verdict, req.value, req.detail)
+        return await engine.report(settings.bonfire_id, turn_id, req.step_id, req.verdict, req.value, req.detail)
 
     @v1.post("/turns/{turn_id}/retry")
     async def retry_step(turn_id: str) -> TurnView:
-        return await engine.retry(turn_id)
+        return await engine.retry(settings.bonfire_id, turn_id)
 
     @v1.post("/teaching")
     async def teach(req: TeachDraft) -> DraftView:
-        return await teaching.begin(req)
+        return await teaching.begin(settings.bonfire_id, req)
 
     @v1.post("/teaching/{draft_id}/confirm")
     async def confirm(draft_id: str, req: ConfirmRequest) -> ConfirmView:
-        return await teaching.confirm(draft_id, req)
+        return await teaching.confirm(settings.bonfire_id, draft_id, req)
 
     @v1.put("/groups/{platform}/{group}/catalogue/{source}", status_code=204)
     async def put_catalogue(platform: str, group: str, source: Runner, catalogue: dict[str, JsonValue]) -> Response:
-        await teaching.put_catalogue(platform, group, catalogue, source)
+        await teaching.put_catalogue(settings.bonfire_id, platform, group, catalogue, source)
         return Response(status_code=204)
 
     @v1.get("/groups/{platform}/{group}/verbs")
     async def verbs(platform: str, group: str) -> list[Verb]:
-        return await teaching.verbs(platform, group)
+        return await teaching.verbs(settings.bonfire_id, platform, group)
 
     @v1.get("/groups/{platform}/{group}/turns")
     async def recent_turns(
@@ -281,20 +278,20 @@ def create_app(
     ) -> list[TurnTrace]:
         return [
             TurnTrace(**turn.model_dump(), ledger=ledger)
-            for turn, ledger in await engine.recent(platform, group, limit)
+            for turn, ledger in await engine.recent(settings.bonfire_id, platform, group, limit)
         ]
 
     @v1.post("/messages")
     async def add_messages(req: AddRequest) -> AddResult:
-        return await take.add(req.messages, req.agent_handles)
+        return await take.add(settings.bonfire_id, req.messages, req.agent_handles)
 
     @v1.post("/sessions/close")
     async def close_session(req: CloseRequest) -> CloseResult:
-        return CloseResult(closed=await take.close(req.conversation_id))
+        return CloseResult(closed=await take.close(settings.bonfire_id, req.conversation_id))
 
     @v1.post("/sessions/{session_id}/retry")
     async def retry_session(session_id: str) -> Response:
-        outcome = await take.retry(session_id)
+        outcome = await take.retry(settings.bonfire_id, session_id)
         if outcome == "unknown":
             raise HTTPException(404, f"no session {session_id!r}")
         if outcome == "not_failed":

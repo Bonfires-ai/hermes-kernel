@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 
-from kernel_turns.groups import SingleBonfire
 from kernel_turns.store import MemoryTurnStore
 from kernel_turns.teaching import Teaching
 from kernel_turns.warm import Warmer, warm_until_done
@@ -12,10 +11,10 @@ from tests.fakes import FakeMk
 from tests.test_sources import AGENT, BONFIRE
 
 
-def _setup(groups: SingleBonfire) -> tuple[FakeMk, Teaching, Warmer]:
+def _setup() -> tuple[FakeMk, Teaching, Warmer]:
     mk = FakeMk()
     mk.unborn = True
-    teaching = Teaching(mk, MemoryTurnStore(), groups)
+    teaching = Teaching(mk, MemoryTurnStore())
     return mk, teaching, Warmer(mk, teaching, BONFIRE)
 
 
@@ -25,9 +24,9 @@ def _found(mk: FakeMk) -> None:
     mk.healthz = {"status": "ok", "version": "2.0.0", "bonfires": {BONFIRE: {}}, "spend": {}}
 
 
-async def test_founding_installs_the_kept_catalogue_and_warms(groups: SingleBonfire) -> None:
-    mk, teaching, warmer = _setup(groups)
-    await teaching.put_catalogue("hermes", "main", AGENT)  # before founding: kept, installed nowhere
+async def test_founding_installs_the_kept_catalogue_and_warms() -> None:
+    mk, teaching, warmer = _setup()
+    await teaching.put_catalogue(BONFIRE, "hermes", "main", AGENT)  # before founding: kept, installed nowhere
     assert await warmer.tick() is False
     assert mk.calls_of("plan") == []
     _found(mk)
@@ -38,9 +37,9 @@ async def test_founding_installs_the_kept_catalogue_and_warms(groups: SingleBonf
     assert len(plans) == 1 and isinstance(plans[0], dict) and plans[0]["chat_id"] == "__warm__"
 
 
-async def test_tick_does_it_once(groups: SingleBonfire) -> None:
-    mk, teaching, warmer = _setup(groups)
-    await teaching.put_catalogue("hermes", "main", AGENT)
+async def test_tick_does_it_once() -> None:
+    mk, teaching, warmer = _setup()
+    await teaching.put_catalogue(BONFIRE, "hermes", "main", AGENT)
     _found(mk)
     assert await warmer.tick() is True
     assert await warmer.tick() is True
@@ -48,9 +47,9 @@ async def test_tick_does_it_once(groups: SingleBonfire) -> None:
     assert len(mk.calls_of("plan")) == 1
 
 
-async def test_a_refused_install_retries_next_tick(groups: SingleBonfire) -> None:
-    mk, teaching, warmer = _setup(groups)
-    await teaching.put_catalogue("hermes", "main", AGENT)
+async def test_a_refused_install_retries_next_tick() -> None:
+    mk, teaching, warmer = _setup()
+    await teaching.put_catalogue(BONFIRE, "hermes", "main", AGENT)
     _found(mk)
     mk.busy = True  # PUT refused with 503
     assert await warmer.tick() is False
@@ -59,16 +58,16 @@ async def test_a_refused_install_retries_next_tick(groups: SingleBonfire) -> Non
     assert len(mk.calls_of("plan")) == 1
 
 
-async def test_an_unborn_bonfire_with_nothing_kept_is_not_warmed(groups: SingleBonfire) -> None:
-    mk, _, warmer = _setup(groups)
+async def test_an_unborn_bonfire_with_nothing_kept_is_not_warmed() -> None:
+    mk, _, warmer = _setup()
     assert await warmer.tick() is False
     assert mk.calls_of("plan") == []
 
 
-async def test_boot_warms_a_bonfire_that_already_exists(groups: SingleBonfire) -> None:
-    mk, teaching, _ = _setup(groups)
+async def test_boot_warms_a_bonfire_that_already_exists() -> None:
+    mk, teaching, _ = _setup()
     _found(mk)
-    await teaching.put_catalogue("hermes", "main", AGENT)  # installed and stored before the restart
+    await teaching.put_catalogue(BONFIRE, "hermes", "main", AGENT)  # installed and stored before the restart
     mk.calls.clear()
     del mk.catalogues[BONFIRE]  # the kernel no longer holds it
     warmer = Warmer(mk, teaching, BONFIRE)  # the restarted service
