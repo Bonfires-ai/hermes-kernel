@@ -31,3 +31,7 @@ that make memory-kernel a person's own Hermes memory and turn reader.
   file with no names. The plugin's tests each run on a temporary home.
 - README: upgrading, a Hermes that was already running, what `/kernel` can show. `.env.example` lists the optional
   settings. A root `.dockerignore`.
+- A person keeps a phrase by clicking a card, on the CLI and in a private Telegram chat. The keep comes only from
+  Hermes's real `clarify` result, seen in a hook, never from what the model says or passes. Everywhere else, and when
+  there is no card, a plain "yes" keeps it as before. Throw it away and Change it close the draft, so a later "yes"
+  cannot revive it while this Hermes runs.

@@ -95,10 +95,17 @@ result), `"them"`, or literal text. `think` is a step you do yourself:
 3. **Fix problems yourself** (a misnamed slot, a step said differently from its form) and call `teach_phrase` again
    in the same message. If a form "also reads as" something the kernel already knows, tell the teacher and let them
    decide.
-4. **Read the read-back to the teacher,** word for word, and ask whether to keep it. Ask them to answer with just
-   "yes": the kernel reads a bare "yes" as a yes, and a longer sentence ("yes, keep it") may not be read as one.
-5. **Only on the teacher's yes,** call `confirm_phrase(draft_id)`. Someone else's yes does not count, and never confirm
-   without it. A no drops the draft. If `confirm_phrase` says the draft is waiting for a plain "yes", ask the teacher
-   to answer with just "yes" and call it again; it is not broken or unavailable.
+4. **Ask the teacher the way `teach_phrase` says.**
+   - **With a card,** when its answer gives a `questions` value: call `clarify`, copying that value exactly. Keep it
+     keeps the phrase by itself; then call `confirm_phrase(draft_id)` to hear the result. Change it: ask what to change
+     and draft again. Throw it away: say so and stop.
+   - **With a plain "yes",** when it gives no `questions` value, when `clarify` is not available, or when they answer
+     in the chat instead of on the card: read the read-back to them, word for word, and ask them to answer with just
+     "yes". The kernel reads a bare "yes" as a yes, and a longer sentence ("yes, keep it") may not be read as one.
+5. **Only on the teacher's own yes,** call `confirm_phrase(draft_id)`. Someone else's yes does not count, and never
+   confirm without it. After a card it only tells you what became of the draft: their choice reaches the plugin
+   directly, so saying they chose keeps nothing. A no drops the draft. If `confirm_phrase` says the person turned the
+   draft down, say so and draft again only if they ask. If it says the draft is waiting for a plain "yes", ask the
+   teacher to answer with just "yes" and call it again; it is not broken or unavailable.
 
 Once kept, the phrase is the person's: they say it, the block lists it, and you run it with `run_phrase`.

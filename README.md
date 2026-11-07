@@ -186,10 +186,20 @@ that Hermes never reads a draft back to you, and that the phrase does nothing wh
 at calling tools for teaching.
 
 Ask Hermes to remember a routine ("when I say `research X`, search the web for X and summarise it"). It drafts the
-phrase, reads it back, and keeps it only when you say yes. **Answer with just `yes`**: the kernel reads a bare
-"yes" as a yes, but not a longer sentence such as "yes, keep it", and then the phrase stays a draft until you say
-`yes` on its own. Then you say `research sourdough` and it runs the steps. In
-this version a phrase only reads: its steps use Hermes's read-only tools (`web_search`) and `think`, a step the model
+phrase and keeps it only when you say so. Then you say `research sourdough` and it runs the steps.
+
+- **On the CLI and in a private Telegram chat** it shows you a card with the draft and three choices: Keep it, Change
+  it, Throw it away. Your click goes to the plugin directly, from Hermes's own `clarify` result, so a model cannot keep a
+  phrase by saying that you did: phrases run steps later, so the keep has to come from you. Keep it keeps the phrase.
+  Throw it away and Change it close that draft, so a later `yes` cannot revive it. That holds while this Hermes runs:
+  memory-kernel has no way to delete a draft, so after a Hermes restart nothing remembers the closing.
+- **In a group, and anywhere else with no card** (other platforms' direct messages too, or `clarify` turned off for the
+  platform), it reads the draft back and you **answer with just `yes`**. A card there would not say who clicked, and
+  Telegram lets any allowed user press a button. The kernel reads a bare "yes" as a yes, but not a longer sentence such
+  as "yes, keep it", and then the phrase stays a draft until you say `yes` on its own. The same goes if you answer a
+  card by typing in the chat instead.
+
+In this version a phrase only reads: its steps use Hermes's read-only tools (`web_search`) and `think`, a step the model
 does itself. A step that would change something outside is refused. The plugin installs a skill that tells Hermes how.
 
 ## Platforms
