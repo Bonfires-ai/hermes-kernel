@@ -332,3 +332,41 @@ def test_money_small_amounts_do_not_read_as_zero():
     assert _money(19.9) == "$19.90"
     assert _money(0) == "$0.00"
     assert _money(20.0) == "$20.00"
+
+
+def test_status_line_hosted_ceiling_names_no_docker():
+    held = {
+        "bonfire_id": "hermes",
+        "hosted": True,
+        "founded": True,
+        "last_built_at": None,
+        "failed": [],
+        "held": "bonfire spend ceiling reached: bonfire 'hermes' has spent $4.9 of $5",
+        "spend": {"charged_usd": 4.9, "ceiling_usd": 5.0},
+    }
+    line = status_line(held, None)
+    assert "docker" not in line and "mk bonfire ceiling" not in line
+    assert "set by Bonfires" in line and "ask them" in line and "Spent $4.90 of $5.00" in line and "Saving." not in line
+
+
+def test_status_line_unretryable_session_offers_no_retry():
+    row = {"session_id": "k9", "reason": "mk said no", "attempts": 2, "retryable": False}
+    status = {"founded": True, "last_built_at": None, "failed": [row], "held": None}
+    line = status_line(status, None)
+    assert "k9" in line and "mk said no" in line and "/kernel retry" not in line
+    assert "ask Bonfires to look at it" in line
+    assert "/kernel retry s1" in status_line(
+        {**status, "failed": [{**row, "session_id": "s1", "retryable": True}]}, None
+    )
+
+
+def test_status_line_unreadable_queue_never_says_saving():
+    status = {
+        "hosted": True,
+        "founded": True,
+        "last_built_at": None,
+        "failed": [],
+        "held": "the build queue can't be read right now",
+    }
+    line = status_line(status, None)
+    assert "Saving." not in line and "can't be read" in line

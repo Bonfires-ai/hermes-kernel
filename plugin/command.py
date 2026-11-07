@@ -38,6 +38,9 @@ def _held_lines(status: dict[str, Any], held: str) -> list[str]:
     lines.append(
         "The ceiling is a running total: pick a new one above what is spent. One close to the total can refuse a long session."
     )
+    if status.get("hosted"):
+        lines.append("On hosted memory the ceiling is set by Bonfires: ask them to raise it.")
+        return lines
     lines.append(
         "To raise it, from the hermes-kernel directory: "
         f"docker compose exec writer mk bonfire ceiling {status.get('bonfire_id', '<bonfire id>')} "
@@ -71,7 +74,13 @@ def status_line(status: dict[str, Any] | None, problem: str | None, *, saving_kn
     failed = status.get("failed") or []
     for item in failed:
         sid = str(item.get("session_id", ""))
-        lines.append(f"Session {sid} failed to build ({item.get('reason') or 'no reason given'}): /kernel retry {sid}")
+        reason = item.get("reason") or "no reason given"
+        if item.get("retryable", True):
+            lines.append(f"Session {sid} failed to build ({reason}): /kernel retry {sid}")
+        else:
+            lines.append(
+                f"Session {sid} failed to build ({reason}). It can't be retried from here: ask Bonfires to look at it."
+            )
     held = status.get("held")
     if held:
         lines.extend(_held_lines(status, str(held)))

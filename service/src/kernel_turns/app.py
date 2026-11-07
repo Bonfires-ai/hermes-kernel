@@ -36,6 +36,8 @@ from kernel_turns.callers import (
     KeysAway,
     ReadOnlyKey,
     Unauthorized,
+    WrongBonfire,
+    bonfire_guard,
     token_check,
 )
 from kernel_turns.calls import CallView
@@ -115,6 +117,9 @@ def _install_errors(app: FastAPI) -> None:
     async def read_only(_: Request, exc: Exception) -> JSONResponse:
         return _error(403, str(exc))
 
+    async def wrong_bonfire(_: Request, exc: Exception) -> JSONResponse:
+        return _error(403, str(exc))
+
     async def keys_away(_: Request, exc: Exception) -> JSONResponse:
         return _error(503, str(exc), {"Retry-After": str(KEYS_RETRY_AFTER_S)})
 
@@ -141,6 +146,7 @@ def _install_errors(app: FastAPI) -> None:
 
     app.add_exception_handler(Unauthorized, unauthorized)
     app.add_exception_handler(ReadOnlyKey, read_only)
+    app.add_exception_handler(WrongBonfire, wrong_bonfire)
     app.add_exception_handler(KeysAway, keys_away)
     app.add_exception_handler(UnknownTurn, not_found)
     app.add_exception_handler(Refused, refused)
@@ -207,19 +213,21 @@ def create_app(
     engine = TurnEngine(kernel, turns_store)
     teaching = Teaching(kernel, turns_store)
     warm = WarmPool(kernel, teaching)
+    handoff_client: HandoffClient | None = None
+    if handoff is None and settings.handoff_url is not None:
+        handoff = handoff_client = HandoffClient(settings.handoff_url, settings.handoff_token.get_secret_value())
+
     key_check: KeyCheck | None = None
     check: Authenticate
     if authenticate is not None:
         check = authenticate
     elif settings.auth_url is not None:
-        key_check = check = KeyCheck(settings.auth_url, settings.auth_token.get_secret_value())
+        assert handoff is not None  # Settings: the two hosted URLs come together
+        key_check = KeyCheck(settings.auth_url, settings.auth_token.get_secret_value())
+        check = bonfire_guard(key_check, handoff)
     else:
         assert settings.bonfire_id is not None  # Settings: local means a bonfire
         check = token_check(settings.token.get_secret_value(), settings.bonfire_id)
-
-    handoff_client: HandoffClient | None = None
-    if handoff is None and settings.handoff_url is not None:
-        handoff = handoff_client = HandoffClient(settings.handoff_url, settings.handoff_token.get_secret_value())
 
     async def caller(authorization: Annotated[str | None, Header()] = None) -> Caller:
         scheme, _, bearer = (authorization or "").partition(" ")
@@ -360,7 +368,7 @@ def create_app(
 
     @v1.get("/status")
     async def status(who: Annotated[Caller, Depends(caller)]) -> StatusView:
-        return await build_status(kernel, session_store, who.bonfire_id)
+        return await build_status(kernel, session_store, who.bonfire_id, worker=handoff)
 
     app.include_router(v1)
 

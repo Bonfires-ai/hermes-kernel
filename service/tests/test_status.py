@@ -135,7 +135,9 @@ def test_status_names_a_failed_session_and_the_spend(world: tuple[World, TestCli
     w.sessions.sessions["s3"] = _session("s3", "closed")
     got = client.get("/v1/status", headers=AUTH).json()
     assert got["founded"] is True
-    assert got["failed"] == [{"session_id": "s1", "conversation_id": "c1", "reason": "mk refused", "attempts": 3}]
+    assert got["failed"] == [
+        {"session_id": "s1", "conversation_id": "c1", "reason": "mk refused", "attempts": 3, "retryable": True}
+    ]
     assert got["spend"] == {"charged_usd": 0.4, "ceiling_usd": 20}
     assert (got["open_messages"], got["sessions_waiting"], got["versions"]["mk"]) == (4, 1, "2.0.0")
 
@@ -177,3 +179,239 @@ def test_a_plain_turn_on_an_unborn_bonfire_is_unread_with_a_neutral_problem(worl
     got = answer.json()
     assert (answer.status_code, got["status"]) == (200, "unread")
     assert "no memory" in " ".join(got["problems"]) and "phrase" not in " ".join(got["problems"])
+
+
+# --- Hosted: the worker's own answer -----------------------------------------------------------------------------------
+
+from collections.abc import Callable  # noqa: E402
+
+import httpx  # noqa: E402
+
+from kernel_turns.callers import Caller, KeysAway, WrongBonfire, bonfire_guard  # noqa: E402
+from kernel_turns.handoff import HandoffClient, Outcome, WorkerFailure, WorkerStatus  # noqa: E402
+from kernel_turns.status import build_status  # noqa: E402
+
+BUILT = datetime(2026, 11, 7, 1, 0, tzinfo=UTC)
+
+
+class Worker:
+    """A fake ``HandoffApi``: ``status`` is what the worker says, or an exception for a read that fails."""
+
+    def __init__(self, status: WorkerStatus | Exception | None = None) -> None:
+        self.status = status or _worker()
+        self.reads: list[str] = []
+
+    async def send(self, bonfire_id: str, body: dict[str, object]) -> Outcome:
+        return Outcome("accepted")
+
+    async def worker_status(self, bonfire_id: str) -> WorkerStatus:
+        self.reads.append(bonfire_id)
+        if isinstance(self.status, Exception):
+            raise self.status
+        return self.status
+
+
+def _worker(**kw: object) -> WorkerStatus:
+    base: dict[str, object] = {
+        "engine": "kernel",
+        "agent_handles": ["hermes"],
+        "waiting": 0,
+        "failed": [],
+        "held": None,
+        "last_built_at": BUILT,
+    }
+    return WorkerStatus.model_validate({**base, **kw})
+
+
+HEALTH = {
+    "status": "ok",
+    "version": "2.0.1",
+    "bonfires": {BONFIRE: "ready"},
+    "spend": {BONFIRE: {"charged_usd": 0.5, "ceiling_usd": 5}},
+}
+
+
+async def _hosted(sessions: MemorySessionStore, worker: Worker, health: dict | None = None):  # type: ignore[type-arg]
+    mk = FakeMk()
+    mk.healthz = HEALTH if health is None else health
+    return await build_status(mk, sessions, BONFIRE, worker=worker)
+
+
+async def test_local_status_is_unchanged() -> None:
+    sessions = MemorySessionStore()
+    sessions.sessions["s1"] = _session("s1", "failed", reason="mk refused", attempts=3)
+    sessions.sessions["s3"] = _session("s3", "closed", reason="put off", attempts=1)
+    mk = FakeMk()
+    mk.healthz = HEALTH
+    got = (await build_status(mk, sessions, BONFIRE)).model_dump(mode="json")
+    assert got["hosted"] is False
+    assert got["held"] is None and got["sessions_waiting"] == 1
+    assert got["failed"] == [
+        {"session_id": "s1", "conversation_id": "c1", "reason": "mk refused", "attempts": 3, "retryable": True}
+    ]
+
+
+async def test_hosted_built_time_and_waiting_come_from_the_worker() -> None:
+    sessions = MemorySessionStore()
+    sessions.sessions["s1"] = _session("s1", "closed")
+    sessions.sessions["s2"] = _session("s2", "open", message_count=2)
+    got = await _hosted(sessions, Worker(_worker(waiting=2)))
+    assert got.hosted is True
+    assert got.last_built_at == BUILT
+    assert got.sessions_waiting == 3 and got.open_messages == 2
+    assert got.founded is True and got.versions.mk == "2.0.1"
+    assert got.spend is not None and got.spend.ceiling_usd == 5
+
+
+async def test_hosted_failed_lists_both_kinds() -> None:
+    sessions = MemorySessionStore()
+    sessions.sessions["s1"] = _session("s1", "failed", reason="refused", attempts=1)
+    row = WorkerFailure(key="k9", conversation_id="chat", reason="mk said no", attempts=2)
+    got = await _hosted(sessions, Worker(_worker(failed=[row])))
+    assert [(f.session_id, f.retryable, f.reason) for f in got.failed] == [
+        ("s1", True, "refused"),
+        ("k9", False, "mk said no"),
+    ]
+
+
+async def test_hosted_held_comes_from_the_worker() -> None:
+    got = await _hosted(MemorySessionStore(), Worker(_worker(held="bonfire spend ceiling reached")))
+    assert got.held == "bonfire spend ceiling reached"
+
+
+async def test_a_session_put_off_shows_in_held_on_hosted_only() -> None:
+    sessions = MemorySessionStore()
+    sessions.sessions["s1"] = _session("s1", "closed", reason="the hand-off answered 503", attempts=2)
+    got = await _hosted(sessions, Worker())
+    assert got.held is not None
+    assert "waiting to be handed over" in got.held and "the hand-off answered 503" in got.held
+    # the worker's own held wins; another bonfire's put-off session says nothing
+    said = await _hosted(sessions, Worker(_worker(held="spend")))
+    assert said.held == "spend"
+    other = MemorySessionStore()
+    other.sessions["x"] = _session("x", "closed", reason="r", attempts=1).model_copy(update={"bonfire_id": "zz"})
+    assert (await _hosted(other, Worker())).held is None
+    # and a closed session never tried has no reason
+    fresh = MemorySessionStore()
+    fresh.sessions["s1"] = _session("s1", "closed")
+    assert (await _hosted(fresh, Worker())).held is None
+
+
+async def test_worker_read_failing_is_said_not_hidden() -> None:
+    got = await _hosted(MemorySessionStore(), Worker(KeysAway("down")))
+    assert got.held == "the build queue can't be read right now"
+    assert got.last_built_at is None and got.hosted is True
+    bad = await _hosted(MemorySessionStore(), Worker(RuntimeError("boom")))
+    assert bad.held == "the build queue can't be read right now"
+
+
+async def test_spend_missing_stays_null_not_zero() -> None:
+    got = await _hosted(MemorySessionStore(), Worker(), health={"status": "ok", "version": "2.0.1", "bonfires": {}})
+    assert got.spend is None
+
+
+# --- The client's read -------------------------------------------------------------------------------------------------
+
+
+def _client(respond: Callable[[httpx.Request], httpx.Response | Exception]) -> HandoffClient:
+    def handler(request: httpx.Request) -> httpx.Response:
+        out = respond(request)
+        if isinstance(out, Exception):
+            raise out
+        return out
+
+    return HandoffClient("http://seam.test/", "tok", client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+
+
+WIRE = {
+    "engine": "kernel",
+    "agent_handles": ["hermes"],
+    "waiting": 1,
+    "failed": [{"key": "k", "conversation_id": None, "reason": None, "attempts": 1}],
+    "held": None,
+    "last_built_at": "2026-11-07T01:00:00Z",
+}
+
+
+async def test_worker_status_is_a_get_with_the_token() -> None:
+    seen: list[httpx.Request] = []
+
+    def respond(req: httpx.Request) -> httpx.Response:
+        seen.append(req)
+        return httpx.Response(200, json=WIRE)
+
+    got = await _client(respond).worker_status("b 1")
+    assert seen[0].method == "GET" and str(seen[0].url) == "http://seam.test/bonfires/b%201/status"
+    assert seen[0].headers["authorization"] == "Bearer tok"
+    assert got.waiting == 1 and got.failed[0].key == "k" and got.last_built_at == BUILT
+
+
+@pytest.mark.parametrize(
+    "respond",
+    [
+        lambda _: httpx.Response(503),
+        lambda _: httpx.Response(404),
+        lambda _: httpx.Response(200, text="<html>"),
+        lambda _: httpx.Response(200, json=[1]),
+        lambda _: httpx.Response(200, json={**WIRE, "waiting": "many"}),
+        lambda _: httpx.Response(200, json={k: v for k, v in WIRE.items() if k != "engine"}),
+        lambda _: httpx.ConnectError("secret-key-text"),
+    ],
+)
+async def test_worker_status_failures_are_one_error_with_no_chain(
+    respond: Callable[[httpx.Request], httpx.Response | Exception],
+) -> None:
+    from kernel_turns.handoff import WorkerUnreadable
+
+    with pytest.raises(WorkerUnreadable) as info:
+        await _client(respond).worker_status("b1")
+    assert info.value.__cause__ is None and info.value.__context__ is None
+    assert "secret" not in str(info.value)
+
+
+# --- The guard ---------------------------------------------------------------------------------------------------------
+
+
+def _inner(bonfire: str = BONFIRE) -> Callable[[str], object]:
+    async def inner(_: str) -> Caller:
+        return Caller(bonfire)
+
+    return inner  # type: ignore[return-value]
+
+
+@pytest.mark.parametrize(
+    "status", [_worker(engine="graphiti"), _worker(agent_handles=["bot"]), _worker(agent_handles=["hermes", "x"])]
+)
+async def test_wrong_kind_of_bonfire_is_403(status: WorkerStatus) -> None:
+    guard = bonfire_guard(_inner(), Worker(status))  # type: ignore[arg-type]
+    for _ in range(2):  # a wrong answer is not kept
+        with pytest.raises(WrongBonfire):
+            await guard("k")
+
+
+async def test_first_sight_during_an_outage_is_503_never_403() -> None:
+    guard = bonfire_guard(_inner(), Worker(RuntimeError("down")))  # type: ignore[arg-type]
+    with pytest.raises(KeysAway):
+        await guard("k")
+
+
+async def test_a_good_bonfire_outlives_a_graph_memory_outage() -> None:
+    worker = Worker()
+    guard = bonfire_guard(_inner(), worker)  # type: ignore[arg-type]
+    assert await guard("k") == Caller(BONFIRE)
+    worker.status = RuntimeError("down")
+    assert await guard("k") == Caller(BONFIRE)
+    assert worker.reads == [BONFIRE]  # one read per bonfire, not per request
+    with pytest.raises(KeysAway):
+        await bonfire_guard(_inner("other"), worker)("k")  # type: ignore[arg-type]
+
+
+async def test_the_guard_answers_403_over_http() -> None:
+    mk = FakeMk()
+    settings = Settings(token=SecretStr("s3cret-token"), bonfire_id=BONFIRE)
+    sessions = MemorySessionStore()
+    guarded = bonfire_guard(_inner(), Worker(_worker(engine="graphiti")))  # type: ignore[arg-type]
+    app = create_app(settings, mk=mk, store=MemoryTurnStore(), sessions=sessions, authenticate=guarded)  # type: ignore[arg-type]
+    with TestClient(app) as client:
+        got = client.get("/v1/status", headers=AUTH)
+    assert got.status_code == 403 and "not set up for hermes-kernel" in got.json()["detail"]

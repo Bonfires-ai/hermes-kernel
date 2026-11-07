@@ -16,6 +16,7 @@ from dataclasses import dataclass
 import httpx
 
 from kernel_turns.config import BONFIRE_PATTERN
+from kernel_turns.handoff import AGENT_HANDLE, HandoffApi
 
 
 @dataclass(frozen=True)
@@ -32,6 +33,10 @@ class Unauthorized(Exception):
 
 class ReadOnlyKey(Exception):
     """The key is good and may not write."""
+
+
+class WrongBonfire(Exception):
+    """The key is good, and its bonfire is not one this service may serve."""
 
 
 class KeysAway(Exception):
@@ -95,7 +100,7 @@ class KeyCheck:
             return held[1]
         caller, permission = await self._ask(key)
         if permission == "read":
-            raise ReadOnlyKey("the key may not write")
+            raise ReadOnlyKey("this key is read-only: it needs write permission")
         if len(self._good) >= 1024:  # expired entries go when the table grows; it never grows past what is live
             self._good = {d: v for d, v in self._good.items() if v[0] > now}
         self._good[digest] = (now + self._ttl_s, caller)
@@ -128,3 +133,33 @@ class KeyCheck:
         ):
             raise KeysAway("the key check answered with something unreadable")
         return Caller(bonfire), permission
+
+
+def bonfire_guard(inner: Authenticate, api: HandoffApi) -> Authenticate:
+    """Any ``write`` key verifies, but only a kernel bonfire whose handles are exactly ``[AGENT_HANDLE]`` may use this
+    service: a key for a Graphiti bonfire, or for a bot's kernel bonfire, is refused (``WrongBonfire``).
+
+    A good answer is kept for the life of the process, because a bonfire's engine is immutable and its handles are
+    fixed; the set holds one id per bonfire. A wrong answer is not kept. An unreadable status is ``KeysAway``, so an
+    outage stops only a bonfire not yet seen, and the read happens once per bonfire, not per request.
+    """
+    good: set[str] = set()
+
+    async def check(key: str) -> Caller:
+        who = await inner(key)
+        if who.bonfire_id in good:
+            return who
+        # The raise sits outside the `except`: no chain carries a value.
+        status = None
+        try:
+            status = await api.worker_status(who.bonfire_id)
+        except Exception:  # noqa: BLE001 - nothing is known about the bonfire just now
+            pass
+        if status is None:
+            raise KeysAway("the bonfire could not be checked just now")
+        if status.engine != "kernel" or status.agent_handles != [AGENT_HANDLE]:
+            raise WrongBonfire("this key's bonfire is not set up for hermes-kernel")
+        good.add(who.bonfire_id)
+        return who
+
+    return check

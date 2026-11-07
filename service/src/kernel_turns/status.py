@@ -12,9 +12,10 @@ from datetime import datetime
 
 from pydantic import BaseModel
 
+from kernel_turns.handoff import HandoffApi
 from kernel_turns.mk_client import KernelApi, MkError
 from kernel_turns.models import JsonValue
-from kernel_turns.sessions import SessionStore
+from kernel_turns.sessions import Session, SessionStore
 
 
 class FailedSession(BaseModel):
@@ -22,6 +23,8 @@ class FailedSession(BaseModel):
     conversation_id: str
     reason: str | None
     attempts: int
+    #: False for a session the worker holds: it cannot be retried from here
+    retryable: bool = True
 
 
 class Spend(BaseModel):
@@ -47,6 +50,8 @@ class StatusView(BaseModel):
     held: str | None
     spend: Spend | None
     versions: Versions
+    #: the numbers came partly from a hosted worker
+    hosted: bool = False
 
 
 def _service_version() -> str:
@@ -85,25 +90,68 @@ def is_founded(health: dict[str, JsonValue], bonfire_id: str) -> bool:
     return isinstance(bonfires, dict) and bonfire_id in bonfires
 
 
-async def build_status(mk: KernelApi, sessions: SessionStore, bonfire_id: str) -> StatusView:
+QUEUE_UNREADABLE = "the build queue can't be read right now"
+
+
+def _put_off_held(waiting: list[Session]) -> str | None:
+    """Hosted: the oldest of the bonfire's sessions that the hand-off put off, as a sentence."""
+    off = sorted(
+        (s for s in waiting if s.state == "closed" and s.reason), key=lambda s: (s.closed_at or s.opened_at, s.id)
+    )
+    if not off:
+        return None
+    return f"A session is waiting to be handed over: {off[0].reason}"
+
+
+async def build_status(
+    mk: KernelApi, sessions: SessionStore, bonfire_id: str, *, worker: HandoffApi | None = None
+) -> StatusView:
     try:
         health = await mk.health()
     except MkError:  # mk serve away: say so by what it cannot tell us
         health = {}
     version = health.get("version")
     waiting = await sessions.waiting(bonfire_id)
+    own_waiting = sum(1 for s in waiting if s.state in ("closed", "running", "held"))
+    failed = [
+        FailedSession(session_id=s.id, conversation_id=s.conversation_id, reason=s.reason, attempts=s.attempts)
+        for s in waiting
+        if s.state == "failed"
+    ]
+    held = next((s.reason for s in waiting if s.state == "held" and s.reason), None)
+    built = await sessions.last_built_at(bonfire_id)
+    if worker is not None:
+        # The worker holds what was handed over, so what it says of the queue is read now, and a read that fails is said.
+        read = None
+        try:
+            read = await worker.worker_status(bonfire_id)
+        except Exception:  # noqa: BLE001 - whatever the reason, the queue is unknown
+            pass
+        if read is None:
+            held = QUEUE_UNREADABLE
+        else:
+            own_waiting += read.waiting
+            built = read.last_built_at
+            failed += [
+                FailedSession(
+                    session_id=f.key,
+                    conversation_id=f.conversation_id or "",
+                    reason=f.reason,
+                    attempts=f.attempts,
+                    retryable=False,
+                )
+                for f in read.failed
+            ]
+            held = read.held or _put_off_held(waiting) or held
     return StatusView(
         bonfire_id=bonfire_id,
         founded=is_founded(health, bonfire_id),
         open_messages=sum(s.message_count for s in waiting if s.state == "open"),
-        sessions_waiting=sum(1 for s in waiting if s.state in ("closed", "running", "held")),
-        last_built_at=await sessions.last_built_at(bonfire_id),
-        failed=[
-            FailedSession(session_id=s.id, conversation_id=s.conversation_id, reason=s.reason, attempts=s.attempts)
-            for s in waiting
-            if s.state == "failed"
-        ],
-        held=next((s.reason for s in waiting if s.state == "held" and s.reason), None),
+        sessions_waiting=own_waiting,
+        last_built_at=built,
+        failed=failed,
+        held=held,
         spend=_spend(health, bonfire_id),
         versions=Versions(service=_service_version(), mk=version if isinstance(version, str) else None),
+        hosted=worker is not None,
     )

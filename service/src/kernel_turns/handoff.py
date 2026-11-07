@@ -33,6 +33,7 @@ from typing import Any, Literal, Protocol
 from urllib.parse import quote
 
 import httpx
+from pydantic import BaseModel, ValidationError
 
 from kernel_turns.sessions import Session, SessionStore, StoredMessage
 
@@ -58,8 +59,37 @@ class Outcome:
     reason: str | None = None
 
 
+class WorkerFailure(BaseModel):
+    """A session the worker holds that failed to build. ``key`` is the worker's own name for it."""
+
+    key: str
+    conversation_id: str | None
+    reason: str | None
+    attempts: int
+
+
+class WorkerStatus(BaseModel):
+    """What the worker says of a bonfire (``GET {url}/bonfires/{id}/status``): its engine, the handles it was created
+    with, how many sessions it holds unbuilt, those that failed, why it is held, and when it last built."""
+
+    engine: str
+    agent_handles: list[str]
+    waiting: int
+    failed: list[WorkerFailure]
+    held: str | None
+    last_built_at: datetime | None
+
+
+class WorkerUnreadable(Exception):
+    """The worker's status could not be read: away, an answer that is not one, or a bonfire it does not know."""
+
+
 class HandoffApi(Protocol):
     async def send(self, bonfire_id: str, body: Body) -> Outcome: ...
+
+    async def worker_status(self, bonfire_id: str) -> WorkerStatus:
+        """Raises ``WorkerUnreadable`` when it cannot be read."""
+        ...
 
 
 def _refusal(resp: httpx.Response) -> str:
@@ -105,6 +135,28 @@ class HandoffClient:
         if resp.status_code in REFUSED_STATUSES:
             return Outcome("refused", _refusal(resp))
         return Outcome("later", f"the hand-off answered {resp.status_code}")
+
+    async def worker_status(self, bonfire_id: str) -> WorkerStatus:
+        url = f"{self._url}/bonfires/{quote(bonfire_id, safe='')}/status"
+        # The raise sits outside the `except` blocks: inside, the original error rides along, and a transport's or a
+        # parser's words can quote what was sent or read.
+        problem: str | None = None
+        status: WorkerStatus | None = None
+        try:
+            resp = await self._client.get(url, headers=self._headers, timeout=self._timeout_s)
+            if resp.status_code != 200:
+                problem = f"the hand-off's status answered {resp.status_code}"
+            else:
+                status = WorkerStatus.model_validate(resp.json())
+        except ValidationError:
+            problem = "the hand-off's status was not what is expected"
+        except ValueError:  # not JSON
+            problem = "the hand-off's status was not what is expected"
+        except Exception as exc:  # noqa: BLE001 - transport, timeout, anything: only the class is kept
+            problem = f"the hand-off's status did not answer: {type(exc).__name__}"
+        if status is None:
+            raise WorkerUnreadable(problem or "the hand-off's status could not be read")
+        return status
 
 
 def _utc(when: datetime) -> datetime:

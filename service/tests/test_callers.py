@@ -203,3 +203,8 @@ async def test_a_good_answer_for_one_key_is_not_another_keys() -> None:
     assert await check("key-1") == Caller("b-1")
     assert await check("key-2") == Caller("b-2")
     assert len(seam.requests) == 2
+
+
+async def test_read_only_key_says_what_it_needs() -> None:
+    with pytest.raises(ReadOnlyKey, match="needs write permission"):
+        await check_over(Seam(lambda _: ok("read")))(KEY)
