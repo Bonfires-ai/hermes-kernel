@@ -7,12 +7,13 @@ session is built). With ``mk serve`` unreachable the answer still comes: ``found
 
 from __future__ import annotations
 
+import asyncio
 import importlib.metadata
 from datetime import datetime
 
 from pydantic import BaseModel
 
-from kernel_turns.handoff import HandoffApi
+from kernel_turns.handoff import REASON_MAX_CHARS, STATUS_TIMEOUT_S, HandoffApi, WorkerStatus
 from kernel_turns.mk_client import KernelApi, MkError
 from kernel_turns.models import JsonValue
 from kernel_turns.sessions import Session, SessionStore
@@ -106,10 +107,21 @@ def _put_off_held(waiting: list[Session]) -> str | None:
 async def build_status(
     mk: KernelApi, sessions: SessionStore, bonfire_id: str, *, worker: HandoffApi | None = None
 ) -> StatusView:
-    try:
-        health = await mk.health()
-    except MkError:  # mk serve away: say so by what it cannot tell us
-        health = {}
+    async def read_health() -> dict[str, JsonValue]:
+        try:
+            return await mk.health()
+        except MkError:  # mk serve away: say so by what it cannot tell us
+            return {}
+
+    async def read_worker() -> WorkerStatus | None:
+        if worker is None:
+            return None
+        try:  # a hung read is cut short, so the whole answer stays inside the plugin's time
+            return await asyncio.wait_for(worker.worker_status(bonfire_id), STATUS_TIMEOUT_S)
+        except Exception:  # noqa: BLE001 - whatever the reason, the queue is unknown
+            return None
+
+    health, read = await asyncio.gather(read_health(), read_worker())
     version = health.get("version")
     waiting = await sessions.waiting(bonfire_id)
     own_waiting = sum(1 for s in waiting if s.state in ("closed", "running", "held"))
@@ -121,12 +133,6 @@ async def build_status(
     held = next((s.reason for s in waiting if s.state == "held" and s.reason), None)
     built = await sessions.last_built_at(bonfire_id)
     if worker is not None:
-        # The worker holds what was handed over, so what it says of the queue is read now, and a read that fails is said.
-        read = None
-        try:
-            read = await worker.worker_status(bonfire_id)
-        except Exception:  # noqa: BLE001 - whatever the reason, the queue is unknown
-            pass
         if read is None:
             held = QUEUE_UNREADABLE
         else:
@@ -134,9 +140,9 @@ async def build_status(
             built = read.last_built_at
             failed += [
                 FailedSession(
-                    session_id=f.key,
-                    conversation_id=f.conversation_id or "",
-                    reason=f.reason,
+                    session_id=f.key.rpartition(":")[2],  # the key holds the chat's id; its last part is enough
+                    conversation_id="",  # another chat's id is not for this one to see
+                    reason=f.reason[:REASON_MAX_CHARS] if f.reason else f.reason,
                     attempts=f.attempts,
                     retryable=False,
                 )

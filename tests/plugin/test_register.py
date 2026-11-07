@@ -370,3 +370,15 @@ def test_status_line_unreadable_queue_never_says_saving():
     }
     line = status_line(status, None)
     assert "Saving." not in line and "can't be read" in line
+
+
+def test_nothing_built_yet_is_not_said_when_the_queue_is_unreadable():
+    status = {
+        "hosted": True,
+        "founded": False,
+        "last_built_at": None,
+        "failed": [],
+        "held": "the build queue can't be read right now",
+    }
+    assert "Nothing built yet" not in status_line(status, None)
+    assert "Nothing built yet" in status_line({**status, "held": None}, None)

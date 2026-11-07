@@ -90,7 +90,7 @@ def status_line(status: dict[str, Any] | None, problem: str | None, *, saving_kn
     built = status.get("last_built_at")
     if built:
         lines.append(f"Last built: {built}")
-    elif not status.get("founded") and not waiting:
+    elif not status.get("founded") and not waiting and not (status.get("hosted") and held):
         lines.append("Nothing built yet: memory starts once the first session has closed.")
     if saving_known and not (problem or failed or held):
         lines.insert(0, "Saving.")

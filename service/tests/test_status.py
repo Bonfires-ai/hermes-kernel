@@ -415,3 +415,69 @@ async def test_the_guard_answers_403_over_http() -> None:
     with TestClient(app) as client:
         got = client.get("/v1/status", headers=AUTH)
     assert got.status_code == 403 and "not set up for hermes-kernel" in got.json()["detail"]
+
+
+# --- Fix round 1 -------------------------------------------------------------------------------------------------------
+
+import asyncio  # noqa: E402
+import time  # noqa: E402
+
+
+class Hung(Worker):
+    async def worker_status(self, bonfire_id: str) -> WorkerStatus:
+        await asyncio.sleep(30)
+        raise AssertionError("unreachable")
+
+
+async def test_a_hung_worker_read_answers_in_time_with_held_saying_so() -> None:
+    mk = FakeMk()
+    mk.healthz = HEALTH
+    began = time.monotonic()
+    got = await build_status(mk, MemorySessionStore(), BONFIRE, worker=Hung())
+    assert time.monotonic() - began < 3
+    assert got.held == "the build queue can't be read right now"
+
+
+async def test_first_sight_with_a_hung_read_is_503_inside_3_s() -> None:
+    began = time.monotonic()
+    with pytest.raises(KeysAway):
+        await bonfire_guard(_inner(), Hung())("k")  # type: ignore[arg-type]
+    assert time.monotonic() - began < 3
+
+
+async def test_the_worker_read_runs_beside_mk_health() -> None:
+    class SlowMk(FakeMk):
+        async def health(self):  # type: ignore[no-untyped-def]
+            await asyncio.sleep(1.5)
+            return await super().health()
+
+    class SlowWorker(Worker):
+        async def worker_status(self, bonfire_id: str) -> WorkerStatus:
+            await asyncio.sleep(1.5)
+            return _worker()
+
+    mk = SlowMk()
+    mk.healthz = HEALTH
+    began = time.monotonic()
+    await build_status(mk, MemorySessionStore(), BONFIRE, worker=SlowWorker())
+    assert time.monotonic() - began < 2.5
+
+
+async def test_a_worker_reason_is_cut_and_the_key_shows_only_its_last_part() -> None:
+    row = WorkerFailure(
+        key="kernel-session:b1:telegram:-1001:abcdef0123456789",
+        conversation_id="telegram:-1001",
+        reason="x" * 900,
+        attempts=1,
+    )
+    got = await _hosted(MemorySessionStore(), Worker(_worker(failed=[row])))
+    assert got.failed[0].session_id == "abcdef0123456789"
+    assert got.failed[0].reason is not None and len(got.failed[0].reason) == 500
+
+
+async def test_nulls_may_be_left_out_of_the_wire() -> None:
+    wire = {"engine": "kernel", "agent_handles": ["hermes"], "waiting": 0, "failed": [{"key": "k", "attempts": 1}]}
+    got = _client(lambda _: httpx.Response(200, json=wire))
+    status = await got.worker_status("b1")
+    assert status.held is None and status.last_built_at is None
+    assert status.failed[0].reason is None and status.failed[0].conversation_id is None

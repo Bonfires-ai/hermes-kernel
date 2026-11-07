@@ -46,6 +46,8 @@ Body = dict[str, Any]
 AGENT_HANDLE = "hermes"
 REFUSED_STATUSES = frozenset({400, 409, 413, 422})
 REASON_MAX_CHARS = 500
+#: the status read is inside the plugin's 5 s for ``/v1/status``, and a first-seen bonfire's guard inside its 3 s
+STATUS_TIMEOUT_S = 2.0
 BACKOFF_MAX_S = 600.0
 #: past this the doubling is well over ``BACKOFF_MAX_S``, and ``2**attempts`` must stay small enough to be a float
 _BACKOFF_MAX_DOUBLINGS = 32
@@ -63,8 +65,8 @@ class WorkerFailure(BaseModel):
     """A session the worker holds that failed to build. ``key`` is the worker's own name for it."""
 
     key: str
-    conversation_id: str | None
-    reason: str | None
+    conversation_id: str | None = None
+    reason: str | None = None
     attempts: int
 
 
@@ -76,8 +78,8 @@ class WorkerStatus(BaseModel):
     agent_handles: list[str]
     waiting: int
     failed: list[WorkerFailure]
-    held: str | None
-    last_built_at: datetime | None
+    held: str | None = None
+    last_built_at: datetime | None = None
 
 
 class WorkerUnreadable(Exception):
@@ -143,11 +145,13 @@ class HandoffClient:
         problem: str | None = None
         status: WorkerStatus | None = None
         try:
-            resp = await self._client.get(url, headers=self._headers, timeout=self._timeout_s)
+            resp = await self._client.get(url, headers=self._headers, timeout=STATUS_TIMEOUT_S)
             if resp.status_code != 200:
                 problem = f"the hand-off's status answered {resp.status_code}"
             else:
                 status = WorkerStatus.model_validate(resp.json())
+                for row in status.failed:  # the receiver's words can quote what a person said: cut as a refusal is
+                    row.reason = row.reason[:REASON_MAX_CHARS] if row.reason else row.reason
         except ValidationError:
             problem = "the hand-off's status was not what is expected"
         except ValueError:  # not JSON

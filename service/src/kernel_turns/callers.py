@@ -6,6 +6,7 @@ maps them to 401, 403 and 503. ``token_check`` is the local one: one token, for 
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import re
@@ -16,7 +17,7 @@ from dataclasses import dataclass
 import httpx
 
 from kernel_turns.config import BONFIRE_PATTERN
-from kernel_turns.handoff import AGENT_HANDLE, HandoffApi
+from kernel_turns.handoff import AGENT_HANDLE, STATUS_TIMEOUT_S, HandoffApi
 
 
 @dataclass(frozen=True)
@@ -152,7 +153,7 @@ def bonfire_guard(inner: Authenticate, api: HandoffApi) -> Authenticate:
         # The raise sits outside the `except`: no chain carries a value.
         status = None
         try:
-            status = await api.worker_status(who.bonfire_id)
+            status = await asyncio.wait_for(api.worker_status(who.bonfire_id), STATUS_TIMEOUT_S)
         except Exception:  # noqa: BLE001 - nothing is known about the bonfire just now
             pass
         if status is None:
