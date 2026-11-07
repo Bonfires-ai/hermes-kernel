@@ -125,6 +125,9 @@ class LocalTurn:
     waiting: dict[str, JsonObject] = field(default_factory=dict)
     #: the phrases continued in this turn (an unnamed continue never goes to another one)
     continued: set[str] = field(default_factory=set)
+    #: the platform the hook or the session record named; empty when neither did (`platform` then holds the `cli`
+    #: fallback, which the conversation id and the service read need and a phrase step must not run on)
+    known_platform: str = ""
     #: what the reading afforded the model, and the afforded tools it calls natively (`None`: not read)
     affordances: list[str] | None = None
     native: set[str] = field(default_factory=set)
@@ -456,7 +459,8 @@ class KernelTurns:
             known = self._by_turn.get(hermes_turn) if hermes_turn else None
             if known is not None and known.session_id == session_id:
                 return known.context  # the same Hermes turn again: nothing begins twice
-        platform = _as_str(kwargs.get("platform")).lower() or _as_str(info.get("platform")).lower() or "cli"
+        known = _as_str(kwargs.get("platform")).lower() or _as_str(info.get("platform")).lower()
+        platform = known or "cli"  # the fallback of the conversation id and the service read, not of a phrase step
         conversation = str(info.get("conversation_id") or conversation_id(platform, "", session_id))
         user_text = message_text(kwargs.get("user_message"))
         sender_id = _as_str(kwargs.get("sender_id"))
@@ -469,7 +473,7 @@ class KernelTurns:
         speaker = speaker or info.get("user_name") or sender_id or "user"
         speaker = _as_str(speaker)
         participants = self._note_speaker(conversation, speaker)
-        local = LocalTurn(hermes_turn, session_id, platform, conversation, conversation, speaker)
+        local = LocalTurn(hermes_turn, session_id, platform, conversation, conversation, speaker, known_platform=known)
         self._remember(local)
         if self._source is not None:
             try:

@@ -81,6 +81,7 @@ _CALL_TIMEOUT_S = 30.0
 _TEACHING_KEPT = 256
 NOTHING_WAITING = "Nothing is waiting for you to continue: no phrase of this person's is paused (nothing ran)."
 DROPPED = "Dropped: the phrase will not go on, and no later message shows it waiting. Nothing more of it ran."
+BUSY = "Another call is still working on that phrase, so nothing was dropped. Ask again in a moment."
 NOTHING_TO_DROP = "That phrase does not wait at a step of yours any more, so there was nothing to drop (nothing ran)."
 STEP_SHAPE = 'each step is a sentence or a call {"call": "<tool>", "args": {"<param>": "<value>"}} with text values'
 CANNOT_CHECK = "Step {n}: I couldn't check that step's tool, so nothing was sent."
@@ -216,8 +217,10 @@ _EMOJI = {
 
 
 def describe_run(phrase: str | None, outcome: RunOutcome) -> str:
-    """A phrase run driven in the agent (`PhraseRun`) as plain text for the model; `phrase` None for a continue;
-    `carried`: the phrase's values (a think instruction bound from one is fenced)."""
+    """A phrase run driven in the agent (`PhraseRun`) as plain text for the model; `phrase` None for a continue."""
+    if outcome.kind == "done" and not outcome.lines:  # a drive that waited on another found the phrase finished
+        name = f" {phrase}" if phrase else ""
+        return f"The phrase{name} had nothing left to run: another call already finished it. Nothing ran here."
     if phrase is None:
         head = "The phrase went on:" if outcome.committed else "The phrase did not go on:"
     else:
@@ -305,8 +308,8 @@ def _defaults(value: Any) -> JsonObject:
 
 
 class KernelTools:
-    """The five handlers, bound to the turn service, the plugin's copy of the current turn, the phrase runner, the call
-    log, the tool catalogue and the step editor."""
+    """The five handlers, bound to the turn service, the plugin's copy of the current turn, the phrase runner, the tool
+    catalogue and the step editor."""
 
     def __init__(
         self,
@@ -390,7 +393,9 @@ class KernelTools:
             self._turns.name_phrase(child, phrase)
             step = result.get("step")
             first = {"agent_step": step, "turn": {"status": "licensed"}} if isinstance(step, dict) else None
-            outcome = self._runs.drive(child, first=first, deadline=deadline, platform=turn.platform, **_ids(kwargs))
+            outcome = self._runs.drive(
+                child, first=first, deadline=deadline, platform=turn.known_platform, **_ids(kwargs)
+            )
             self._paused(turn, outcome)
             return describe_run(phrase, outcome)
 
@@ -465,11 +470,20 @@ class KernelTools:
                 return self._show(child, step)
             try:
                 if drop:
-                    return DROPPED if runs.drop(child) else NOTHING_TO_DROP
-                outcome = runs.resume(child, step, text, deadline=deadline, platform=turn.platform, **_ids(kwargs))
-            except ServiceError:
+                    dropped = runs.drop(child)
+                    if dropped is None:
+                        with self._lock:
+                            turn.waiting[child] = waiting  # still there: nothing was asked
+                        return BUSY
+                    return DROPPED if dropped else NOTHING_TO_DROP
+                outcome = runs.resume(
+                    child, step, text, deadline=deadline, platform=turn.known_platform, **_ids(kwargs)
+                )
+            except Exception:
                 with self._lock:
-                    turn.waiting[child] = waiting  # nothing went on: the same continue may be asked again
+                    turn.waiting[child] = (
+                        waiting  # nothing went on that we know of: the same continue may be asked again
+                    )
                 raise
             with self._lock:
                 turn.continued.add(child)

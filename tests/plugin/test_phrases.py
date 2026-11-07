@@ -13,9 +13,9 @@ from plugin import shared
 from plugin.client import Refused, Unauthorized, Unavailable
 from plugin.guide import Editor, GuideData
 from plugin.ledger import StepLedger
-from plugin.runs import PhraseRun
-from plugin.tools import KernelTools
-from plugin.turns import LocalTurn
+from plugin.runs import PhraseRun, RunOutcome
+from plugin.tools import KernelTools, describe_run
+from plugin.turns import KernelTurns, LocalTurn
 
 RESULT = "Sourdough starter notes: feed 1:1:1 daily; rye starters are forgiving."
 
@@ -38,6 +38,11 @@ class Client:
         self.call_result: Any = {"kind": "turn", "turn_id": "c1", "step": step(1)}
         self.report_errors = []
         self.teach_error: Exception | None = None
+        self.begun: list[Any] = []
+
+    def begin(self, body, *, timeout=10.0):
+        self.begun.append(body)
+        return {"turn_id": "m1", "status": "licensed", "affordances": ["research"], "native": []}
 
     def calls(self, turn_id, tool, args, *, timeout=30.0):
         self.called.append((turn_id, tool, args))
@@ -129,7 +134,7 @@ def build(
         calls.append((name, args))
         return dispatch(name, args) if dispatch else RESULT
 
-    local = local or LocalTurn("h1", "s1", "telegram", "g", "g", "Ana", turn_id="m1")
+    local = local or LocalTurn("h1", "s1", "telegram", "g", "g", "Ana", turn_id="m1", known_platform="telegram")
     if local.affordances is None:
         local.affordances = ["research", "web_search", "teach_phrase"]
         local.native = {"web_search"}
@@ -328,13 +333,21 @@ def test_the_step_is_checked_on_the_turns_platform_when_no_session_record_exists
     assert source.platform == "telegram"
 
 
-def test_a_step_on_an_unknown_platform_does_not_run(env):
-    env.sessions.clear()
+def test_a_step_on_an_unknown_platform_does_not_run_and_the_turn_still_reads_as_cli(env):
+    env.sessions.clear()  # no session record, and the hook's platform is empty (a headless agent)
     client = Client()
-    local = LocalTurn("h1", "s1", "", "g", "g", "Ana", turn_id="m1")
-    tools, calls, _, _ = build(client, local=local)
+    source = Source()
+    turns = KernelTurns(cast(Any, client))
+    turns.on_pre_llm_call(session_id="s1", turn_id="h1", platform="", user_message="research bread")
+    calls: list[Any] = []
+    runs = PhraseRun(
+        cast(Any, client), cast(Any, source), lambda n, a, **k: calls.append(n) or RESULT, StepLedger(None)
+    )
+    tools = KernelTools(cast(Any, client), turns, runs, cast(Any, source), Editor(source, GuideData()))
     answer = ask(tools, "run_phrase", {"phrase": "research"})
     assert calls == [] and "could not tell which platform" in answer
+    assert [r[1] for r in client.reports] == ["tool_error"]
+    assert client.begun[0]["platform"] == "cli"  # the service read still has its fallback
 
 
 def test_empty_text_at_a_tool_step_shows_it_and_runs_nothing(env):
@@ -468,3 +481,28 @@ def test_a_read_only_tool_off_the_list_gets_the_not_on_the_list_refusal(env):
         answer = ask(tools, name, {"forms": ["go {X}"], "body": body})
         assert "summarize_page" in answer and "not on the list of tools a phrase can use" in answer
         assert "changes something" not in answer
+
+
+def test_a_drop_on_a_busy_phrase_says_so_and_keeps_the_record(env):
+    tools, _, local, _ = build(Client())
+    local.waiting = {"c1": {"turn_id": "c1", "step": step(1)}}
+    tools._runs.drop = lambda child: None  # the lock stayed taken past the budget
+    answer = ask(tools, "phrase_continue", {"text": "", "phrase": "c1", "drop": True})
+    assert "Another call is still working" in answer and "c1" in local.waiting
+
+
+def test_any_failure_of_a_continue_keeps_the_record(env):
+    tools, _, local, _ = build(Client())
+    local.waiting = {"c1": {"turn_id": "c1", "step": step(1)}}
+
+    def boom(*a, **k):
+        raise RuntimeError("boom")
+
+    tools._runs.resume = boom
+    ask(tools, "phrase_continue", {"text": "go", "phrase": "c1"})
+    assert "c1" in local.waiting
+
+
+def test_a_drive_that_found_the_phrase_finished_says_so():
+    answer = describe_run("research", RunOutcome("done", "c1"))
+    assert "nothing left to run" in answer and "finished" in answer

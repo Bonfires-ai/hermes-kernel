@@ -9,7 +9,8 @@ that is pending and reports it (`POST /v1/turns/{child}/report`), and repeats un
   name: `AgentSource.tool`), and is reported committed with the tool's own text: an untyped result fills a text
   parameter of a later step. Before it runs, in this order, the step must still be a kept row (`AgentSource.tool`: its
   MCP server may be down, its toolset turned off) and the tool must be enabled on this session's platform
-  (`AgentSource.enabled_for`, the platform from the session record, lowercased, `cli` by default). When either fails,
+  (`AgentSource.enabled_for`, the platform the turn's hook or session record named, lowercased; none known: the step
+  is refused, never run on a guess). When either fails,
   a dispatch raises, or a result is an error (`{"error": ...}`, Hermes's own test), the step is reported `tool_error`
   with the reason: the run stops with a sentence the model can say, and nothing is reported committed. A step left
   pending instead would show as waiting on every later message.
@@ -32,7 +33,7 @@ that is pending and reports it (`POST /v1/turns/{child}/report`), and repeats un
   values each child turn's steps gave (`carried`), kept in the step ledger until the child turn ends (so a restart
   keeps them). When the child turn committed steps and what they gave is gone (a ledger that could not be read, or
   was written by an older plugin), every line of it is fenced (`FENCE_ALL`). So is what may echo those args: the
-  service's repair question in a child turn that carries a value, and a step's failure (its own tool's fence, as
+  service's repair question (always, whatever the child carries), and a step's failure (its own tool's fence, as
   Hermes fences an error result, else the fence of a value its args carry), in its line and its stop reason. A think
   step's input is always fenced (`tools.think_lines`). The fence, the scan and the values carried go by the tool's real
   name, never the step's short one: Hermes fences an `mcp_*` result, not a bare `mcp__srv__search`. The name is
@@ -64,7 +65,6 @@ from .agent_source import MCP_PREFIX, THINK, AgentSource
 from .client import Refused, ServiceClient, ServiceError, Unavailable, never_sent
 from .fence import closed, fenced, scan
 from .ledger import UNKNOWN, UNKNOWN_SOURCE, Carried, StepLedger
-from .shared import get_shared
 
 logger = logging.getLogger(__name__)
 
@@ -237,16 +237,6 @@ class _Ran:
     refused: str | None = None
 
 
-def _platform(platform: str | None, session_id: str | None) -> str | None:
-    """The platform a step runs on, lowercased: the turn's own (the hook's), else the session record's; `None` when
-    neither is known (the step is then refused)."""
-    if platform:
-        return platform.lower()
-    info = get_shared().sessions.get(session_id) if session_id else None
-    value = info.get("platform") if isinstance(info, dict) else None
-    return str(getattr(value, "value", value)).lower() if value else None
-
-
 class PhraseRun:
     """Drives phrase child turns in the agent."""
 
@@ -355,13 +345,14 @@ class PhraseRun:
                     out.committed = 1
             return self._drive(child_turn_id, None, out, task_id, session_id, platform, end)
 
-    def drop(self, child_turn_id: str) -> bool:
+    def drop(self, child_turn_id: str) -> bool | None:
         """Drop the phrase: the step it waits at, as the service holds it now (a re-plan issues it again under a new id),
         is reported `declined`, which ends the child turn. `False` when no step of it is pending any more (it went on,
-        or ended): nothing is reported."""
+        or ended): nothing is reported. `None` when another call still holds the phrase past the budget: nothing was
+        asked."""
         with self._hold(child_turn_id, self.budget_end()) as contended:
             if contended is None:
-                return False
+                return None
             view = self._client.get(child_turn_id, timeout=_REPORT_TIMEOUT_S)
             pending = _step(view.get("pending"))
             if view.get("status") != "licensed" or pending is None:
@@ -550,7 +541,7 @@ class PhraseRun:
                 "was turned off)"
             )
             return "", missing, tool
-        where = _platform(platform, session_id)
+        where = platform.lower() if platform else None
         if where is None:
             return "", f"I could not tell which platform this is, so a phrase may not run {tool}", tool
         if not self._source.enabled_for(where, held.name):
