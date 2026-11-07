@@ -1,0 +1,62 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+env:
+  # The Hermes the plugin is built and tested against.
+  HERMES_REF: v0.23.0
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff
+      - name: ruff (plugin and its tests, the root config)
+        run: ruff format --check . && ruff check .
+      - name: ruff (service)
+        run: cd service && ruff format --check . && ruff check .
+      - name: ruff (writer)
+        run: cd writer && ruff format --check . && ruff check .
+      - name: no private names, paths or keys
+        run: scripts/name-scan.sh
+
+  service:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ./service pytest pytest-asyncio
+      - run: cd service && pytest tests -q
+
+  writer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ./writer pytest mongomock
+      - run: cd writer && pytest tests -q
+
+  plugin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: NousResearch/hermes-agent
+          ref: ${{ env.HERMES_REF }}
+          path: hermes-src
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ./hermes-src pytest httpx
+      - run: python -m pytest tests/plugin -q
