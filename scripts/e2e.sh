@@ -335,18 +335,20 @@ jq -e 'length == 1 and .[0] != "hermes"' <<<"$person" >/dev/null || fail "2. the
 pass "2. a first conversation, then founding (${MEM_DELAY_FOUND} s from session end to recall returning it; kernel spend $(spend) USD)"
 
 # ---- 3. a new session recalls it; /kernel against the live stack --------------------------------------------------------
-# ---- 4. a phrase with a think step: teach, confirm, use -----------------------------------------------------------------
+# ---- 4. a phrase with a think step: teach, keep it on its card, use ---------------------------------------------------
 # One conversation does both. The chat is asked first, so the recall in stage 3 comes from the first session alone.
 
-stage "3 and 4. recall, /kernel, then teach a phrase and use it"
-prompts \
-  "/kernel" \
-  "What is my sourdough starter called, and what am I allergic to?" \
-  "When I say 'research X', I want you to look X up on the web and give me a one-line summary. Can you set that up as a phrase? Show me what you drafted and wait for my yes." \
-  "yes" \
-  "research sourdough hydration" >"$OUT/p3.json"
+stage "3 and 4. recall, /kernel, then teach a phrase, keep it on its card, and use it"
+# No "yes" is ever sent here: the phrase is kept by picking Keep it on the card. A plain "yes" is proved by the unit
+# tests and the contract test. A model that does not call clarify fails this stage; it does not fall back.
+jq -n '[
+  "/kernel",
+  "What is my sourdough starter called, and what am I allergic to?",
+  {prompt: "When I say '"'"'research X'"'"', I want you to look X up on the web and give me a one-line summary. Can you set that up as a phrase? Let me decide whether to keep it.", card: true},
+  "research sourdough hydration"
+]' >"$OUT/p3.json"
 S2_START="$(now)"
-chat s2 "$OUT/p3.json" --quiet-s 25 --max-s 300
+chat s2 "$OUT/p3.json" --quiet-s 25 --max-s 300 || fail "4. the card never came up: the model did not call clarify (see $OUT/s2.txt)"
 S2_END="$(now)"
 
 # /kernel (stage 2's check, run live) and recall (stage 3)
@@ -364,7 +366,15 @@ grep -qi "bramble" "$OUT/s2-recall.txt" && grep -qi "walnut" "$OUT/s2-recall.txt
   || fail "3. the new session did not recall Bramble and walnuts (see $OUT/s2-recall.txt)"
 pass "3. a new session recalls the first one (Bramble, walnuts)"
 
-# 4: the phrase must have reached done, with the think step done by the model.
+# 4: the card showed the read-back, the service's own log has the one confirm the click made, and the phrase reached
+# done, with the think step done by the model. The hook takes only an exact choice, so that 200 also shows that the
+# "(Recommended)" label on the screen did not come back in the answer.
+grep -Eq 'Keep *this *phrase\?' "$OUT/s2.txt" || fail "4. the card did not show the read-back (see $OUT/s2.txt)"
+dc logs --no-color turn-service >"$OUT/turn-service-stage4.log" 2>&1 || true
+confirms="$(grep -Ec 'POST /v1/teaching/[^ /]+/confirm HTTP/[0-9.]+" 200' "$OUT/turn-service-stage4.log" || true)"
+echo "confirms the turn service answered 200: $confirms"
+[ "$confirms" = "1" ] || fail "4. expected one confirm from the card in the service's log, found $confirms (see $OUT/turn-service-stage4.log)"
+pass "4. the phrase was kept on its card, with no yes sent (one confirm, 200, in the service's log)"
 uses="$(mongo 'db.uses.countDocuments({outcome: "ok"})' | tr -d '[:space:]')"
 think_len="$(mongo 'const r = db.ledger.find({tool: "think", verdict: "committed"}).toArray(); print(r.length ? JSON.stringify(r[r.length-1].value_json || r[r.length-1].value).length : 0)' | tr -d '[:space:]')"
 search_ok="$(mongo 'db.ledger.countDocuments({tool: "web_search", verdict: "committed"})' | tr -d '[:space:]')"

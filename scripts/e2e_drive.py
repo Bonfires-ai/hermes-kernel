@@ -9,6 +9,11 @@ with terminal codes removed. A prompt that is an object `{"run": "<shell command
 of the chat instead (used to stop and start the stack while a conversation is open, and to check what that did). A
 command that exits non-zero ends the run: the chat is closed, the transcript written, and the exit status is 1.
 
+A prompt that is an object `{"prompt": "<text>", "card": true}` is sent, then the driver waits up to `--max-s` for the
+card to keep a phrase and presses Enter on it, which picks Keep it: the first choice, where the cursor starts. The
+picker repaints every second while it waits, so the screen is never quiet there. A card that never comes up ends the
+run the same way as a failed command.
+
 Needs `pexpect`.
 """
 
@@ -28,6 +33,8 @@ from e2e_guard import require_own_hermes_home
 # CSI sequences, OSC strings (ended by BEL or ST; a bare "up to the next BEL" would swallow the text after one that ends
 # with ST), character-set selections, and carriage returns.
 ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][A-Za-z0-9]|\r")
+# The first choice as the picker labels it. The screen is drawn as a diff, so a space over a blank cell is never sent.
+CARD = re.compile(r"Keep\s*it\s*\(Recommended\)")
 
 
 def clean(raw: bytes) -> str:
@@ -49,6 +56,22 @@ def settle(child: Any, quiet_s: float, max_s: float) -> bytes:
     return out
 
 
+def await_card(child: Any, max_s: float) -> tuple[bytes, bool]:
+    """Everything printed until the card is on the screen, or `max_s` has passed; and whether it came up."""
+    out = b""
+    started = time.time()
+    while time.time() - started < max_s:
+        try:
+            out += child.read_nonblocking(65536, timeout=1)
+        except pexpect.TIMEOUT:
+            pass
+        except pexpect.EOF:
+            break
+        if CARD.search(clean(out)):
+            return out, True
+    return out, False
+
+
 def main() -> int:
     _ = require_own_hermes_home()
     args = sys.argv[1:]
@@ -67,6 +90,22 @@ def main() -> int:
     child.expect(b"Welcome to Hermes", timeout=90)
     parts.append(clean(settle(child, 8, 30)))
     for prompt in prompts:
+        if isinstance(prompt, dict) and prompt.get("card"):
+            child.send(prompt["prompt"].encode())
+            time.sleep(0.7)
+            _ = child.send(b"\r")
+            parts.append(f"\n=== PROMPT {prompt['prompt']}\n")
+            shown, up = await_card(child, max_s)
+            parts.append(clean(shown))
+            if not up:
+                parts.append("\n=== CARD never came up\n")
+                failed = True
+                break
+            time.sleep(1)  # the picker has its keys once it is painted
+            _ = child.send(b"\r")
+            parts.append("\n=== CARD picked the first choice\n")
+            parts.append(clean(settle(child, quiet_s, max_s)))
+            continue
         if isinstance(prompt, dict):
             done = subprocess.run(prompt["run"], shell=True, capture_output=True, text=True, check=False)  # noqa: S602
             parts.append(f"\n=== RUN {prompt['run']} -> exit {done.returncode}\n{done.stdout}{done.stderr}")
