@@ -25,8 +25,18 @@ from pymongo.errors import DuplicateKeyError
 
 from kernel_turns.app import create_app
 from kernel_turns.config import Settings
+from kernel_turns.handoff import Body, Outcome, hand_over_once
+from kernel_turns.keys import message_key
 from kernel_turns.models import LedgerRow, PendingStep, TurnRecord
-from kernel_turns.sessions import MemorySessionStore, MessageIn, MongoSessionStore, SessionStore, SessionTake
+from kernel_turns.sessions import (
+    MemorySessionStore,
+    MessageIn,
+    MongoSessionStore,
+    Session,
+    SessionClosed,
+    SessionStore,
+    SessionTake,
+)
 from kernel_turns.store import Doc, MemoryTurnStore, MongoTurnStore, TurnStore
 from kernel_turns.turns import TurnEngine, UnknownTurn
 from tests.fakes import FakeMk, Script, team_turn
@@ -270,6 +280,199 @@ async def test_catalogues_and_sources_are_per_bonfire(store: Stores) -> None:
 # -- a kept volume -------------------------------------------------------------------------------------------------
 
 
+# --- The hand-off's reads and marks ------------------------------------------------------------------------------------
+
+
+class Seam:
+    """Takes whatever it is sent."""
+
+    def __init__(self, answer: Outcome | None = None) -> None:
+        self.answer = answer or Outcome("accepted")
+        self.sent: list[tuple[str, Body]] = []
+
+    async def send(self, bonfire_id: str, body: Body) -> Outcome:
+        self.sent.append((bonfire_id, body))
+        return self.answer
+
+
+async def _closed(store: Stores, bonfire: str, chat: str, *ids: str, text: str = "hi") -> Session:
+    """A closed session holding ``ids``."""
+    message = _msg("-", chat).model_copy(update={"text": text})
+    await _take(store).add(bonfire, [message.model_copy(update={"message_id": i}) for i in ids], HANDLES)
+    (session,) = [s for s in await store.sessions.waiting(bonfire) if s.conversation_id == chat and s.state == "open"]
+    assert await store.sessions.close_open(bonfire, chat, session.last_message_at)
+    return session
+
+
+async def test_closed_heads_are_each_bonfires_oldest_and_a_delay_holds_the_ones_behind(store: Stores) -> None:
+    sessions = store.sessions
+    a_new = await _closed(store, A, "new", "m1")
+    a_old = await _closed(store, A, "old", "m2")
+    b_only = await _closed(store, B, "b", "m3")
+    # the writer's order is the closed time, whatever order they opened in
+    for session, at in ((a_new, AT + timedelta(minutes=2)), (a_old, AT + timedelta(minutes=1))):
+        await _set_closed_at(store, session, at)
+
+    assert {s.id for s in await sessions.closed_heads(AT)} == {a_old.id, b_only.id}
+
+    await sessions.put_off(A, a_old.id, "away", AT + timedelta(seconds=30))
+    assert {s.id for s in await sessions.closed_heads(AT)} == {b_only.id}  # nothing of A goes ahead of its head
+    assert {s.id for s in await sessions.closed_heads(AT + timedelta(seconds=30))} == {a_old.id, b_only.id}
+
+
+async def _set_closed_at(store: Stores, session: Session, at: datetime) -> None:
+    if isinstance(store.sessions, MemorySessionStore):
+        store.sessions.sessions[session.id].closed_at = at
+    else:
+        assert isinstance(store.sessions, MongoSessionStore)
+        await store.sessions._sessions.update_one({"_id": session.id}, {"$set": {"closed_at": at}})  # pyright: ignore[reportPrivateUsage]
+
+
+async def test_a_sweep_closes_many_at_one_time_and_the_id_still_orders_them(store: Stores) -> None:
+    first = await _closed(store, A, "one", "m1")
+    second = await _closed(store, A, "two", "m2")
+    await _set_closed_at(store, first, AT)
+    await _set_closed_at(store, second, AT)
+    (head,) = await store.sessions.closed_heads(AT)
+    assert head.id == min(first.id, second.id)
+
+
+async def test_the_hand_off_gives_each_bonfire_its_own_messages(store: Stores) -> None:
+    """The same chat and the same message ids in two bonfires, in one pass."""
+    in_a = await _closed(store, A, "chat", "m1", "m2", text="said in a")
+    in_b = await _closed(store, B, "chat", "m1", text="said in b")
+    seam = Seam()
+    assert await hand_over_once(store.sessions, seam, lambda: AT) == 2
+
+    sent = {bonfire: body["messages"] for bonfire, body in seam.sent}
+    assert [m["text"] for m in sent[A]] == ["said in a", "said in a"]
+    assert [m["text"] for m in sent[B]] == ["said in b"]
+    assert {m["message_id"] for m in sent[A]} == {"m1", "m2"}  # the plain id, never the stored key
+    assert not await store.sessions.messages_of(B, in_a.id)
+    assert not await store.sessions.messages_of(A, in_b.id)
+
+
+async def test_handed_removes_the_text_and_keeps_the_ids(store: Stores) -> None:
+    sessions = store.sessions
+    session = await _closed(store, A, "chat", "m1", "m2")
+    other = await _closed(store, B, "chat", "m1")
+    await sessions.mark_handed(A, session.id, AT)
+
+    assert [(m.message_id, m.text) for m in await sessions.messages_of(A, session.id)] == [("m1", None), ("m2", None)]
+    assert [m.text for m in await sessions.messages_of(B, other.id)] == ["hi"]
+    assert await sessions.waiting(A) == []
+    assert await sessions.has_message(A, "m1")
+    added = await _take(store).add(A, [_msg("m1")], HANDLES)
+    assert (added.accepted, added.duplicates) == (0, 1)
+
+
+async def test_refused_keeps_the_text_and_retry_puts_it_back(store: Stores) -> None:
+    sessions = store.sessions
+    session = await _closed(store, A, "chat", "m1")
+    await sessions.put_off(A, session.id, "away", AT + timedelta(days=1))
+    await sessions.mark_refused(A, session.id, "other handles", AT)
+
+    (failed,) = await sessions.waiting(A)
+    assert (failed.state, failed.reason, failed.failed_at, failed.retry_after) == ("failed", "other handles", AT, None)
+    assert await sessions.closed_heads(AT) == []
+    assert [m.text for m in await sessions.messages_of(A, session.id)] == ["hi"]
+
+    assert await _take(store).retry(A, session.id) == "retried"
+    (head,) = await sessions.closed_heads(AT)
+    assert (head.id, head.state, head.reason, head.attempts) == (session.id, "closed", None, 0)
+
+
+async def test_put_off_counts_an_attempt_and_stays_closed(store: Stores) -> None:
+    sessions = store.sessions
+    session = await _closed(store, A, "chat", "m1")
+    await sessions.put_off(A, session.id, "away", AT + timedelta(seconds=30))
+    await sessions.put_off(A, session.id, "still away", AT + timedelta(seconds=60))
+
+    (waiting,) = await sessions.waiting(A)
+    assert (waiting.state, waiting.attempts, waiting.reason) == ("closed", 2, "still away")
+    assert waiting.retry_after == AT + timedelta(seconds=60)
+
+
+async def test_a_mark_moves_only_a_closed_session_of_its_own_bonfire(store: Stores) -> None:
+    sessions = store.sessions
+    session = await _closed(store, A, "chat", "m1")
+    await sessions.mark_handed(B, session.id, AT)
+    await sessions.mark_refused(B, session.id, "no", AT)
+    await sessions.put_off(B, session.id, "no", AT + timedelta(days=1))
+    (held,) = await sessions.waiting(A)
+    assert (held.state, held.reason, held.attempts, held.retry_after) == ("closed", None, 0, None)
+    assert [m.text for m in await sessions.messages_of(A, session.id)] == ["hi"]
+
+    # two answers for one session (a process stopping as another starts): the first stands
+    await sessions.mark_handed(A, session.id, AT)
+    await sessions.mark_refused(A, session.id, "no", AT)
+    await sessions.put_off(A, session.id, "away", AT + timedelta(days=1))
+    assert await sessions.waiting(A) == []
+
+    refused = await _closed(store, A, "other", "m2")
+    await sessions.mark_refused(A, refused.id, "no", AT)
+    await sessions.mark_handed(A, refused.id, AT)  # a failed session keeps the text its retry needs
+    (failed,) = await sessions.waiting(A)
+    assert failed.state == "failed"
+    assert [m.text for m in await sessions.messages_of(A, refused.id)] == ["hi"]
+
+
+async def test_a_message_that_loses_the_race_with_the_close_leaves_the_session_as_it_was(store: Stores) -> None:
+    sessions = store.sessions
+    await _take(store).add(A, [_msg("m1")], HANDLES)
+    (stale,) = await sessions.waiting(A)
+    assert await sessions.close_open(A, "chat", AT)
+
+    with pytest.raises(SessionClosed):
+        await sessions.append(stale, _msg("m2"), AT + timedelta(seconds=1), HANDLES, AT)
+
+    assert [m.message_id for m in await sessions.messages_of(A, stale.id)] == ["m1"]
+    assert not await sessions.has_message(A, "m2")
+
+
+async def test_a_failure_removing_text_never_sends_the_session_again(store: Stores) -> None:
+    """The state moves first: text gone from a session still closed would send fewer ids, which is another job."""
+    if not isinstance(store.sessions, MongoSessionStore):
+        pytest.skip("memory has no second write to fail")
+    sessions = store.sessions
+    session = await _closed(store, A, "chat", "m1", "m2")
+
+    class Away:
+        def __getattr__(self, name: str) -> object:
+            return getattr(real, name)
+
+        async def update_many(self, *_: object) -> None:
+            raise ConnectionError("gone")
+
+    real, sessions._messages = sessions._messages, Away()  # pyright: ignore[reportPrivateUsage, reportAttributeAccessIssue]
+    seam = Seam()
+    await hand_over_once(sessions, seam, lambda: AT)
+    sessions._messages = real  # pyright: ignore[reportPrivateUsage]
+
+    assert len(seam.sent) == 1
+    assert await sessions.closed_heads(AT) == []
+    assert await sessions.waiting(A) == []
+    assert [m.text for m in await sessions.messages_of(A, session.id)] == ["hi", "hi"]  # left behind: see mark_handed
+
+
+async def test_messages_read_back_in_one_order_and_an_old_row_by_its_plain_id(store: Stores) -> None:
+    """A crash can leave two messages with one timestamp and one seq."""
+    if not isinstance(store.sessions, MongoSessionStore):
+        pytest.skip("only Mongo holds rows of the old shape")
+    sessions = store.sessions
+    session = await _closed(store, A, "chat", "m3")
+    raw = sessions._messages  # pyright: ignore[reportPrivateUsage]
+    await raw.update_one({"_id": message_key(A, "m3")}, {"$set": {"timestamp": AT, "seq": 1}})
+    row: Doc = {"session_id": session.id, "seq": 1, "speaker": "Kira", "text": "hi", "timestamp": AT, "addressees": []}
+    await raw.insert_one({**row, "_id": message_key(A, "m2"), "bonfire_id": A, "message_id": "m2"})
+    await raw.insert_one({**row, "_id": "old-plain-id"})  # stored before the bonfire was in the key
+
+    read = await sessions.messages_of(A, session.id)
+    assert [m.message_id for m in read] == ["m2", "m3", "old-plain-id"]
+    assert all(m.bonfire_id == A for m in read)
+    assert await sessions.messages_of(B, session.id) == [m.model_copy(update={"bonfire_id": B}) for m in read[2:]]
+
+
 async def _old_indexes(client: AsyncMongoClient[Doc], name: str) -> None:
     """The unique indexes a stack from before this release left on its volume, over the rows it left."""
     await client[name]["sessions"].create_index(
@@ -353,6 +556,7 @@ async def test_the_service_starts_on_a_kept_volume(mongo: Database) -> None:
     )
     with TestClient(create_app(settings, mk=FakeMk())) as service:
         assert service.get("/healthz").status_code == 200
-    assert "one_open_session_per_chat_v2" in await client[name]["sessions"].index_information()
+    assert {"one_open_session_per_chat_v2", "closed_heads"} <= set(await client[name]["sessions"].index_information())
+    assert "session_messages" in await client[name]["messages"].index_information()
     assert "ledger_key_v2" in await client[name]["ledger"].index_information()
     assert (await client[name]["turns"].index_information())["retention"]["expireAfterSeconds"] == THIRTY_DAYS_S

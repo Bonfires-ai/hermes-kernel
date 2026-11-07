@@ -30,8 +30,9 @@ class Settings(BaseSettings):
     port: int = 8000
     # Local: the one bonfire every conversation speaks to (required). Hosted: unset, since each key names its bonfire.
     bonfire_id: str | None = Field(default=None, min_length=1, pattern=BONFIRE_PATTERN)
-    # Hosted seams. `auth_url` checks a key (POST {"key"} -> {bonfire_id, permission}); `handoff_url` is told when
-    # work is waiting, every `handoff_every_s`. Each is called with `Authorization: Bearer <token>`.
+    # Hosted seams. `auth_url` checks a key (POST {"key"} -> {bonfire_id, permission}); `handoff_url` is a base URL that
+    # takes each bonfire's oldest closed session, every `handoff_every_s`. Each is called with
+    # `Authorization: Bearer <token>`.
     auth_url: str | None = None
     auth_token: SecretStr = SecretStr("")
     handoff_url: str | None = None

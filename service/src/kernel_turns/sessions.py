@@ -1,13 +1,15 @@
 """Taking in conversation: messages group into sessions, one open session per chat.
 
 The plugin posts messages; a separate writer reads *closed* sessions straight from Mongo and builds them into memory.
-The two collections below (in ``KT_MONGO_DB``) are the contract between the two programs:
+The two collections below (in ``KT_MONGO_DB``) are the contract between the two programs. With ``KT_HANDOFF_URL`` set no
+writer runs: ``handoff.py`` sends each closed session to that URL instead.
 
 * ``sessions``: ``{_id, bonfire_id, conversation_id, state, agent_handles, opened_at, closed_at, last_message_at,
   message_count, attempts, reason, built_at, last_ts}``. ``state`` is ``open``, ``closed``, ``running``, ``built``,
-  ``failed`` or ``held``; this service only ever moves ``open`` to ``closed`` and ``failed`` back to ``closed``
-  (the writer owns the rest). ``last_message_at`` is the service clock at the latest message (the quiet window runs
-  from it); ``last_ts`` is the latest *stored message* timestamp (the writer ignores it).
+  ``failed``, ``held`` or ``handed``. This service moves ``open`` to ``closed`` and ``failed`` back to ``closed``; the
+  writer owns the rest, except that with a hand-off URL ``closed`` goes to ``handed`` or ``failed`` here and no writer
+  runs. ``last_message_at`` is the service clock at the latest message (the quiet window runs from it); ``last_ts`` is
+  the latest *stored message* timestamp (the writer ignores it).
 * ``messages``: ``{_id: keys.message_key(bonfire_id, message_id), bonfire_id, message_id, session_id, seq, speaker,
   text, timestamp, addressees}``. ``_id`` is unique, so a resend is a duplicate, and the same ``message_id`` in another
   bonfire is another message. The kernel is only ever handed the plain ``message_id``. A message stored before the
@@ -17,7 +19,11 @@ The two collections below (in ``KT_MONGO_DB``) are the contract between the two 
 Guarantees the writer may rely on, and what it must not assume:
 
 * A message is only ever added to an ``open`` session: the add is guarded on ``state``, so a session that has been
-  closed (and perhaps built) never gains a message.
+  closed (and perhaps built) never gains a message. The ids a session holds when it closes are the ids it keeps, which
+  is what makes a resent hand-off the same job: the receiver keys it on them. A message arriving later opens the chat's
+  next session, or is a duplicate if its id is stored. Mongo inserts before it checks that guard, so this leans on
+  ``SessionTake``'s lock, which orders every add and close: a second process could read a message for the moment before
+  it is taken back. Hosted runs one, and stops the old task before starting the new.
 * The writer must NOT delete a message document. To drop the text after building it removes only ``text`` (``$unset``)
   and keeps ``_id``, ``bonfire_id``, ``message_id``, ``session_id``, ``seq``, ``speaker`` and ``timestamp``, so a resent
   ``message_id`` stays a duplicate. ``text`` may therefore be absent on a message.
@@ -27,7 +33,7 @@ Guarantees the writer may rely on, and what it must not assume:
   ``(timestamp, seq)``; never assume ``seq`` is contiguous or ``message_count`` exact.
 * A session belongs to one bonfire. The writer takes only sessions of the bonfire it builds, and every read or write
   of a chat, session or message here names a bonfire: what another bonfire holds looks as if it did not exist. Only
-  the quiet sweep (``close_quiet``) spans them.
+  the quiet sweep (``close_quiet``) and the hand-off's look for work (``closed_heads``) span them.
 
 A session closes after ``idle_s`` of quiet, at ``max_messages`` messages, or on request. A message for a chat with no
 open session in its bonfire opens a new one.
@@ -52,7 +58,7 @@ from kernel_turns.store import drop_index_if_there
 log = logging.getLogger(__name__)
 
 Doc = dict[str, object]
-State = Literal["open", "closed", "running", "built", "failed", "held"]
+State = Literal["open", "closed", "running", "built", "failed", "held", "handed"]
 Retry = Literal["retried", "unknown", "not_failed"]
 
 
@@ -102,8 +108,10 @@ class Session(BaseModel):
     reason: str | None = None
     built_at: datetime | None = None
     last_ts: datetime | None = None
-    #: the writer's: a stopped session is not tried again before this
+    #: a stopped or put-off session is not tried again before this
     retry_after: datetime | None = None
+    handed_at: datetime | None = None
+    failed_at: datetime | None = None
 
 
 class StoredMessage(BaseModel):
@@ -157,8 +165,34 @@ class SessionStore(Protocol):
         """The newest ``built_at`` of the bonfire's sessions."""
         ...
 
+    async def closed_heads(self, now: datetime) -> list[Session]:
+        """Each bonfire's oldest ``closed`` session by ``(closed_at, id)``, of any bonfire. A head whose ``retry_after``
+        is still to come is left out and nothing behind it takes its place: a bonfire's sessions go in order."""
+        ...
+
+    async def messages_of(self, bonfire_id: str, session_id: str) -> list[StoredMessage]:
+        """The session's messages, by ``(timestamp, seq)`` and then id, so that a tie reads the same way every time."""
+        ...
+
+    async def mark_handed(self, bonfire_id: str, session_id: str, now: datetime) -> None:
+        """``closed`` to ``handed``, then the text goes (the ids stay, so a resent message is still a duplicate). In that
+        order: text gone from a session still ``closed`` would send fewer ids next time, and that is another job."""
+        ...
+
+    async def mark_refused(self, bonfire_id: str, session_id: str, reason: str, now: datetime) -> None:
+        """``closed`` to ``failed`` with ``reason``. The text stays, for ``retry``."""
+        ...
+
+    async def put_off(self, bonfire_id: str, session_id: str, reason: str, until: datetime) -> None:
+        """Stays ``closed`` and waits for ``until``, with one more attempt counted."""
+        ...
+
 
 WAITING_STATES = ("open", "closed", "running", "held", "failed")
+
+
+def _due(session: Session, now: datetime) -> bool:
+    return session.retry_after is None or session.retry_after <= now
 
 
 class MemorySessionStore:
@@ -257,6 +291,41 @@ class MemorySessionStore:
         built = [s.built_at for s in self.sessions.values() if s.bonfire_id == bonfire_id and s.built_at is not None]
         return max(built, default=None)
 
+    async def closed_heads(self, now: datetime) -> list[Session]:
+        closed = [s for s in self.sessions.values() if s.state == "closed"]
+        heads: dict[str, Session] = {}
+        for session in sorted(closed, key=lambda s: (s.closed_at or s.opened_at, s.id)):
+            heads.setdefault(session.bonfire_id, session)
+        return [s.model_copy() for s in heads.values() if _due(s, now)]
+
+    async def messages_of(self, bonfire_id: str, session_id: str) -> list[StoredMessage]:
+        mine = [m for m in self.messages.values() if m.session_id == session_id and m.bonfire_id == bonfire_id]
+        return [m.model_copy() for m in sorted(mine, key=lambda m: (m.timestamp, m.seq, m.message_id))]
+
+    def _closed(self, bonfire_id: str, session_id: str) -> Session | None:
+        session = self.sessions.get(session_id)
+        return session if session and session.bonfire_id == bonfire_id and session.state == "closed" else None
+
+    async def mark_handed(self, bonfire_id: str, session_id: str, now: datetime) -> None:
+        session = self._closed(bonfire_id, session_id)
+        if session is None:
+            return
+        session.state, session.handed_at, session.reason, session.retry_after = "handed", now, None, None
+        for message in self.messages.values():
+            if message.session_id == session_id:
+                message.text = None
+
+    async def mark_refused(self, bonfire_id: str, session_id: str, reason: str, now: datetime) -> None:
+        session = self._closed(bonfire_id, session_id)
+        if session is not None:
+            session.state, session.reason, session.failed_at, session.retry_after = "failed", reason, now, None
+
+    async def put_off(self, bonfire_id: str, session_id: str, reason: str, until: datetime) -> None:
+        session = self._closed(bonfire_id, session_id)
+        if session is not None:
+            session.reason, session.retry_after = reason, until
+            session.attempts += 1
+
 
 class MongoSessionStore:
     """``SessionStore`` over MongoDB. Call ``ensure_indexes`` once at start.
@@ -283,6 +352,13 @@ class MongoSessionStore:
             name="one_open_session_per_chat_v2",
         )
         await self._sessions.create_index([("state", ASCENDING), ("last_message_at", ASCENDING)], name="quiet_sweep")
+        await self._sessions.create_index(
+            [("state", ASCENDING), ("closed_at", ASCENDING), ("_id", ASCENDING)], name="closed_heads"
+        )
+        await self._messages.create_index(
+            [("session_id", ASCENDING), ("timestamp", ASCENDING), ("seq", ASCENDING), ("_id", ASCENDING)],
+            name="session_messages",
+        )
 
     async def has_message(self, bonfire_id: str, message_id: str) -> bool:
         return await self._messages.find_one({"_id": message_key(bonfire_id, message_id)}, {"_id": 1}) is not None
@@ -387,9 +463,64 @@ class MongoSessionStore:
         built = doc.get("built_at") if doc else None
         return built if isinstance(built, datetime) else None
 
+    async def closed_heads(self, now: datetime) -> list[Session]:
+        cursor = await self._sessions.aggregate(
+            [
+                {"$match": {"state": "closed"}},
+                {"$sort": {"closed_at": ASCENDING, "_id": ASCENDING}},
+                {"$group": {"_id": "$bonfire_id", "head": {"$first": "$$ROOT"}}},
+                {"$replaceWith": "$head"},
+            ]
+        )
+        return [session for session in [_session(doc) async for doc in cursor] if _due(session, now)]
+
+    async def messages_of(self, bonfire_id: str, session_id: str) -> list[StoredMessage]:
+        # A message stored before the bonfire was in the key has no `bonfire_id`, and None matches that.
+        mine: Doc = {"session_id": session_id, "bonfire_id": {"$in": [bonfire_id, None]}}
+        cursor = self._messages.find(mine).sort([("timestamp", ASCENDING), ("seq", ASCENDING), ("_id", ASCENDING)])
+        return [_message(doc, bonfire_id) async for doc in cursor]
+
+    @staticmethod
+    def _closed(bonfire_id: str, session_id: str) -> Doc:
+        return {"_id": session_id, "bonfire_id": bonfire_id, "state": "closed"}
+
+    async def mark_handed(self, bonfire_id: str, session_id: str, now: datetime) -> None:
+        marked = await self._sessions.update_one(
+            self._closed(bonfire_id, session_id),
+            {"$set": {"state": "handed", "handed_at": now, "reason": None}, "$unset": {"retry_after": ""}},
+        )
+        if marked.matched_count == 1:  # the write below is keyed by session id alone: never on its own
+            await self._messages.update_many({"session_id": session_id}, {"$unset": {"text": ""}})
+
+    async def mark_refused(self, bonfire_id: str, session_id: str, reason: str, now: datetime) -> None:
+        await self._sessions.update_one(
+            self._closed(bonfire_id, session_id),
+            {"$set": {"state": "failed", "reason": reason, "failed_at": now}, "$unset": {"retry_after": ""}},
+        )
+
+    async def put_off(self, bonfire_id: str, session_id: str, reason: str, until: datetime) -> None:
+        await self._sessions.update_one(
+            self._closed(bonfire_id, session_id),
+            {"$set": {"reason": reason, "retry_after": until}, "$inc": {"attempts": 1}},
+        )
+
 
 def _session(doc: Doc) -> Session:
     return Session.model_validate({**doc, "id": doc["_id"]})
+
+
+def _message(doc: Doc, bonfire_id: str) -> StoredMessage:
+    """A message as read back: ``text`` may be gone, and one stored before the bonfire was in the key has neither
+    ``bonfire_id`` nor ``message_id``: its ``_id`` is the plain id."""
+    return StoredMessage.model_validate(
+        {
+            **doc,
+            "bonfire_id": bonfire_id,
+            "message_id": doc.get("message_id", doc["_id"]),
+            "text": doc.get("text"),
+            "addressees": doc.get("addressees") or [],
+        }
+    )
 
 
 class SessionTake:

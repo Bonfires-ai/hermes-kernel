@@ -4,7 +4,8 @@ Every route but ``/healthz`` needs ``Authorization: Bearer <key>``. The ``caller
 ``Caller`` and every ``/v1`` route takes its bonfire from that and nowhere else, so a turn, session or draft of another
 bonfire is unknown to it: 404, never 403. With no ``authenticate`` injected the key is ``KT_TOKEN`` for the one
 configured bonfire (``callers.token_check``: an empty ``KT_TOKEN`` refuses every request), warmed at start; otherwise a
-bonfire is warmed when its caller first comes.
+bonfire is warmed when its caller first comes. With a ``handoff`` (``KT_HANDOFF_URL``) a loop beside the quiet sweep hands
+closed sessions over, and no writer runs; without one there is no loop and closed sessions wait for the writer.
 
 Routes delegate to ``TurnEngine`` and ``Teaching``; the domain exceptions they raise are mapped here: ``Unauthorized``
 401, ``ReadOnlyKey`` 403, ``KeysAway`` 503 with ``Retry-After``, ``UnknownTurn`` 404, ``Refused`` 409, ``NotTeacher``
@@ -39,6 +40,7 @@ from kernel_turns.callers import (
 )
 from kernel_turns.calls import CallView
 from kernel_turns.config import Settings
+from kernel_turns.handoff import HandoffApi, HandoffClient, hand_over_forever
 from kernel_turns.mk_client import KernelApi, KernelBusy, KernelDown, MkClient, MkError, NotTeacher, Refused
 from kernel_turns.models import BodyStep, JsonValue, LedgerRow, Runner, TurnRecord, Verdict
 from kernel_turns.sessions import (
@@ -168,10 +170,12 @@ def create_app(
     sessions: SessionStore | None = None,
     clock: Callable[[], datetime] | None = None,
     authenticate: Authenticate | None = None,
+    handoff: HandoffApi | None = None,
 ) -> FastAPI:
     """The app over ``settings``; ``mk`` and ``store`` are injected by tests (default: ``MkClient`` and
     ``MongoTurnStore``, owned and closed by the app). ``authenticate`` says who a bearer is (default: ``token_check``
-    over ``KT_TOKEN`` and ``KT_BONFIRE_ID``)."""
+    over ``KT_TOKEN`` and ``KT_BONFIRE_ID``). ``handoff`` takes closed sessions (default: a ``HandoffClient`` when
+    ``KT_HANDOFF_URL`` is set, owned and closed by the app; otherwise none, and no loop runs)."""
     client: MkClient | None = None
     kernel: KernelApi
     if mk is None:
@@ -198,12 +202,8 @@ def create_app(
     else:  # tests inject the stores; sessions then default to memory, never to a database
         turns_store = store
         session_store = sessions or MemorySessionStore()
-    take = SessionTake(
-        session_store,
-        settings.session_idle_s,
-        settings.session_max_messages,
-        clock or (lambda: datetime.now(UTC)),
-    )
+    now = clock or (lambda: datetime.now(UTC))
+    take = SessionTake(session_store, settings.session_idle_s, settings.session_max_messages, now)
     engine = TurnEngine(kernel, turns_store)
     teaching = Teaching(kernel, turns_store)
     warm = WarmPool(kernel, teaching)
@@ -216,6 +216,10 @@ def create_app(
     else:
         assert settings.bonfire_id is not None  # Settings: local means a bonfire
         check = token_check(settings.token.get_secret_value(), settings.bonfire_id)
+
+    handoff_client: HandoffClient | None = None
+    if handoff is None and settings.handoff_url is not None:
+        handoff = handoff_client = HandoffClient(settings.handoff_url, settings.handoff_token.get_secret_value())
 
     async def caller(authorization: Annotated[str | None, Header()] = None) -> Caller:
         scheme, _, bearer = (authorization or "").partition(" ")
@@ -231,20 +235,25 @@ def create_app(
             await mongo_store.ensure_indexes()  # the ledger's unique key is what makes a report idempotent
         if mongo_sessions is not None and session_store is mongo_sessions:
             await mongo_sessions.ensure_indexes()  # one open session per chat
-        sweeper = asyncio.create_task(_close_quiet_sessions(take))
+        loops = [asyncio.create_task(_close_quiet_sessions(take))]
+        if handoff is not None:
+            loops.append(asyncio.create_task(hand_over_forever(session_store, handoff, now, settings.handoff_every_s)))
         if settings.bonfire_id is not None and authenticate is None:  # the one bonfire is known now
             warm.ensure(settings.bonfire_id)
         try:
             yield
         finally:
             await warm.stop()
-            sweeper.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await sweeper
+            for loop in loops:
+                loop.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await loop
             if client is not None:
                 await client.aclose()
             if key_check is not None:
                 await key_check.aclose()
+            if handoff_client is not None:
+                await handoff_client.aclose()
             if mongo is not None:
                 await mongo.close()
 
