@@ -16,7 +16,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install ruff
+      - run: pip install ruff==0.17.4
       - name: ruff (plugin and its tests, the root config)
         run: ruff format --check . && ruff check .
       - name: ruff (service)
@@ -24,7 +24,7 @@ jobs:
       - name: ruff (writer)
         run: cd writer && ruff format --check . && ruff check .
       - name: no private names, paths or keys
-        run: scripts/name-scan.sh
+        run: NAME_SCAN_GENERIC_ONLY=1 scripts/name-scan.sh
 
   service:
     runs-on: ubuntu-latest
@@ -55,8 +55,11 @@ jobs:
           repository: NousResearch/hermes-agent
           ref: ${{ env.HERMES_REF }}
           path: hermes-src
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - run: pip install -e ./hermes-src pytest httpx
-      - run: python -m pytest tests/plugin -q
+      - uses: astral-sh/setup-uv@v5
+      # Hermes's dependencies are gated on Python 3.14 and pinned by its uv.lock (pip cannot read its
+      # [tool.uv] override-dependencies), so the environment is built the way Hermes builds its own.
+      - run: cd hermes-src && uv sync --frozen --python 3.14
+        env:
+          UV_PROJECT_ENVIRONMENT: ${{ github.workspace }}/.hermes-venv
+      - run: uv pip install --python .hermes-venv/bin/python pytest httpx
+      - run: .hermes-venv/bin/python -m pytest tests/plugin -q

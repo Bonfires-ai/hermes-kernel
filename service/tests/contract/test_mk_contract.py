@@ -4,7 +4,9 @@ Run by hand or on a release, never on every push (it needs a running stack and t
 
     KT_CONTRACT_URL=http://mk-serve:8000 pytest service/tests/contract -v
 
-`mk serve` has no host port, so run it from a container on the stack's network (see the README's release notes). The
+`mk serve` has no host port, so run it from a container on the stack's network, for example the turn service's own
+image (`docker run --network <project>_kernel -v ./service:/svc:ro --entrypoint sh hermes-kernel-turns`, then pip
+install pytest pytest-asyncio and run pytest on a copy of /svc). The
 bonfire (`KT_CONTRACT_BONFIRE`, default `hermes`) must already hold a built session. Each run teaches one new phrase,
 `ktcontract<letters> {X}`, and leaves it in the bonfire.
 """
@@ -18,8 +20,11 @@ from uuid import uuid4
 
 import pytest
 
+from kernel_turns.affordances import has_staged_draft
 from kernel_turns.mk_client import MkClient, PlanGone, Refused
 from kernel_turns.models import JsonValue
+from kernel_turns.plans import frames_of, licence_of, phrase_of, step_of
+from kernel_turns.status import _spend  # pyright: ignore[reportPrivateUsage]
 from kernel_turns.teaching import merge_sources
 
 URL = os.environ.get("KT_CONTRACT_URL", "")
@@ -110,6 +115,10 @@ async def test_the_walk(mk: MkClient) -> None:
     health = await mk.health()
     bonfires = as_dict(health["bonfires"])
     assert BONFIRE in bonfires, f"{BONFIRE!r} is not built in this mk serve: {sorted(bonfires)}"
+    # the status reads spend from the health, and returns None for a shape it does not know: so it must be known
+    spend = _spend(health, BONFIRE)
+    assert spend is not None, f"the service cannot read spend from this health: {health.get('spend')}"
+    assert spend.ceiling_usd > 0 and spend.charged_usd >= 0
 
     # the catalogue: read, put (the agent's tools, as the service puts them), read back
     before = await mk.get_catalogue(BONFIRE)
@@ -145,11 +154,21 @@ async def test_the_walk(mk: MkClient) -> None:
     assert isinstance(draft_id, str) and draft_id, f"the draft was refused: {draft.get('problems')}"
     assert draft.get("problems") == []
     rows = await mk.constructions(BONFIRE)
-    staged = [r for r in rows if r.get("status") == "staged" or draft_id in str(r.get("id", ""))]
-    assert staged, "the new draft is not among the constructions"
+    # this draft's own row (not any staged row in the bonfire): staged, with its teacher in the provenance
+    own = [r for r in rows if as_dict(r.get("provenance") or {}).get("draft_id") == draft_id]
+    assert own, "the new draft is not among the constructions"
+    assert all(r.get("status") == "staged" for r in own)
+    assert all(as_dict(r["provenance"]).get("teacher") == TEACHER for r in own)
+    assert has_staged_draft(own, TEACHER) and not has_staged_draft(own, "Somebody Else")
+
+    # a bare "yes" after a draft is read as a yes: the plain-yes ruling rests on this
+    yes = frames_of(await mk.plan(BONFIRE, plan_body("yes")))
+    assert any(f.name == "yes" and f.kind == "reply" for f in yes), [(f.name, f.kind) for f in yes]
     confirmed = await mk.confirm(BONFIRE, draft_id, TEACHER)
     assert confirmed["draft_id"] == draft_id
-    assert confirmed.get("specs") or confirmed.get("phrases")
+    specs = confirmed.get("specs")
+    assert isinstance(specs, list) and specs
+    phrase_ids = {str(as_dict(spec)["id"]) for spec in specs}
 
     # plan a message that reads as the phrase: its first step is the search
     plan = await mk.plan(BONFIRE, plan_body(f"{WORD} sourdough"))
@@ -158,6 +177,24 @@ async def test_the_walk(mk: MkClient) -> None:
     assert isinstance(plan_id, str)
     search = first_step(plan)
     assert search["tool"] == "web_search"
+    # what the service's own readers make of the plan: a missing or renamed key is silent in production
+    assert [f.name for f in frames_of(plan) if f.kind == "phrase"], "no phrase frame was read"
+    assert {f.name for f in frames_of(plan) if f.kind == "phrase"} <= phrase_ids | {
+        n.split("#v")[0] for n in phrase_ids
+    }
+    reading = as_dict(plan["reading"])
+    assert isinstance(reading["applied"], list) and reading["applied"]
+    assert isinstance(plan["hand"], list) and plan["hand"]
+    assert phrase_of(plan) in phrase_ids, f"phrase_of read {phrase_of(plan)!r}, not one of {phrase_ids}"
+    assert {"web_search", "think"} <= set(licence_of(plan) or []), licence_of(plan)
+    step = step_of(plan)
+    assert step is not None
+    tool, args, step_id, needs_confirmation = step
+    assert (tool, step_id) == ("web_search", search["step_id"])
+    assert args == {"query": "sourdough"}, args
+    # step_of treats a missing needs_confirmation as True; here the key must really be there
+    assert isinstance(search.get("needs_confirmation"), bool), search
+    assert needs_confirmation is search["needs_confirmation"]
 
     # resume with the search's result: the next step is the model's think
     plan = await mk.resume(BONFIRE, plan_id, [result(search, "committed", "Sourdough is a leavened bread.")])

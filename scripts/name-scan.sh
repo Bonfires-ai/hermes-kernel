@@ -1,61 +1,82 @@
 #!/usr/bin/env bash
-# Fails if a tracked or new file holds a path of someone's machine, or something shaped like a key.
+# Fails if a tracked or new file holds a path of someone's machine, or something shaped like a key, or a private name.
 #
 #   scripts/name-scan.sh
 #
 # Generic checks always run: a home-directory path, an `sk-` key, a `bf_` token. Private names (a company's internal
 # project names, people) are not listed here, because a tracked list would publish what it hunts. They are read from
-# .dev/private-names.txt, which is git-ignored: one name per line, optionally `name|text` to exempt lines that hold
-# `text`. Without that file the private half is skipped with a note (CI does not have it, so run the scan on your own
-# machine before a release). Every file git knows is scanned, tests and data included.
+# .dev/private-names.txt, which is git-ignored: one name per line, optionally `name|text` to exempt matches that hold
+# `text`. The scan FAILS CLOSED: without that file it fails, unless NAME_SCAN_GENERIC_ONLY=1 says that only the generic
+# half is wanted (CI sets it, since CI does not have the file; run the full scan on your own machine before a release).
+# It also fails when git cannot list the files, when there are no files, and when grep itself errors. Every file git
+# knows is scanned, tests and data included.
 
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 NAMES_FILE="${NAME_SCAN_NAMES:-.dev/private-names.txt}"
+GENERIC_ONLY="${NAME_SCAN_GENERIC_ONLY:-0}"
 hits=0
 files=()
-while IFS= read -r -d '' f; do
-  [ -f "$f" ] && [ ! -L "$f" ] && files+=("$f")
-done < <(git ls-files -z --cached --others --exclude-standard)
+listing="$(git ls-files -z --cached --others --exclude-standard | tr '\0' '\n')" \
+  || { echo "name-scan: git could not list the files: the scan cannot say anything." >&2; exit 2; }
+while IFS= read -r f; do
+  [ -n "$f" ] && [ -f "$f" ] && [ ! -L "$f" ] && files+=("$f")
+done <<<"$listing"
+[ "${#files[@]}" -gt 0 ] || { echo "name-scan: no files to scan: the scan cannot say anything." >&2; exit 2; }
 
-scan() { # scan <label> <grep args...>: print every hit, count it
-  local label="$1"; shift
-  local out
-  out="$(grep -InH "$@" -- "${files[@]}" 2>/dev/null || true)"
-  if [ -n "$out" ]; then
-    echo "name-scan: $label:"
-    echo "$out" | sed 's/^/  /'
-    hits=$((hits + $(echo "$out" | wc -l)))
+# run_grep <grep args...>: prints the matches; status 0 for matches or none, exit 2 when grep itself fails.
+run_grep() {
+  local out status=0
+  out="$(grep -InH "$@" -- "${files[@]}" 2>&1)" || status=$?
+  if [ "$status" -gt 1 ]; then echo "name-scan: grep failed (status $status): $out" >&2; exit 2; fi
+  [ "$status" -eq 1 ] || printf '%s\n' "$out"
+}
+
+report() { # report <label> <matches>
+  if [ -n "$2" ]; then
+    echo "name-scan: $1:"
+    printf '%s\n' "$2" | sed 's/^/  /'
+    hits=$((hits + $(printf '%s\n' "$2" | wc -l)))
   fi
 }
 
 # Generic. The brackets keep this file from matching its own patterns.
-scan "a home-directory path" -E '[/]home[/]'
-scan "something shaped like an sk- key" -E '(^|[^A-Za-z0-9])sk-[A-Za-z0-9_-]{10,}'
-scan "something shaped like a bf_ token" -E '(^|[^A-Za-z0-9])bf_[A-Za-z0-9]{16,}'
+report "a home-directory path" "$(run_grep -E '[/]home[/]')"
+report "something shaped like an sk- key" "$(run_grep -E '(^|[^A-Za-z0-9])sk-[A-Za-z0-9_-]{10,}')"
+report "something shaped like a bf_ token" "$(run_grep -E '(^|[^A-Za-z0-9])bf_[A-Za-z0-9]{16,}')"
 
 # Private.
+mode="generic and private names"
 if [ -f "$NAMES_FILE" ]; then
-  while IFS= read -r line; do
+  while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in ''|'#'*) continue ;; esac
     name="${line%%|*}"
     exempt=""
     [ "$name" != "$line" ] && exempt="${line#*|}"
-    out="$(grep -InHiF "$name" -- "${files[@]}" 2>/dev/null || true)"
-    [ -n "$exempt" ] && out="$(echo "$out" | grep -viF "$exempt" || true)"
-    if [ -n "$out" ]; then
-      echo "name-scan: a private name from $NAMES_FILE:"
-      echo "$out" | sed 's/^/  /'
-      hits=$((hits + $(echo "$out" | wc -l)))
+    # -o prints only the matched text, so an exemption is matched against that, not against file:line:text.
+    out="$(run_grep -oiF "$name")"
+    if [ -n "$exempt" ] && [ -n "$out" ]; then
+      # Exempt a hit when its line holds the exempting text: look the line up again by file and number.
+      kept=""
+      while IFS= read -r hit; do
+        [ -n "$hit" ] || continue
+        file="${hit%%:*}"; rest="${hit#*:}"; num="${rest%%:*}"
+        if ! sed -n "${num}p" "$file" | grep -qiF -- "$exempt"; then kept+="$hit"$'\n'; fi
+      done <<<"$out"
+      out="${kept%$'\n'}"
     fi
+    report "a private name from $NAMES_FILE" "$out"
   done <"$NAMES_FILE"
+elif [ "$GENERIC_ONLY" = "1" ]; then
+  mode="generic only"
 else
-  echo "name-scan: $NAMES_FILE is absent: the private-name half was skipped (only the generic checks ran)."
+  echo "name-scan: $NAMES_FILE is absent, so the private-name half cannot run. Create it, or set NAME_SCAN_GENERIC_ONLY=1 to scan only for paths and keys." >&2
+  exit 2
 fi
 
 if [ "$hits" -gt 0 ]; then
   echo "name-scan: $hits hit(s)."
   exit 1
 fi
-echo "name-scan: no hits in ${#files[@]} files."
+echo "name-scan: no hits in ${#files[@]} files ($mode)."

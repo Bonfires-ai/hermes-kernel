@@ -1,5 +1,6 @@
 .env
 .dev/
+# No slash: .dev may be a symlink, which the pattern ".dev/" (a directory) does not match.
 .dev
 .venv
 __pycache__/

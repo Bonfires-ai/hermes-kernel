@@ -6,7 +6,8 @@ Starts `<hermes> chat --cli` under a pseudo terminal (HERMES_HOME comes from the
 the JSON list in turn, waits until the screen has been quiet for `--quiet-s` seconds (or `--max-s` passes), and ends
 the chat with `/exit`, which closes the session. The transcript has each prompt, then what Hermes printed after it,
 with terminal codes removed. A prompt that is an object `{"run": "<shell command>"}` runs that command in the middle
-of the chat instead (used to stop and start the stack while a conversation is open).
+of the chat instead (used to stop and start the stack while a conversation is open, and to check what that did). A
+command that exits non-zero ends the run: the chat is closed, the transcript written, and the exit status is 1.
 
 Needs `pexpect`.
 """
@@ -60,12 +61,16 @@ def main() -> int:
     prompts = json.loads(Path(prompts_file).read_text(encoding="utf-8"))
     child = pexpect.spawn(hermes, ["chat", "--cli"], env=None, encoding=None, timeout=150, dimensions=(50, 160))
     parts: list[str] = []
+    failed = False
     child.expect(b"Welcome to Hermes", timeout=90)
     parts.append(clean(settle(child, 8, 30)))
     for prompt in prompts:
         if isinstance(prompt, dict):
             done = subprocess.run(prompt["run"], shell=True, capture_output=True, text=True, check=False)  # noqa: S602
-            parts.append(f"\n=== RUN {prompt['run']} -> exit {done.returncode}\n")
+            parts.append(f"\n=== RUN {prompt['run']} -> exit {done.returncode}\n{done.stdout}{done.stderr}")
+            if done.returncode != 0:
+                failed = True
+                break
             continue
         child.send(prompt.encode())
         time.sleep(0.7)
@@ -82,7 +87,7 @@ def main() -> int:
     except Exception:  # noqa: BLE001  the chat is over either way
         pass
     Path(transcript).write_text("".join(parts), encoding="utf-8")
-    return 0
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
