@@ -28,3 +28,14 @@ def test_clean_keeps_what_it_can():
     assert pieces == [f"m2~{n}" for n in range(1, 41) if n != 7]  # only the unreadable piece is gone
     assert "m3" not in ids  # a message with no readable piece is dropped whole
     assert set(changed) == {"m1", "m2", "m3"}
+
+
+def test_point_nltk_puts_the_data_dir_first_once(monkeypatch, tmp_path):
+    import os
+
+    from hermes_writer.clean import point_nltk
+
+    monkeypatch.setenv("NLTK_DATA", "/elsewhere")
+    point_nltk(tmp_path)
+    point_nltk(tmp_path)
+    assert os.environ["NLTK_DATA"] == f"{tmp_path / 'nltk_data'}{os.pathsep}/elsewhere"

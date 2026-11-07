@@ -30,9 +30,11 @@ from __future__ import annotations
 import asyncio
 import importlib
 import logging
+import os
 import re
 import unicodedata
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -162,6 +164,15 @@ async def clean_session(
                 "kernel.session.message_dropped", extra={"bonfire_id": bonfire_id, "message_id": original["message_id"]}
             )
     return {**session, "messages": messages}, changed
+
+
+def point_nltk(data_dir: Path) -> None:
+    """Put ``<data_dir>/nltk_data`` first in ``NLTK_DATA``, where ``mk setup`` placed the benepar model. The ``mk`` CLI does
+    this for its own processes; this one is not ``mk``, and without it ``kernel_parse`` stops with "benepar_en3 not
+    found". Call it before the first parse (nltk reads the variable when it is imported)."""
+    corpus = str(data_dir / "nltk_data")
+    rest = [p for p in os.environ.get("NLTK_DATA", "").split(os.pathsep) if p and p != corpus]
+    os.environ["NLTK_DATA"] = os.pathsep.join([corpus, *rest])
 
 
 async def kernel_parse(text: str) -> list[Tree]:
