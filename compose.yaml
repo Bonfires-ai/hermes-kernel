@@ -10,6 +10,8 @@ services:
     environment:
       NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:?set NEO4J_PASSWORD in .env}
       NEO4J_server_config_strict__validation_enabled: "false"
+      # Neo4j 5.20 and later send an anonymous usage report (server IP, database sizes and counts) every 24 hours by default.
+      NEO4J_dbms_usage__report_enabled: "false"
       NEO4J_server_memory_heap_initial__size: 512m
       NEO4J_server_memory_heap_max__size: 1G
       NEO4J_server_memory_pagecache_size: 512m
@@ -40,14 +42,14 @@ services:
       start_period: 10s
 
   mk-serve:
-    image: hermes-kernel-mk:${MK_VERSION:-2.0.0}
+    image: hermes-kernel-mk:${MK_VERSION:-2.0.1}
     restart: unless-stopped
     build: &mk-build
       # The repo root: the image also installs writer/.
       context: .
       dockerfile: images/mk/Dockerfile
       args:
-        MK_VERSION: ${MK_VERSION:-2.0.0}
+        MK_VERSION: ${MK_VERSION:-2.0.1}
     # --neo4j-uri is also the image's CMD default; it is repeated here so a compose edit cannot lose it.
     command: ["mk", "serve", "--host", "0.0.0.0", "--port", "8000", "--neo4j-uri", "bolt://neo4j:7687"]
     environment:
@@ -69,7 +71,7 @@ services:
 
   # The writer: reads closed sessions from Mongo and builds them into the bonfire. Same image as mk-serve.
   writer:
-    image: hermes-kernel-mk:${MK_VERSION:-2.0.0}
+    image: hermes-kernel-mk:${MK_VERSION:-2.0.1}
     restart: unless-stopped
     build: *mk-build
     command: ["python", "-m", "hermes_writer"]
