@@ -30,7 +30,6 @@ class FakeClient:
 
 @pytest.fixture
 def env(monkeypatch):
-    monkeypatch.delenv("HERMES_HOME", raising=False)
     shared.reset_shared()
     yield shared.get_shared()
     shared.reset_shared()

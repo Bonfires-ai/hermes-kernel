@@ -110,7 +110,6 @@ class Turns:
 
 @pytest.fixture
 def env(monkeypatch):
-    monkeypatch.delenv("HERMES_HOME", raising=False)
     shared.reset_shared()
     sh = shared.get_shared()
     sh.sessions["s1"] = {"platform": "Telegram"}

@@ -69,7 +69,6 @@ class CollectorCtx:
 @pytest.fixture
 def impl_shared(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KERNEL_TOKEN", "t")
-    monkeypatch.delenv("HERMES_HOME", raising=False)
     import hermes_constants  # pyright: ignore[reportMissingImports]
 
     monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: tmp_path)  # never a developer's real home
@@ -251,6 +250,7 @@ def test_money_small_amounts_do_not_read_as_zero():
 
     assert _money(0.0034) == "$0.0034"
     assert _money(0.0004) == "$0.0004"
+    assert _money(0.00001234) == "$0.00001234"  # under $0.00005 four decimals would still read as $0.0000
     assert _money(0.1) == "$0.10"
     assert _money(19.9) == "$19.90"
     assert _money(0) == "$0.00"

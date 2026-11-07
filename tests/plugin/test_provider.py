@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import pytest
 
@@ -43,7 +44,6 @@ class FakeCapture:
 @pytest.fixture
 def env(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KERNEL_TOKEN", "t")
-    monkeypatch.delenv("HERMES_HOME", raising=False)
     shared.reset_shared()
     sh = shared.get_shared()
     sh.client = FakeClient()  # pyright: ignore[reportAttributeAccessIssue]
@@ -168,7 +168,6 @@ def test_the_context_bound_is_a_wide_safety_limit(env):
 
 def test_not_configured_is_visible(monkeypatch):
     monkeypatch.delenv("HERMES_KERNEL_TOKEN", raising=False)
-    monkeypatch.delenv("HERMES_HOME", raising=False)
     shared.reset_shared()
     try:
         provider = KernelMemory()
@@ -199,7 +198,6 @@ def test_a_rebuilt_provider_keeps_the_counter_and_the_carried_conversation(env):
 def test_a_saved_url_is_read_under_hermes_own_home(tmp_path, monkeypatch):
     import hermes_constants  # pyright: ignore[reportMissingImports]
 
-    monkeypatch.delenv("HERMES_HOME", raising=False)
     monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: tmp_path)
     KernelMemory().save_config({"url": "http://kernel.example:9"}, str(tmp_path))
     assert shared.configured_url() == "http://kernel.example:9"
@@ -212,3 +210,10 @@ def test_the_block_is_true_with_the_service_up_or_down(env):
     for name in ("run_phrase", "offer_phrase", "teach_phrase", "confirm_phrase", "phrase_continue", "search_memory"):
         assert name in block
     assert "5 minutes" in block and "30 minutes" in block
+
+
+def test_the_suite_never_runs_on_the_real_hermes_home(env):
+    from hermes_constants import get_hermes_home  # pyright: ignore[reportMissingImports]
+
+    assert Path(get_hermes_home()).resolve() != (Path.home() / ".hermes").resolve()
+    assert shared.configured_url() == ""
