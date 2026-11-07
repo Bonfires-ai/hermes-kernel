@@ -123,7 +123,9 @@ class KernelMemory(MemoryProvider):
         if info is None or client is None or not (query or "").strip():
             return ""
         try:
-            return cut_kernel_block(client.context(query, self._speaker(info), timeout=CONTEXT_TIMEOUT_S))
+            block = cut_kernel_block(client.context(query, self._speaker(info), timeout=CONTEXT_TIMEOUT_S))
+            log.info("hermes-kernel: recalled %d characters for session %s", len(block), session_id)
+            return block
         except (Unavailable, Unauthorized, Refused) as exc:
             log.warning("hermes-kernel: no recall this turn: %s", exc)
         except Exception:  # noqa: BLE001  nothing may raise out of a memory call
