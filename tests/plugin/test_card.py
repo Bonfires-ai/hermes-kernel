@@ -253,6 +253,82 @@ def test_the_hook_never_raises_when_the_service_raises_anything():
     assert decision is not None and decision.chosen
 
 
+def ask_hermes(questions: Any, pick: Any) -> str:
+    """Hermes's own `clarify` tool, with `pick` standing in for the surface. The real result, in its real shape."""
+    from tools.clarify_tool import clarify_tool  # pyright: ignore[reportMissingImports]
+
+    return clarify_tool(questions, callback=pick)
+
+
+def test_hermess_real_result_for_the_first_choice_keeps_the_phrase_though_the_screen_said_recommended():
+    shown: list[Any] = []
+
+    def surface(questions):
+        shown.extend(questions)
+        return {"answers": {questions[0]["qid"]: questions[0]["choices"][0]}, "outcome": "submitted"}
+
+    service = Service()
+    cards = book(service)
+    res = ask_hermes([{"question": ASKED, "choices": list(CHOICES)}], surface)
+    assert shown[0]["choices"][0] == "Keep it (Recommended)"  # what the person sees on the screen
+    hook(cards, res)
+    assert len(service.confirmed) == 1
+
+
+def test_hermess_real_result_strips_what_the_model_sends_and_still_matches():
+    service = Service()
+    cards = book(service)
+    res = ask_hermes(
+        [{"question": f"  {ASKED}\n", "choices": [f" {c} " for c in CHOICES]}],
+        lambda qs: {"answers": {qs[0]["qid"]: qs[0]["choices"][0]}, "outcome": "submitted"},
+    )
+    hook(cards, res)
+    assert len(service.confirmed) == 1
+
+
+def test_hermess_real_results_with_no_answer_change_nothing():
+    for reply in (
+        {"answers": {}, "outcome": "undelivered", "notice": "single-query mode: no user available to answer."},
+        {"answers": {}, "outcome": "timed_out"},
+        {"answers": {}, "outcome": "cancelled"},
+        {"answers": {"q0": None}, "outcome": "submitted"},
+    ):
+        service = Service()
+        cards = book(service)
+        hook(cards, ask_hermes([{"question": ASKED, "choices": list(CHOICES)}], lambda qs, r=reply: r))
+        assert service.confirmed == [] and cards.decision("d1") is None
+
+
+def test_hermess_real_multi_select_answer_is_a_list_and_changes_nothing():
+    service = Service()
+    cards = book(service)
+    res = ask_hermes(
+        [{"question": ASKED, "choices": list(CHOICES), "multi_select": True}],
+        lambda qs: {"answers": {qs[0]["qid"]: json.dumps(["Keep it"])}, "outcome": "submitted"},
+    )
+    hook(cards, res)
+    assert service.confirmed == []
+
+
+def test_hermess_real_typed_answer_is_not_a_choice_and_changes_nothing():
+    service = Service()
+    cards = book(service)
+    res = ask_hermes(
+        [{"question": ASKED, "choices": list(CHOICES)}],
+        lambda qs: {"answers": {qs[0]["qid"]: "yes please"}, "outcome": "submitted"},
+    )
+    hook(cards, res)
+    assert service.confirmed == []
+
+
+def test_hermess_real_error_for_a_bad_call_changes_nothing():
+    service = Service()
+    cards = book(service)
+    hook(cards, ask_hermes([], None), status="error")
+    hook(cards, ask_hermes([{"question": ASKED, "choices": list(CHOICES)}], None))  # no surface: not available
+    assert service.confirmed == []
+
+
 def test_a_new_card_for_the_session_replaces_the_old_one():
     service = Service()
     cards = book(service)
