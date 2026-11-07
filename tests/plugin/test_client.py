@@ -124,7 +124,8 @@ def copies():
 
 
 class FakeCtx:
-    pass
+    def register_memory_provider(self, provider):
+        self.provider = provider
 
 
 def test_two_imports_share_one_state(copies):

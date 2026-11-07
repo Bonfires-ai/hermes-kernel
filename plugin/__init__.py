@@ -45,7 +45,11 @@ def _canonical() -> ModuleType:
 def register(ctx) -> None:
     if __name__ != _CANON:
         return _canonical().register(ctx)
+    from .provider import KernelMemory
     from .shared import get_shared
 
     get_shared()
-    log.info("hermes-kernel loaded")
+    if hasattr(ctx, "dispatch_tool"):
+        log.info("hermes-kernel loaded (general path)")  # hooks, tools and commands arrive in later tasks
+        return
+    ctx.register_memory_provider(KernelMemory())

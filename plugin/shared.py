@@ -3,11 +3,16 @@ singleton is one per process."""
 
 from __future__ import annotations
 
+import json
 import os
 import threading
+from pathlib import Path
 from typing import Any
 
+from .capture import Capture
 from .client import Breaker, ServiceClient
+
+CONFIG_FILE = "hermes-kernel.json"
 
 DEFAULT_URL = "http://127.0.0.1:8787"
 
@@ -19,16 +24,38 @@ class Shared:
         #: per-session facts, keyed by session id; guard with `lock`
         self.sessions: dict[str, Any] = {}
         self.lock = threading.RLock()
+        #: the Capture once `capture()` made it; None before, or with no client
+        self.made_capture: Capture | None = None
+
+    def capture(self, spool_path: Path) -> Capture | None:
+        """The one Capture, made on first call (it starts no thread until first use). None without a client."""
+        with self.lock:
+            if self.made_capture is None and self.client is not None:
+                self.made_capture = Capture(self.client, spool_path, agent_handle="hermes")
+            return self.made_capture
 
 
 _lock = threading.Lock()
 _shared: Shared | None = None
 
 
+def configured_url() -> str:
+    """`url` from `<HERMES_HOME>/hermes-kernel.json`, written by `save_config`; "" when absent or unreadable."""
+    home = os.environ.get("HERMES_HOME", "").strip()
+    if not home:
+        return ""
+    try:
+        data = json.loads((Path(home) / CONFIG_FILE).read_text(encoding="utf-8"))
+        value = data.get("url") if isinstance(data, dict) else None
+        return value.strip() if isinstance(value, str) else ""
+    except (OSError, ValueError):
+        return ""
+
+
 def _build() -> Shared:
     breaker = Breaker()
     token = os.environ.get("HERMES_KERNEL_TOKEN", "").strip()
-    url = os.environ.get("HERMES_KERNEL_URL", "").strip() or DEFAULT_URL
+    url = os.environ.get("HERMES_KERNEL_URL", "").strip() or configured_url() or DEFAULT_URL
     client = ServiceClient(url, token, breaker=breaker) if token else None
     return Shared(client, breaker)
 
