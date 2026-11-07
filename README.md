@@ -308,7 +308,9 @@ key, and the service talks to the two seams:
   - `GET {url}/bonfires/{bonfire_id}/status` answers `{engine, agent_handles, waiting, failed: [{key, conversation_id,
     reason, attempts}], held, last_built_at}`. It's read for `/v1/status`, and the first time a bonfire's key is used:
     only a bonfire with `engine` `kernel` and `agent_handles` exactly `["hermes"]` is served, and any other key gets a
-    403 on every route.
+    403 on every route. A bonfire that passes is not asked again while the service runs. While the status can't be read
+    (no answer within 2 seconds, an error, or a body that doesn't parse), a bonfire not yet seen gets a 503 with
+    `Retry-After` on every route; one already served goes on, and `/v1/status` says the queue can't be read.
 
 With `KT_HANDOFF_URL` set, don't run the writer. The hand-off sends each closed session to be built, and a writer would
 build it as well.

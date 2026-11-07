@@ -1,10 +1,13 @@
 """One customer can never reach another's data, through any route, on either store.
 
 Customer A is seeded with real rows: a turn with a committed ledger row and a pending step, a turn in repair, a live
-phrase and a staged draft, a use, a catalogue, an open, a closed and a failed session, and numbers of its own at the
-kernel and at the worker. Customer B holds a phrase with the same id as A's. Then every ``/v1`` route is called on A's
-ids with B's key, with no key or an unknown one, and with the key of a bonfire this service must not serve. Each time
-A's state is exactly what it was, and the kernel hears nothing of A.
+phrase and a staged draft, a use, a catalogue with a tool only A has, an open, a closed and a failed session, and
+numbers of its own at the kernel and at the worker. A also has what a turn of the same chat and speaker reads from
+the speaker's past: an earlier turn with an open frame and an open offer to teach, and a phrase paused at a step the
+agent runs. B holds a phrase with the same id as A's. Then every ``/v1`` route is called on A's ids with B's key, with
+no key or an unknown one, and with the key of a bonfire this service must not serve. Each time A's state is exactly
+what it was, the kernel hears nothing of A (nor anything A holds, in what B's requests send it), and a hand-off pass
+afterwards sends each bonfire's session under its own id.
 
 ``PROBES`` holds one probe per route, keyed by ``(method, path)``, and ``test_every_route_has_a_probe`` fails for a route
 that has none: a new route fails here until it has one. A probe's ``call`` is plain HTTP (any ``httpx.Client``) and its
@@ -42,7 +45,7 @@ from kernel_turns import keys
 from kernel_turns.app import create_app
 from kernel_turns.callers import KeyCheck
 from kernel_turns.config import Settings
-from kernel_turns.handoff import HandoffClient
+from kernel_turns.handoff import HandoffClient, hand_over_once
 from kernel_turns.models import JsonValue, LedgerRow, TurnRecord
 from kernel_turns.sessions import MemorySessionStore, MongoSessionStore, SessionStore
 from kernel_turns.store import Doc, MemoryTurnStore, MongoTurnStore, TurnStore
@@ -66,6 +69,21 @@ AT = "2026-11-07T10:00:00+00:00"
 MAKE: dict[str, JsonValue] = {"title": "onboard sam"}
 #: what only A's data holds, beside its ids
 VALUE, FORM, SECRET, SPENT = "JUJ-9", "fetch {X}", "the door code is 4417", "0.4242"
+TITLE, OFFERED, TOOL, SHELF = "a-secret-title", "sing {X} at dawn", "a_private_tool", "a-secret-shelf"
+#: earlier than every other seeded turn: the speaker's previous turn is strictly earlier
+EARLIER = "2026-11-07T09:30:00+00:00"
+
+
+def _with_tool(catalogue: dict[str, JsonValue], name: str) -> dict[str, JsonValue]:
+    tools = catalogue["tools"]
+    assert isinstance(tools, list)
+    schema: dict[str, JsonValue] = {"type": "object", "properties": {}}
+    tool: dict[str, JsonValue] = {"name": name, "x-side-effect": False, "input_schema": schema}
+    return {**catalogue, "tools": [*tools, tool]}
+
+
+#: A's catalogue holds a tool no other customer's does
+A_CATALOGUE = _with_tool(CATALOGUE, TOOL)
 #: the catalogue B puts on A's group: unlike A's, so a write that reached A's rows would show
 THEIRS: dict[str, JsonValue] = {
     "schema_version": "kernel-catalogue/v1",
@@ -78,6 +96,13 @@ SCRIPTS = {
     "yes": Script(steps=[], partial=True, frames=[frame("yes", "reply", complete=True)]),
     # applies the first phrase taught (``brew.d1.0`` in either bonfire) and is answered: a use
     "fetch water": Script(steps=[], phrase="brew.d1.0", answer="fetched"),
+    # an open tool frame whose role names something of A's
+    "remember the title": Script(steps=[], partial=True, frames=[frame("make", title=TITLE)]),
+    # a message the phrase reads in, and the phrase's own text, paused at a step the agent runs
+    "please fetch the herb": Script(
+        steps=[], partial=True, frames=[frame("brew.d1.0", "phrase", construction="frame.brew.d1.0.fetch")]
+    ),
+    "fetch the herb": Script(steps=[("look", {"place": SHELF})], phrase="brew.d1.0"),
 }
 
 
@@ -126,6 +151,10 @@ class Ids:
     broken_turn: str
     #: a turn that affords ``teach_phrase``
     editor_turn: str
+    #: the speaker's earlier turn in the chat, with an open frame and an open offer; and the phrase child turn paused at
+    #: a step the agent runs
+    earlier_turn: str
+    waiting_turn: str
     #: a draft waiting for its teacher's yes, and the form of the phrase that is live
     draft: str
     form: str
@@ -150,8 +179,9 @@ class Probe:
     check: Check
     #: what the same call answers with A's own key
     owner: Check
-    #: the call reaches the kernel, for the caller's own bonfire
-    kernel: bool = False
+    #: what the call asks of the kernel, in order, all of it for the caller's own bonfire (checked against the fake
+    #: kernel only)
+    kernel: tuple[str, ...] = ()
 
 
 def _auth(key: str | None) -> dict[str, str]:
@@ -218,8 +248,16 @@ no_turn = unknown(lambda ids: f"no turn {ids.turn!r}")
 
 
 def _begin(client: httpx.Client, ids: Ids, key: str | None) -> httpx.Response:
-    """The very message of A's turn."""
-    return client.post("/v1/turns", json=_turn_body(ids, ids.turn_message, ids.text), headers=_auth(key))
+    """The very message id of A's turn, in A's chat, as a yes: a turn that read another customer's past would answer A's
+    open offer, send A's open frames to the kernel as its context, show A's paused phrase as waiting, and afford A's
+    tools."""
+    return client.post("/v1/turns", json=_turn_body(ids, ids.turn_message, "yes"), headers=_auth(key))
+
+
+def _begin_as(client: httpx.Client, ids: Ids, key: str, message_id: str, text: str) -> str:
+    begun = client.post("/v1/turns", json=_turn_body(ids, message_id, text), headers=_auth(key))
+    assert begun.status_code == 200, begun.text
+    return begun.json()["turn_id"]
 
 
 def _a_turn_of_its_own(answer: httpx.Response, ids: Ids) -> None:
@@ -277,7 +315,13 @@ def _confirm(client: httpx.Client, ids: Ids, key: str | None) -> httpx.Response:
 
 
 def _put_catalogue(client: httpx.Client, ids: Ids, key: str | None) -> httpx.Response:
-    return client.put(f"/v1/groups/{ids.platform}/{ids.group}/catalogue/agent", json=THEIRS, headers=_auth(key))
+    """A catalogue unlike A's, twice: the first installs it, so a write that reached A's rows shows; the second is
+    the same catalogue again, which installs nothing unless the one held is read from someone else's rows."""
+    url = f"/v1/groups/{ids.platform}/{ids.group}/catalogue/agent"
+    first = client.put(url, json=THEIRS, headers=_auth(key))
+    if first.status_code != 204:
+        return first
+    return client.put(url, json=THEIRS, headers=_auth(key))
 
 
 def _no_content(answer: httpx.Response, ids: Ids) -> None:
@@ -324,7 +368,7 @@ def _status(client: httpx.Client, ids: Ids, key: str | None) -> httpx.Response:
 #: one per route under /v1, by (method, path). Run one after another with the same key, in this order, each still holds
 #: on fresh ids: the close comes before the message that would open the caller's own session in that chat
 PROBES: dict[tuple[str, str], Probe] = {
-    ("POST", "/v1/turns"): Probe(_begin, _a_turn_of_its_own, shows(200, "turn"), kernel=True),
+    ("POST", "/v1/turns"): Probe(_begin, _a_turn_of_its_own, shows(200, "turn"), kernel=("plan", "constructions")),
     ("GET", "/v1/turns/{turn_id}"): Probe(_get_turn, no_turn, shows(200, "turn")),
     ("POST", "/v1/turns/{turn_id}/calls"): Probe(_call, no_turn, shows(200, "turn")),
     ("POST", "/v1/turns/{turn_id}/offers"): Probe(_offer, no_turn, shows(200, "turn")),
@@ -334,12 +378,17 @@ PROBES: dict[tuple[str, str], Probe] = {
     ),
     ("POST", "/v1/teaching"): Probe(_teach, unknown(lambda ids: f"no turn {ids.editor_turn!r}"), _drafted),
     ("POST", "/v1/teaching/{draft_id}/confirm"): Probe(
-        _confirm, unknown(lambda ids: f"no staged draft {ids.draft!r}"), shows(200, "draft"), kernel=True
+        _confirm,
+        unknown(lambda ids: f"no staged draft {ids.draft!r}"),
+        shows(200, "draft"),
+        kernel=("plan", "constructions", "constructions"),
     ),
     ("PUT", "/v1/groups/{platform}/{group}/catalogue/{source}"): Probe(
-        _put_catalogue, _no_content, _no_content, kernel=True
+        _put_catalogue, _no_content, _no_content, kernel=("put_catalogue",)
     ),
-    ("GET", "/v1/groups/{platform}/{group}/verbs"): Probe(_verbs, answered(), shows(200, "form"), kernel=True),
+    ("GET", "/v1/groups/{platform}/{group}/verbs"): Probe(
+        _verbs, answered(), shows(200, "form"), kernel=("constructions",)
+    ),
     ("GET", "/v1/groups/{platform}/{group}/turns"): Probe(_recent_turns, answered(), shows(200, "turn", "text")),
     ("POST", "/v1/sessions/close"): Probe(_close, exactly({"closed": False}), exactly({"closed": True})),
     ("POST", "/v1/messages"): Probe(
@@ -348,7 +397,7 @@ PROBES: dict[tuple[str, str], Probe] = {
     ("POST", "/v1/sessions/{session_id}/retry"): Probe(
         _retry_session, unknown(lambda ids: f"no session {ids.session!r}"), shows(204)
     ),
-    ("POST", "/v1/context"): Probe(_recall, answered(), shows(200, "bonfire"), kernel=True),
+    ("POST", "/v1/context"): Probe(_recall, answered(), shows(200, "bonfire"), kernel=("context",)),
     ("GET", "/v1/status"): Probe(_status, answered(), shows(200, "bonfire", "session")),
 }
 ROUTES = sorted(PROBES)
@@ -376,9 +425,12 @@ class Seam:
     workers: dict[str, dict[str, JsonValue]]
     keys_asked: list[str] = field(default_factory=list)
     status_asked: list[str] = field(default_factory=list)
-    sent: list[str] = field(default_factory=list)
+    #: (bonfire, message ids) of every session handed over
+    sent: list[tuple[str, tuple[str, ...]]] = field(default_factory=list)
 
     def check_key(self, request: httpx.Request) -> httpx.Response:
+        if (request.method, str(request.url)) != ("POST", AUTH_URL):
+            return httpx.Response(500)  # a check sent anywhere else: every key is then a 503, and every test fails
         if request.headers.get("Authorization") != f"Bearer {SEAM_TOKEN}":
             return httpx.Response(401)
         key = json.loads(request.content)["key"]
@@ -388,12 +440,15 @@ class Seam:
         return httpx.Response(200, json={"bonfire_id": KEYS[key], "permission": "write"})
 
     def worker(self, request: httpx.Request) -> httpx.Response:
-        found = re.fullmatch(r"/internal/turn-service/bonfires/([^/]+)/(status|sessions)", request.url.path)
+        found = re.fullmatch(re.escape(HANDOFF_URL) + r"/bonfires/([^/]+)/(status|sessions)", str(request.url))
         if request.headers.get("Authorization") != f"Bearer {SEAM_TOKEN}" or found is None:
             return httpx.Response(401 if found else 404)
         bonfire, what = found.groups()
+        if (what, request.method) not in (("status", "GET"), ("sessions", "POST")):
+            return httpx.Response(405)
         if what == "sessions":
-            self.sent.append(bonfire)
+            body = json.loads(request.content)
+            self.sent.append((bonfire, tuple(m["message_id"] for m in body["messages"])))
             return httpx.Response(202)
         self.status_asked.append(bonfire)
         held = self.workers.get(bonfire)
@@ -442,6 +497,11 @@ class World:
                 "installed": self.mk.catalogues.get(bonfire),
             }
         )
+
+    def hand_over(self) -> None:
+        """One hand-off pass, as the service's loop runs it, through a ``HandoffClient`` over the same seam."""
+        client = HandoffClient(HANDOFF_URL, SEAM_TOKEN, client=_over(self.seam.worker))
+        self.run(hand_over_once, self.sessions, client, lambda: datetime.now(UTC))
 
     def settle(self) -> None:
         """Let any task a request started run: a warmer started for a bonfire plans at once if it is founded."""
@@ -548,9 +608,9 @@ def _seed(w: World) -> Ids:
         assert answer.status_code == status, answer.text
         return answer
 
-    def begin(key: str, message_id: str, text: str) -> str:
+    def begin(key: str, message_id: str, text: str, at: str = AT) -> str:
         body = {"platform": PLATFORM, "group": GROUP, "chat": GROUP, "speaker": SPEAKER, "message_id": message_id}
-        body |= {"text": text, "at": AT, "participants": [SPEAKER]}
+        body |= {"text": text, "at": at, "participants": [SPEAKER]}
         return ok(c.post("/v1/turns", json=body, headers=_auth(key))).json()["turn_id"]
 
     def teach(key: str, turn: str, form: str) -> str:
@@ -572,7 +632,7 @@ def _seed(w: World) -> Ids:
         assert closed.json() == {"closed": True}
 
     # A: a turn with a committed call and a pending one; a live phrase and a staged draft; a use; three sessions
-    ok(c.put(f"{TEAM}/catalogue/agent", json=CATALOGUE, headers=_auth(KEY_A)), 204)
+    ok(c.put(f"{TEAM}/catalogue/agent", json=A_CATALOGUE, headers=_auth(KEY_A)), 204)
     turn = begin(KEY_A, "m-make", "make onboard sam")
     called = ok(c.post(f"/v1/turns/{turn}/calls", json={"tool": "make", "args": MAKE}, headers=_auth(KEY_A)))
     report = {"step_id": called.json()["step"]["step_id"], "verdict": "committed", "value": {"id": VALUE}}
@@ -590,10 +650,23 @@ def _seed(w: World) -> Ids:
         close(KEY_A, chat)
     failed = next(s for s in w.run(w.sessions.waiting, A) if s.conversation_id == "conv-failed")
     w.run(w.sessions.mark_refused, A, failed.id, "the worker refused it", datetime.now(UTC))
-
-    # B: a catalogue, and a live phrase under the same id as A's first one (``brew.d1.0``), unused
+    # B: a catalogue, a live phrase under the same id as A's first one (``brew.d1.0``), unused, and a closed session
     ok(c.put(f"{TEAM}/catalogue/agent", json=CATALOGUE, headers=_auth(KEY_B)), 204)
     confirm(KEY_B, teach(KEY_B, begin(KEY_B, "m-b-teach", "teach fetch"), "pour {X}"), "m-b-yes")
+    say(KEY_B, "conv-b-closed", "m-b-closed", "a message of B's")
+    close(KEY_B, "conv-b-closed")
+
+    # A again: what the speaker's past holds, made last so it reads into no other seeded turn, B's included (B's draft
+    # above would otherwise be its follow-up, if a draft could follow another bonfire's offer): an earlier turn with an
+    # open frame and an open offer to teach, and a phrase called from a message and paused at a step the agent runs
+    earlier = begin(KEY_A, "m-earlier", "remember the title", at=EARLIER)
+    offer = {"forms": [OFFERED], "body": ["take {X}"]}
+    ok(c.post(f"/v1/turns/{earlier}/offers", json=offer, headers=_auth(KEY_A)))
+    asked = begin(KEY_A, "m-ask", "please fetch the herb")
+    phrase = {"tool": "brew.d1.0", "args": {"X": "the herb"}}
+    paused = ok(c.post(f"/v1/turns/{asked}/calls", json=phrase, headers=_auth(KEY_A))).json()
+    assert (paused["kind"], paused["step"]["tool"], paused["runner"]) == ("turn", "look", "agent"), paused
+    waiting = paused["turn_id"]
 
     seeded = w.state(A)
     assert {turn, broken, editor} <= {t.turn_id for t in seeded["turns"]}
@@ -601,7 +674,11 @@ def _seed(w: World) -> Ids:
     assert [u.phrase for u in seeded["uses"]] == ["brew.d1.0"]
     assert sorted(s.state for s in seeded["sessions"]) == ["closed", "failed", "open"]
     assert [r["status"] for r in seeded["staged"]] == ["live", "staged"]
-    assert seeded["source"] == CATALOGUE
+    assert seeded["source"] == A_CATALOGUE
+    held = {t.turn_id: t for t in seeded["turns"]}
+    earlier_offer = held[earlier].offer
+    assert earlier_offer is not None and earlier_offer.drafted is None and held[earlier].at < held[turn].at
+    assert (held[waiting].parent, held[waiting].status, held[waiting].pending.runner) == (asked, "licensed", "agent")
     w.mk.seen.clear()
     w.mk.calls.clear()
     w.seam.keys_asked.clear()
@@ -623,7 +700,10 @@ def _seed(w: World) -> Ids:
         session=failed.id,
         conversation="conv-open",
         message="m-open",
-        private=(A, turn, broken, editor, failed.id, VALUE, FORM, SECRET, SPENT),
+        earlier_turn=earlier,
+        waiting_turn=waiting,
+        private=(A, turn, broken, editor, earlier, asked, waiting, failed.id, VALUE, FORM, SECRET, SPENT)
+        + (TITLE, OFFERED, TOOL, SHELF),
     )
 
 
@@ -688,8 +768,27 @@ def test_the_other_customer_gets_nothing(route: tuple[str, str], seeded: tuple[W
     w.settle()
     assert w.state(A) == before
     assert {bonfire for _, bonfire in w.mk.seen} <= {B}, w.mk.seen
-    assert bool(w.mk.seen) is probe.kernel, w.mk.seen  # a route that asks the kernel asked it of B
-    assert set(w.seam.status_asked) <= {B} and w.seam.sent == []
+    assert [name for name, _ in w.mk.seen] == list(probe.kernel), w.mk.seen
+    assert set(w.seam.status_asked) <= {B}
+    for name, body in w.mk.calls:  # nothing of A's rides in what B's requests sent the kernel
+        sent = json.dumps(body, ensure_ascii=False)
+        assert not [held for held in ids.private if held in sent], (name, sent)
+    w.hand_over()  # afterwards each bonfire's oldest closed session leaves under its own id, and only it
+    assert sorted(w.seam.sent) == [(A, ("m-conv-closed",)), (B, ("m-b-closed",))]
+
+
+def test_a_draft_follows_no_other_customer_s_offer(seeded: tuple[World, Ids]) -> None:
+    """A draft marks the open offer on its teacher's previous turn as followed: B drafting from a turn of its own, in
+    A's chat and under A's speaker's name, writes nothing to A's offer."""
+    w, ids = seeded
+    before = w.state(A)
+    editor = _begin_as(w.client, ids, KEY_B, "m-b-editor", "teach fetch")
+    draft = {"turn_id": editor, "platform": ids.platform, "group": ids.group, "chat": ids.chat, "teacher": ids.speaker}
+    draft |= {"forms": ["sip {X}"], "body": ["take {X}"]}
+    taught = w.client.post("/v1/teaching", json=draft, headers=_auth(KEY_B))
+    assert taught.status_code == 200 and taught.json()["draft_id"], taught.text
+    _nothing_of_theirs(taught, ids)
+    assert w.state(A) == before
 
 
 @pytest.mark.parametrize("route", ROUTES, ids=_route_id)
@@ -725,5 +824,5 @@ def test_a_wrong_kind_of_bonfire_is_403_and_the_kernel_sees_nothing(
     assert (answer.status_code, answer.json()) == (403, NOT_SERVED)
     w.settle()  # C is founded at the kernel: a warmer started for it would have planned by now
     assert w.mk.seen == [], w.mk.seen
-    assert w.seam.status_asked == [C] and w.seam.sent == []
+    assert w.seam.status_asked == [C]
     assert (w.state(A), w.state(B), w.state(C)) == before
