@@ -31,3 +31,6 @@ class Settings(BaseSettings):
     plan_timeout_s: float = 8
     resume_timeout_s: float = 45
     teach_timeout_s: float = 30
+    # A chat's session closes after this many seconds of quiet, or at this many messages.
+    session_idle_s: float = 1800
+    session_max_messages: int = 100

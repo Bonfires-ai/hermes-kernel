@@ -8,14 +8,17 @@ with ``Retry-After``, ``KernelDown`` 502, an invalid body 422.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import hmac
 import logging
 import math
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, FastAPI, Header, Query, Request, Response
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from pymongo import AsyncMongoClient
@@ -25,6 +28,16 @@ from kernel_turns.config import Settings
 from kernel_turns.groups import SingleBonfire
 from kernel_turns.mk_client import KernelApi, KernelBusy, KernelDown, MkClient, MkError, NotTeacher, Refused
 from kernel_turns.models import BodyStep, JsonValue, LedgerRow, Runner, TurnRecord, Verdict
+from kernel_turns.sessions import (
+    AddRequest,
+    AddResult,
+    CloseRequest,
+    CloseResult,
+    MemorySessionStore,
+    MongoSessionStore,
+    SessionStore,
+    SessionTake,
+)
 from kernel_turns.store import Doc, MongoTurnStore, TurnStore
 from kernel_turns.teaching import ConfirmRequest, ConfirmView, DraftView, TeachDraft, Teaching
 from kernel_turns.turns import BeginTurn, TurnEngine, TurnView, UnknownTurn
@@ -113,11 +126,25 @@ def _install_errors(app: FastAPI) -> None:
     app.add_exception_handler(MkError, other_kernel_error)
 
 
+SWEEP_EVERY_S = 30
+
+
+async def _close_quiet_sessions(take: SessionTake) -> None:
+    while True:
+        await asyncio.sleep(SWEEP_EVERY_S)
+        try:
+            await take.close_idle()
+        except Exception:  # a database blip must not end the sweep
+            log.exception("kernel_turns.close_idle_failed")
+
+
 def create_app(
     settings: Settings,
     *,
     mk: KernelApi | None = None,
     store: TurnStore | None = None,
+    sessions: SessionStore | None = None,
+    clock: Callable[[], datetime] | None = None,
 ) -> FastAPI:
     """The app over ``settings``; ``mk`` and ``store`` are injected by tests (default: ``MkClient`` and
     ``MongoTurnStore``, owned and closed by the app)."""
@@ -136,13 +163,25 @@ def create_app(
         kernel = mk
     mongo: AsyncMongoClient[Doc] | None = None
     mongo_store: MongoTurnStore | None = None
+    mongo_sessions: MongoSessionStore | None = None
     turns_store: TurnStore
+    session_store: SessionStore
     if store is None:
         mongo = AsyncMongoClient(settings.mongo_uri.get_secret_value(), tz_aware=True)
         mongo_store = MongoTurnStore(mongo, settings.mongo_db)
         turns_store = mongo_store
-    else:
+        mongo_sessions = MongoSessionStore(mongo, settings.mongo_db)
+        session_store = sessions or mongo_sessions
+    else:  # tests inject the stores; sessions then default to memory, never to a database
         turns_store = store
+        session_store = sessions or MemorySessionStore()
+    take = SessionTake(
+        session_store,
+        settings.session_idle_s,
+        settings.session_max_messages,
+        clock or (lambda: datetime.now(UTC)),
+        bonfire_id=settings.bonfire_id,
+    )
     engine = TurnEngine(kernel, turns_store, groups)
     teaching = Teaching(kernel, turns_store, groups)
 
@@ -150,9 +189,15 @@ def create_app(
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         if mongo_store is not None:
             await mongo_store.ensure_indexes()  # the ledger's unique key is what makes a report idempotent
+        if mongo_sessions is not None and session_store is mongo_sessions:
+            await mongo_sessions.ensure_indexes()  # one open session per chat
+        sweeper = asyncio.create_task(_close_quiet_sessions(take))
         try:
             yield
         finally:
+            sweeper.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await sweeper
             if client is not None:
                 await client.aclose()
             if mongo is not None:
@@ -212,6 +257,23 @@ def create_app(
             TurnTrace(**turn.model_dump(), ledger=ledger)
             for turn, ledger in await engine.recent(platform, group, limit)
         ]
+
+    @v1.post("/messages")
+    async def add_messages(req: AddRequest) -> AddResult:
+        return await take.add(req.messages, req.agent_handles)
+
+    @v1.post("/sessions/close")
+    async def close_session(req: CloseRequest) -> CloseResult:
+        return CloseResult(closed=await take.close(req.conversation_id))
+
+    @v1.post("/sessions/{session_id}/retry")
+    async def retry_session(session_id: str) -> Response:
+        outcome = await take.retry(session_id)
+        if outcome == "unknown":
+            raise HTTPException(404, f"no session {session_id!r}")
+        if outcome == "not_failed":
+            raise HTTPException(409, "only a failed session can be retried")
+        return Response(status_code=204)
 
     app.include_router(v1)
 
