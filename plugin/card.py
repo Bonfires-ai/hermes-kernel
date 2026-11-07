@@ -16,6 +16,7 @@ A card leaves pending when it is answered, so a result cannot be replayed:
   leaves the choice recorded, and `confirm_phrase` sends it again (`resend`), with what was recorded at the click.
 - **Change it** and **Throw it away** record the draft as closed: mk has no route to delete a draft, so without this a
   later "yes" could revive one the person threw away. The record is in this process, bounded, so a restart forgets it.
+  It stops a confirm and nothing else: until `mk serve` restarts, the draft still reads for its teacher in that chat.
 
 Anything else changes nothing and the card stays pending. A card only ever opens in a private chat
 (`LocalTurn.private`): `clarify` does not say who clicked, and on Telegram any allowed user may press a button.

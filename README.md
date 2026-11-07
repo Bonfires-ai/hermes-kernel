@@ -191,8 +191,10 @@ phrase and keeps it only when you say so. Then you say `research sourdough` and 
 - **On the CLI and in a private Telegram chat** it shows you a card with the draft and three choices: Keep it, Change
   it, Throw it away. Your click goes to the plugin directly, from Hermes's own `clarify` result, so a model cannot keep a
   phrase by saying that you did: phrases run steps later, so the keep has to come from you. Keep it keeps the phrase.
-  Throw it away and Change it close that draft, so a later `yes` cannot revive it. That holds while this Hermes runs:
-  memory-kernel has no way to delete a draft, so after a Hermes restart nothing remembers the closing.
+  Throw it away and Change it close that draft, so a later `yes` cannot revive it. That holds while this Hermes runs,
+  and closing does no more than that, because memory-kernel has no way to delete a draft. Until `mk-serve` restarts, a
+  draft you turned down still reads for you in that chat, and it can read beside the phrase you kept in its place.
+  `docker compose restart mk-serve` clears it.
 - **In a group, and anywhere else with no card** (other platforms' direct messages too, or `clarify` turned off for the
   platform), it reads the draft back and you **answer with just `yes`**. A card there would not say who clicked, and
   Telegram lets any allowed user press a button. The kernel reads a bare "yes" as a yes, but not a longer sentence such
@@ -207,8 +209,9 @@ does itself. A step that would change something outside is refused. The plugin i
 The agent is always called `hermes` in memory, so a person whose platform name is `hermes` is read as the agent.
 
 Tested on the Hermes CLI, and by hand once on Telegram: one conversation, recall in a new session and one taught
-phrase. Telegram and the other platforms (Discord and the rest) are best effort: speakers are named as the platform gives
-them, and a Hermes that serves several people shares one memory among them (see the warning at the top).
+phrase. The card to keep a phrase is proved on the CLI only: that Telegram pass came before it, and no one has clicked
+one on Telegram yet. Telegram and the other platforms (Discord and the rest) are best effort: speakers are named as the
+platform gives them, and a Hermes that serves several people shares one memory among them (see the warning at the top).
 
 ## Upgrading
 
