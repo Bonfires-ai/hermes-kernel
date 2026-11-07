@@ -2,3 +2,4 @@
 .dev/
 .dev
 .venv
+__pycache__/

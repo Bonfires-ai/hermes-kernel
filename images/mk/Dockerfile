@@ -27,10 +27,20 @@ ENV MK_DATA_DIR=/opt/mk
 RUN mk setup
 RUN mk setup --component spacy-model-trf
 
+# The writer runs in this same image: it imports memory_kernel in process (see writer/src/hermes_writer/build.py).
+# The build context is the repo root, for `COPY writer`. No dev extra; memory-kernel stays as installed above.
+COPY writer /tmp/writer
+RUN pip install /tmp/writer && rm -rf /tmp/writer
+
 # The data stays root-owned and world-readable: no recursive chown, so no second copy of it in a layer.
-RUN useradd --create-home --uid 10001 kernel
+# /opt/mk/runtime-fcg: the runtime engine writes there. Without it every plan is a quiet `200 unread` while /healthz
+# and `mk setup --check` both pass. /var/lib/hermes-writer: the writer's scratch (a volume mounted there starts as
+# the runtime user's).
+RUN useradd --create-home --uid 10001 kernel \
+    && mkdir -p /opt/mk/runtime-fcg /var/lib/hermes-writer \
+    && chown kernel:kernel /opt/mk/runtime-fcg /var/lib/hermes-writer
 USER kernel
 WORKDIR /opt/mk
 # The last build step runs as the runtime user: a broken image fails the build.
 RUN mk setup --check
-CMD ["mk", "serve", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["mk", "serve", "--host", "0.0.0.0", "--port", "8000", "--neo4j-uri", "bolt://neo4j:7687"]

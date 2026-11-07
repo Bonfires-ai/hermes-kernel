@@ -39,15 +39,18 @@ services:
 
   mk-serve:
     image: hermes-kernel-mk:${MK_VERSION:-2.0.0}
-    build:
-      context: images/mk
+    build: &mk-build
+      # The repo root: the image also installs writer/.
+      context: .
+      dockerfile: images/mk/Dockerfile
       args:
         MK_VERSION: ${MK_VERSION:-2.0.0}
+    # --neo4j-uri is also the image's CMD default; it is repeated here so a compose edit cannot lose it.
     command: ["mk", "serve", "--host", "0.0.0.0", "--port", "8000", "--neo4j-uri", "bolt://neo4j:7687"]
     environment:
       MK_OPS_URI: mongodb://mongo:27017
       NEO4J_PASSWORD: ${NEO4J_PASSWORD:?set NEO4J_PASSWORD in .env}
-      VOYAGE_API_KEY: ${VOYAGE_API_KEY:-}
+      VOYAGE_API_KEY: ${VOYAGE_API_KEY:?set VOYAGE_API_KEY in .env}
     depends_on:
       neo4j:
         condition: service_healthy
@@ -61,10 +64,64 @@ services:
       retries: 12
       start_period: 30s
 
+  # The writer: reads closed sessions from Mongo and builds them into the bonfire. Same image as mk-serve.
+  writer:
+    image: hermes-kernel-mk:${MK_VERSION:-2.0.0}
+    build: *mk-build
+    command: ["python", "-m", "hermes_writer"]
+    environment:
+      KT_MONGO_URI: mongodb://mongo:27017
+      KT_MONGO_DB: kernel_turns
+      KT_BONFIRE_ID: ${KT_BONFIRE_ID:-hermes}
+      MK_OPS_URI: mongodb://mongo:27017
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:?set NEO4J_PASSWORD in .env}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:?set OPENROUTER_API_KEY in .env}
+      VOYAGE_API_KEY: ${VOYAGE_API_KEY:?set VOYAGE_API_KEY in .env}
+      KT_SPEND_CEILING_USD: ${KT_SPEND_CEILING_USD:-20}
+      KT_FOUNDING_CAP_USD: ${KT_FOUNDING_CAP_USD:-1}
+      KT_WRITER_MAX_TRIES: ${KT_WRITER_MAX_TRIES:-3}
+      KT_SCRATCH_DIR: /var/lib/hermes-writer
+    volumes:
+      - writer-scratch:/var/lib/hermes-writer
+    depends_on:
+      neo4j:
+        condition: service_healthy
+      mongo:
+        condition: service_healthy
+    networks: [kernel]
+
+  # The turn service: the one published port, on loopback.
+  turn-service:
+    image: hermes-kernel-turns:latest
+    build:
+      context: .
+      dockerfile: images/service/Dockerfile
+    ports:
+      - "127.0.0.1:8787:8000"
+    environment:
+      KT_MK_URL: http://mk-serve:8000
+      KT_MONGO_URI: mongodb://mongo:27017
+      KT_MONGO_DB: kernel_turns
+      KT_TOKEN: ${KT_TOKEN:?set KT_TOKEN in .env}
+      KT_BONFIRE_ID: ${KT_BONFIRE_ID:-hermes}
+    depends_on:
+      mongo:
+        condition: service_healthy
+      mk-serve:
+        condition: service_healthy
+    networks: [kernel]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
 networks:
   kernel:
-    name: kernel
 
 volumes:
   neo4j-data:
   mongo-data:
+  writer-scratch:
