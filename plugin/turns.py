@@ -36,7 +36,7 @@ import logging
 import threading
 import uuid
 from collections import OrderedDict
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Protocol
@@ -79,7 +79,13 @@ class TurnsApi(Protocol):
 
 
 class Source(Protocol):
+    """The tool catalogue (`AgentSource`)."""
+
     def sync_soon(self) -> None: ...
+
+    def unavailable(self) -> set[str]: ...
+
+    def real_names(self) -> dict[str, str]: ...
 
 
 class Log(Protocol):
@@ -195,12 +201,15 @@ def reading_text(frame: JsonObject) -> str:
 def frames_block(
     view: JsonObject,
     *,
+    hidden: Collection[str] = (),
     names: Mapping[str, str] | None = None,
+    natively: Mapping[str, str] | None = None,
 ) -> str:
     """What the model may run and what the kernel read in the message, one short block ("" when it read nothing:
     no frames, no waiting phrase, no offer). The lines naming the calls and the teaching tools come first and are
-    never cut; the frame lines get the budget that is left (`_MAX_BLOCK_CHARS`), whole lines only. `names`: phrase
-    names by child turn id, for the waiting line."""
+    never cut; the frame lines get the budget that is left (`_MAX_BLOCK_CHARS`), whole lines only. `hidden`: the agent's
+    own tools Hermes does not offer now (left out of the lines); `names`: phrase names by child turn id, for the
+    waiting line; `natively`: a short-named row's real name (`AgentSource.real_names`), to call it by."""
     raw = view.get("frames")
     frames = [f for f in raw if isinstance(f, dict)] if isinstance(raw, list) else []
     waiting = view.get("waiting")
@@ -211,6 +220,7 @@ def frames_block(
     own = {a for a in raw_native if isinstance(a, str)} if isinstance(raw_native, list) else set()
     raw_afford = view.get("affordances")
     afford = [a for a in raw_afford if isinstance(a, str)] if isinstance(raw_afford, list) else []
+    afford = [a for a in afford if not (a in own and a in hidden)]
     lines: list[str] = []
     native = [a for a in afford if a in own]
     calls = [a for a in afford if a not in OWN_TOOLS and a not in native]
@@ -220,7 +230,9 @@ def frames_block(
             "a role that is not given instead of guessing it."
         )
     if native:
-        lines.append(f"Your own tools, afforded too: {', '.join(native)}. Call them directly, not with run_phrase.")
+        real = natively or {}
+        said = [f"{a} (call it as {real[a]})" if a in real else a for a in native]
+        lines.append(f"Your own tools, afforded too: {', '.join(said)}. Call them directly, not with run_phrase.")
     if isinstance(waiting, dict):
         child = str(waiting.get("turn_id"))
         lines.append(waiting_line(waiting, (names or {}).get(child)))
@@ -498,13 +510,25 @@ class KernelTurns:
         calls = self._call_log.block(local.session_id) if drafting and self._call_log is not None else ""
         with self._lock:
             names = dict(self._phrases)
-        block = frames_block(view, names=names)
+        hidden, natively = self._tool_names()
+        block = frames_block(view, hidden=hidden, names=names, natively=natively)
         lines = [block, calls] if block else []
         repair = view.get("repair")
         if view.get("status") == "repair" and isinstance(repair, str) and repair:
             lines.insert(0, repair_block())
         context = "\n".join(line for line in lines if line)
         return {"context": context} if context else None
+
+    def _tool_names(self) -> tuple[set[str], dict[str, str]]:
+        """The agent's tools Hermes does not offer now, and the short-named rows' real names (as of the last read of
+        the registry); never costs the turn."""
+        if self._source is None:
+            return set(), {}
+        try:
+            return self._source.unavailable(), self._source.real_names()
+        except Exception:  # noqa: BLE001 — the block then lists what the service afforded
+            self._warn("tools", "could not tell which tools Hermes offers now", exc_info=True)
+            return set(), {}
 
     def name_phrase(self, child_turn_id: str, phrase: str) -> None:
         """The phrase `phrase` runs as `child_turn_id` (its name in a later message's waiting line)."""

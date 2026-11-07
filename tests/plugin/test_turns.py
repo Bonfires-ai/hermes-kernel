@@ -200,7 +200,7 @@ def test_register_hooks_on_the_general_path_only(monkeypatch):
     canon = plugin._canonical().shared  # register delegates to the one canonical copy
     plugin.register(Ctx(True))
     plugin.register(memory)
-    assert set(general.hooks) == {"pre_gateway_dispatch", "pre_llm_call"}
+    assert set(general.hooks) == {"pre_gateway_dispatch", "pre_llm_call", "post_tool_call"}
     assert memory.hooks == {} and memory.provider is not None
     assert canon.get_shared().turns is not None
     canon.reset_shared()
@@ -267,6 +267,12 @@ def test_a_failing_source_does_not_lose_the_block(env):
     session(env)
 
     class Source:
+        def unavailable(self):
+            return set()
+
+        def real_names(self):
+            return {}
+
         def sync_soon(self):
             raise RuntimeError("boom")
 
@@ -335,3 +341,16 @@ def test_a_voice_message_is_matched_by_its_sender(env):
     turns.on_gateway_dispatch(event("", message_id="m1"))
     turns.on_pre_llm_call(**hook(turn_id="h1", user_message="what I said aloud", sender_id="U1"))
     assert client.calls[0][0]["message_id"] == "m1"
+
+
+def test_a_tool_hermes_does_not_offer_now_is_left_out_and_a_short_name_is_called_by_its_real_one():
+    from plugin.turns import frames_block
+
+    view = {
+        "frames": [{"name": "x", "complete": True}],
+        "native": ["web_search", "lookup"],
+        "affordances": ["web_search", "lookup"],
+    }
+    block = frames_block(view, hidden={"web_search"}, natively={"lookup": "mcp__srv__lookup"})
+    assert "web_search" not in block
+    assert "lookup (call it as mcp__srv__lookup)" in block

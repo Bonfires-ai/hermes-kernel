@@ -50,16 +50,30 @@ def register(ctx) -> None:
 
     get_shared()
     if hasattr(ctx, "dispatch_tool"):
+        from . import guide
+        from .agent_source import AgentSource, HermesRegistry, load_read_only
+        from .call_log import CallLog
         from .turns import KernelTurns
 
         shared = get_shared()
         with shared.lock:
             if shared.turns is None and shared.client is not None:
-                shared.turns = KernelTurns(shared.client)
-            turns = shared.turns
+                try:
+                    read_only, params = load_read_only()
+                except (OSError, ValueError):
+                    log.exception("hermes-kernel: the read-only tools file is unreadable; phrases have only think")
+                    read_only, params = set(), {}
+                source = AgentSource(shared.client, HermesRegistry(), read_only, params=params)
+                call_log = CallLog(source)
+                shared.source = source
+                shared.call_log = call_log
+                shared.editor = guide.Editor(source, guide.load())
+                shared.turns = KernelTurns(shared.client, source=source, call_log=call_log)
+            turns, call_log = shared.turns, shared.call_log
         if turns is not None:
             ctx.register_hook("pre_gateway_dispatch", turns.on_gateway_dispatch)
             ctx.register_hook("pre_llm_call", turns.on_pre_llm_call)
-        log.info("hermes-kernel loaded (general path)")  # tools and commands arrive in later tasks
+            ctx.register_hook("post_tool_call", call_log.on_post_tool_call)
+        log.info("hermes-kernel loaded (general path)")  # phrase tools and commands arrive in later tasks
         return
     ctx.register_memory_provider(KernelMemory())

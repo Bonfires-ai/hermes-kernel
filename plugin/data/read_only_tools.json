@@ -1,0 +1,8 @@
+{
+  "about": "Hermes tools that read and change nothing, by their registry names (an MCP tool is mcp__<server>__<tool>). Only these go into the kernel's catalogue, so a taught phrase can use them as steps. A tool runs as a step only while Hermes offers it to the model: one in a disabled toolset, one whose availability check fails, or one that is not registered is left out. A step gives the tool's required text parameters, or the ones `params` names. A tool that changes anything never belongs here. Add a name to allow another read-only tool.",
+  "tools": [
+    { "name": "web_search" },
+    { "name": "session_search", "params": ["query"] },
+    { "name": "vision_analyze" }
+  ]
+}

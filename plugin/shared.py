@@ -28,6 +28,10 @@ class Shared:
         self.made_capture: Capture | None = None
         #: the turn reader, built by the general path's `register`; None before, or with no client
         self.turns: Any = None
+        #: the tool catalogue, its call log and the step editor, built with the turn reader; None before
+        self.source: Any = None
+        self.call_log: Any = None
+        self.editor: Any = None
 
     def capture(self, spool_path: Path) -> Capture | None:
         """The one Capture, made on first call (it starts no thread until first use). None without a client."""
