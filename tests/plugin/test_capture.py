@@ -158,3 +158,102 @@ def test_nothing_runs_until_the_first_turn_and_the_worker_sends(tmp_path):
     assert client.arrived.wait(5)
     cap.shutdown()
     assert len(client.sent) == 2
+
+
+def test_a_lone_surrogate_reaches_the_service_as_valid_text(tmp_path):
+    cap, client, _ = make(tmp_path)
+    turn(cap, user="bad \ud800 text")
+    turn(cap, n=2)
+    while cap.backlog:
+        assert cap.drain_once()
+    assert len(client.sent) == 4
+    client.sent[0]["text"].encode("utf-8")  # does not raise
+
+
+def test_a_poison_batch_is_dropped_and_later_turns_still_send(tmp_path):
+    cap, client, _ = make(tmp_path)
+    real = client.post_messages
+
+    def post(batch, agent_handles, *, timeout=30.0):
+        if any("\ud800" in m["text"] for m in batch):
+            raise UnicodeEncodeError("utf-8", "x", 0, 1, "surrogates not allowed")
+        return real(batch, agent_handles)
+
+    client.post_messages = post
+    cap.set_agent_handle("hermes")
+    cap._enqueue([{"kind": "message", "handle": "hermes", "message": {"text": "\ud800"}}])  # pyright: ignore
+    turn(cap, n=2)
+    assert cap.drain_once()  # the poison item, alone at the head
+    assert cap.last_error and "UnicodeEncodeError" in cap.last_error
+    while cap.backlog:
+        assert cap.drain_once()
+    assert [m["text"] for m in client.sent] == ["hello", "hi there"]
+
+
+def test_a_batch_with_one_refused_message_delivers_the_others(tmp_path):
+    cap, client, _ = make(tmp_path)
+    real = client.post_messages
+
+    def post(batch, agent_handles, *, timeout=30.0):
+        if any(m["text"] == "bad" for m in batch):
+            raise Refused(422, "nope")
+        return real(batch, agent_handles)
+
+    client.post_messages = post
+    turn(cap, n=1)
+    turn(cap, n=2, user="bad")
+    turn(cap, n=3)
+    while cap.backlog:
+        assert cap.drain_once()
+    assert [m["text"] for m in client.sent] == ["hello", "hi there", "hi there", "hello", "hi there"]
+    assert cap.last_error and "422" in cap.last_error
+
+
+def test_a_409_keeps_the_batch_and_retries(tmp_path):
+    cap, client, spool = make(tmp_path)
+    client.error = Refused(409, "busy")
+    turn(cap)
+    assert not cap.drain_once()
+    assert cap.backlog == 2 and spool.exists()
+    client.error = None
+    assert cap.drain_once() and len(client.sent) == 2
+
+
+def test_a_dead_worker_is_replaced_on_the_next_turn(tmp_path):
+    client = FakeClient()
+    cap = Capture(client, tmp_path / "s.jsonl", agent_handle="hermes", clock=lambda: T0)
+    dead = threading.Thread(target=lambda: None)
+    dead.start()
+    dead.join()
+    cap._thread = dead
+    turn(cap)
+    assert cap._thread is not dead
+    assert client.arrived.wait(5)
+    cap.shutdown()
+
+
+def test_an_unreadable_spool_is_left_byte_identical_through_an_outage(tmp_path, monkeypatch):
+    spool = tmp_path / "spool.jsonl"
+    spool.write_bytes(b'{"kind": "close", "conversation_id": "old"}\n')
+    before = spool.read_bytes()
+    monkeypatch.setattr("plugin.spool.Spool.load", lambda self: None)
+    cap, client, _ = make(tmp_path)
+    client.error = Unavailable("down")
+    turn(cap)
+    cap.drain_once()
+    assert spool.read_bytes() == before
+    assert cap.last_error and "spool.jsonl" in cap.last_error
+    client.error = None
+    cap.drain_once()
+    assert spool.read_bytes() == before
+    assert cap.last_error and "spool.jsonl" in cap.last_error
+
+
+def test_a_turn_without_a_conversation_is_skipped_and_empty_names_are_filled(tmp_path):
+    cap, client, _ = make(tmp_path)
+    cap.turn("", "Kira", "hello", "hi", session_id="s", turn_number=1)
+    assert cap.backlog == 0
+    cap.set_agent_handle("")
+    cap.turn("c", "", "hello", "hi", session_id="s", turn_number=2)
+    cap.drain_once()
+    assert [m["speaker"] for m in client.sent] == ["user", "hermes"]

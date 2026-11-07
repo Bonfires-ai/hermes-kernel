@@ -36,6 +36,8 @@ SHUTDOWN_FLUSH_S = 5.0
 #: bounds the spool; the writer splits long text itself, so nothing shorter is cut
 TEXT_MAX_CHARS = 100_000
 
+#: a 4xx that is the service's trouble, not the message's
+TRANSIENT_STATUSES = frozenset({408, 409, 429})
 TOKEN_HINT = "the turn service rejected the token: check HERMES_KERNEL_TOKEN"
 
 
@@ -95,6 +97,7 @@ class Capture:
         self._drop_logged = False
         self._logged_error: str | None = None
         self.last_error: str | None = None
+        self._spool_error: str | None = None
 
     # public
 
@@ -117,8 +120,12 @@ class Capture:
         turn_number: int,
     ) -> None:
         """Queue the user's message and the reply (an empty one is skipped). Never blocks on the network."""
+        if not conversation_id:
+            logger.warning("hermes-kernel: skipped a turn with no conversation id")
+            return
         now = self._clock()
-        handle = self._handle
+        handle = self._handle or "hermes"
+        speaker = speaker or "user"
         items: list[dict[str, Any]] = []
         for role, who, text, addressee, when in (
             ("user", speaker, user_text, handle, now),
@@ -126,7 +133,7 @@ class Capture:
         ):
             if not text.strip():
                 continue
-            text = text[:TEXT_MAX_CHARS]
+            text = text[:TEXT_MAX_CHARS].encode("utf-8", "replace").decode("utf-8")  # no lone surrogates
             message = {
                 "conversation_id": conversation_id,
                 "message_id": message_id(conversation_id, session_id, turn_number, role, text),
@@ -195,7 +202,7 @@ class Capture:
 
     def _spawn(self) -> None:
         with self._lock:
-            if self._thread is None and not self._stop.is_set():
+            if (self._thread is None or not self._thread.is_alive()) and not self._stop.is_set():
                 self._thread = threading.Thread(target=self._run, name="hermes-kernel-capture", daemon=True)
                 self._thread.start()
 
@@ -205,6 +212,10 @@ class Capture:
             return
         loaded = self._spool.load()
         if loaded is None:
+            self._spool_error = f"the capture spool at {self._spool.path} could not be read; it is left alone"
+            self.last_error = self._spool_error
+            logger.warning("hermes-kernel: %s, and captures are kept in memory only", self._spool_error)
+            self._spool = None
             return
         payloads, skipped = loaded
         valid = [p for p in payloads if p.get("kind") in ("message", "close")]
@@ -228,18 +239,20 @@ class Capture:
         while not self._stop.is_set():
             try:
                 ok = self.drain_once()
-            except Exception:  # the worker must outlive anything
+                with self._lock:
+                    empty = not self._queue
+                if self._flushing and (empty or not ok):
+                    return
+                if ok and empty:
+                    self._wake.wait()
+                    self._wake.clear()
+                elif not ok:
+                    self._wake.wait(self._backoff)
+                    self._wake.clear()
+            except Exception:  # noqa: BLE001 - only the stop signal ends the worker
                 logger.exception("hermes-kernel: capture worker error")
-                ok = False
-            with self._lock:
-                empty = not self._queue
-            if self._flushing and (empty or not ok):
-                return
-            if ok and empty:
-                self._wake.wait()
-                self._wake.clear()
-            elif not ok:
-                self._wake.wait(self._backoff)
+                self.last_error = "capture worker error; see the log"
+                self._wake.wait(BACKOFF_MAX_S)
                 self._wake.clear()
 
     def drain_once(self) -> bool:
@@ -249,23 +262,48 @@ class Capture:
             if not self._queue:
                 return True
             batch = self._next_batch()
-        last_seq = batch[-1][0]
+        kind, error = self._try(batch)
+        if kind == "ok":
+            self._delivered(batch[-1][0])
+            return True
+        if kind != "drop":
+            self._failed(error, at_cap=kind == "token")
+            return False
+        if len(batch) == 1:
+            self._drop(batch[0][0], 1, error)
+            return True
+        dropped = ""
+        for item in batch:  # a permanent refusal of the batch: find the item(s) at fault
+            kind, error = self._try([item])
+            if kind == "ok":
+                self._delivered(item[0])
+            elif kind == "drop":
+                self._drop(item[0], 1, error)
+                dropped = error
+            else:
+                self._failed(error, at_cap=kind == "token")
+                return False
+        if dropped:
+            self.last_error = f"{dropped}; {self._spool_error}" if self._spool_error else dropped
+        return True
+
+    def _try(self, batch: list[Item]) -> tuple[str, str]:
+        """One send: ("ok" | "hold" | "token" | "drop", what to tell a person)."""
         try:
             self._send(batch)
         except Unauthorized:
-            self._failed(TOKEN_HINT, at_cap=True)
-            return False
+            return "token", TOKEN_HINT
         except Unavailable as exc:
-            self._failed(f"turn service unavailable: {exc.detail}")
-            return False
+            return "hold", f"turn service unavailable: {exc.detail}"
         except Refused as exc:
-            self._refused(last_seq, len(batch), exc)
-            return True
-        except Exception as exc:  # noqa: BLE001 - nothing may escape the worker
-            self._failed(f"capture failed: {type(exc).__name__}: {exc}")
-            return False
-        self._delivered(last_seq)
-        return True
+            if exc.status in TRANSIENT_STATUSES:
+                return "hold", f"turn service busy ({exc.status}): {exc.detail}"
+            return "drop", f"the turn service refused captured items with {exc.status}: {exc.detail}"
+        except (ValueError, TypeError) as exc:  # cannot be encoded: it never will be
+            return "drop", f"a captured item could not be sent: {type(exc).__name__}: {exc}"
+        except Exception as exc:  # noqa: BLE001 - unexpected: keep the data and retry
+            return "hold", f"capture failed: {type(exc).__name__}: {exc}"
+        return "ok", ""
 
     def _next_batch(self) -> list[Item]:
         first = self._queue[0]
@@ -301,15 +339,15 @@ class Capture:
         self._backoff = BACKOFF_START_S
         self._drop_logged = False
         self._logged_error = None
-        self.last_error = None
+        self.last_error = self._spool_error
 
-    def _refused(self, last_seq: int, count: int, exc: Refused) -> None:
+    def _drop(self, last_seq: int, count: int, error: str) -> None:
         self._remove_through(last_seq)
-        self.last_error = f"the turn service refused {count} captured item(s) with {exc.status}: {exc.detail}"
-        logger.warning("hermes-kernel: dropped %d captured item(s), the service refused them: %s", count, exc.detail)
+        self.last_error = f"{error}; {self._spool_error}" if self._spool_error else error
+        logger.warning("hermes-kernel: dropped %d captured item(s): %s", count, error)
 
     def _failed(self, error: str, *, at_cap: bool = False) -> None:
-        self.last_error = error
+        self.last_error = f"{error}; {self._spool_error}" if self._spool_error else error
         if error != self._logged_error:
             self._logged_error = error
             logger.warning("hermes-kernel: capture is holding %d item(s): %s", self.backlog, error)
