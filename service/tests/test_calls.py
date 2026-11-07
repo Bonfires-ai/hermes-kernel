@@ -12,7 +12,7 @@ from kernel_turns.store import MemoryTurnStore
 from kernel_turns.turns import TurnEngine
 from tests.fakes import CATALOGUE, FakeMk, Script, frame, team_turn
 
-MAKE = {"title": "onboard josh"}
+MAKE = {"title": "onboard sam"}
 PARTIAL_MAKE = Script(steps=[], partial=True, frames=[frame("make", title=None)])
 TRIAGE_ROW: dict[str, JsonValue] = {
     "id": "triage.d2.0",
@@ -40,9 +40,9 @@ async def _engine(mk: FakeMk, groups: SingleBonfire) -> tuple[TurnEngine, Memory
 
 
 async def test_call_admits_an_afforded_verb(groups: SingleBonfire) -> None:
-    mk = FakeMk({"make onboard josh": PARTIAL_MAKE})
+    mk = FakeMk({"make onboard sam": PARTIAL_MAKE})
     engine, store = await _engine(mk, groups)
-    view = await engine.begin(team_turn("make onboard josh"))
+    view = await engine.begin(team_turn("make onboard sam"))
     called = await engine.call(view.turn_id, "make", MAKE)
     step = called.step
     assert called.kind == "step" and step is not None
@@ -63,20 +63,20 @@ async def test_a_confirm_consent_verb_waits_for_the_board(groups: SingleBonfire)
 
 
 async def test_repeat_call_returns_the_first_result(groups: SingleBonfire) -> None:
-    mk = FakeMk({"make onboard josh": PARTIAL_MAKE})
+    mk = FakeMk({"make onboard sam": PARTIAL_MAKE})
     engine, store = await _engine(mk, groups)
-    view = await engine.begin(team_turn("make onboard josh"))
+    view = await engine.begin(team_turn("make onboard sam"))
     first = await engine.call(view.turn_id, "make", MAKE)
     assert first.step is not None
-    again = await engine.call(view.turn_id, "make", {"title": "onboard josh"})
+    again = await engine.call(view.turn_id, "make", {"title": "onboard sam"})
     assert again.kind == "step" and again.step == first.step  # not committed yet: the same step, the same key
-    ticket = {"id": "JUJ-9", "title": "onboard josh"}
+    ticket = {"id": "JUJ-9", "title": "onboard sam"}
     await engine.report(view.turn_id, first.step.step_id, "committed", ticket)
     done = await engine.call(view.turn_id, "make", MAKE)
     assert done.kind == "done" and done.value == ticket
 
     # the message is delivered again after its calls committed: the same turn, the same first result
-    redelivered = await engine.begin(team_turn("make onboard josh"))
+    redelivered = await engine.begin(team_turn("make onboard sam"))
     assert redelivered.turn_id == view.turn_id
     done = await engine.call(redelivered.turn_id, "make", MAKE)
     assert done.kind == "done" and done.value == ticket
@@ -88,9 +88,9 @@ async def test_repeat_call_returns_the_first_result(groups: SingleBonfire) -> No
 
 
 async def test_a_declined_call_is_final_and_a_tool_error_may_run_again(groups: SingleBonfire) -> None:
-    mk = FakeMk({"make onboard josh": PARTIAL_MAKE})
+    mk = FakeMk({"make onboard sam": PARTIAL_MAKE})
     engine, _ = await _engine(mk, groups)
-    view = await engine.begin(team_turn("make onboard josh"))
+    view = await engine.begin(team_turn("make onboard sam"))
     first = await engine.call(view.turn_id, "make", MAKE)
     assert first.step is not None
     await engine.report(view.turn_id, first.step.step_id, "tool_error", None, "the tap is down")
@@ -104,9 +104,9 @@ async def test_a_declined_call_is_final_and_a_tool_error_may_run_again(groups: S
 
 
 async def test_direct_report_writes_the_ledger_only(groups: SingleBonfire) -> None:
-    mk = FakeMk({"make onboard josh": PARTIAL_MAKE})
+    mk = FakeMk({"make onboard sam": PARTIAL_MAKE})
     engine, store = await _engine(mk, groups)
-    view = await engine.begin(team_turn("make onboard josh"))
+    view = await engine.begin(team_turn("make onboard sam"))
     called = await engine.call(view.turn_id, "make", MAKE)
     assert called.step is not None
     after = await engine.report(view.turn_id, called.step.step_id, "committed", {"id": "JUJ-9"})

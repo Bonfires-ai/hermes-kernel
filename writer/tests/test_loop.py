@@ -14,7 +14,7 @@ from hermes_writer.loop import run_once
 from hermes_writer.queue import Claimed, Queue
 
 T0 = datetime(2026, 11, 1, tzinfo=UTC)
-KEY = "sk-or-very-secret-value"
+KEY = "or-very-secret-value"
 
 
 @pytest.fixture

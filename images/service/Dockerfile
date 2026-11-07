@@ -10,8 +10,8 @@ ENV PYTHONUNBUFFERED=1 \
 COPY service /tmp/service
 RUN pip install /tmp/service && rm -rf /tmp/service
 
-RUN useradd --create-home --uid 10002 kturns
+RUN useradd --create-home --home-dir /srv/kturns --uid 10002 kturns
 USER kturns
-WORKDIR /home/kturns
+WORKDIR /srv/kturns
 EXPOSE 8000
 CMD ["python", "-m", "kernel_turns"]

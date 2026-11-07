@@ -98,9 +98,9 @@ def test_a_phrase_called_is_not_open() -> None:
 
 
 async def test_a_group_with_no_catalogue_still_has_frames(groups: SingleBonfire) -> None:
-    mk = FakeMk({"make onboard josh": Script(steps=[], partial=True, frames=[frame("make", title=None)])})
+    mk = FakeMk({"make onboard sam": Script(steps=[], partial=True, frames=[frame("make", title=None)])})
     engine = TurnEngine(mk, MemoryTurnStore(), groups)
-    view = await engine.begin(team_turn("make onboard josh"))
+    view = await engine.begin(team_turn("make onboard sam"))
     assert view.affordances == ["make"]  # the fake kernel has no tools installed either
     cli = await engine.begin(cli_turn("hello"))
     assert cli.affordances == [] and cli.status == "unread"
