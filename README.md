@@ -25,14 +25,14 @@ messages and runs.
 
 ```bash
 git clone https://github.com/Bonfires-ai/hermes-kernel && cd hermes-kernel
-export OPENROUTER_API_KEY=...   # or leave them out and the script asks, with the input hidden
+export OPENROUTER_API_KEY=...   # in a terminal you can leave them out and the script asks, input hidden
 export VOYAGE_API_KEY=...
 ./install.sh
 ```
 
 `install.sh` sets up the local stack and the plugin in one go. It builds and starts the stack, installs the plugin into
 your Hermes, gives the plugin its token and the stack's URL, and enables it. What it asks you for are the OpenRouter and
-Voyage keys, and only if they are not in your environment or in `.env` already; keys are never taken from the command
+Voyage keys, and only if they are not in your environment or in `.env` already, and only in a terminal (without one it stops and says which are missing); keys are never taken from the command
 line. It makes a `.env` from `.env.example` with a fresh `NEO4J_PASSWORD` and `KT_TOKEN` (the bearer token Hermes uses to
 talk to the stack), mode 0600.
 

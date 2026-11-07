@@ -18,7 +18,7 @@
 #
 # Settings (all optional except E2E_CONFIRM):
 #   E2E_PROJECT          compose project name, must start with hermes-kernel-e2e   (hermes-kernel-e2e)
-#   E2E_OVERRIDE         one extra compose file                      (none)
+#   E2E_OVERRIDE         a compose file that REPLACES compose.yaml, for install.sh and every dc call  (none)
 #   E2E_PLUGIN_SOURCE    what install.sh gives `hermes plugins install`   (empty: install.sh picks this checkout's HEAD)
 #   E2E_HERMES           the hermes command                          (hermes)
 #   E2E_PYTHON           a python that has pexpect                   (python3)
@@ -144,7 +144,7 @@ avail_mb="$(awk '/MemAvailable/ {print int($2 / 1024)}' /proc/meminfo)"
 FILES=(-f compose.yaml)
 if [ -n "${E2E_OVERRIDE:-}" ]; then
   [ -f "$E2E_OVERRIDE" ] || die "E2E_OVERRIDE '$E2E_OVERRIDE' is not a file."
-  FILES+=(-f "$E2E_OVERRIDE")
+  FILES=(-f "$E2E_OVERRIDE")   # replaces compose.yaml, as install.sh --compose-file does
 fi
 dc() { docker compose -p "$PROJECT" "${FILES[@]}" "$@"; }
 
@@ -290,6 +290,8 @@ INSTALL=(./install.sh --mode local --hermes "$HERMES" --project "$PROJECT")
 [ "$BUILD" != "no" ] || INSTALL+=(--no-build)
 [ -z "$PLUGIN_SOURCE" ] || INSTALL+=(--plugin-source "$PLUGIN_SOURCE")
 "${INSTALL[@]}" || fail "install.sh failed"
+grep -qxF "HERMES_KERNEL_TOKEN=$KT_TOKEN_VALUE" "$HERMES_HOME/.env" || fail "1. install.sh did not put this run's token in the Hermes .env"
+grep -qF "http://127.0.0.1:$PORT" "$HERMES_HOME/hermes-kernel.json" 2>/dev/null || fail "1. install.sh did not write the local URL to hermes-kernel.json"
 echo "install.sh done in $(( $(now) - t0 )) s; the kernel has spent $(spend) USD"
 "$HERMES" config set model.provider openrouter >/dev/null
 "$HERMES" config set model.default "$MODEL" >/dev/null
