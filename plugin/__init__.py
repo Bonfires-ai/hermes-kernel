@@ -42,6 +42,19 @@ def _canonical() -> ModuleType:
         return mod
 
 
+def _ledger_path() -> Path | None:
+    """The step ledger's file under Hermes's home; `None` when Hermes cannot say (the ledger then fences everything)."""
+    try:
+        from hermes_constants import get_hermes_home  # pyright: ignore[reportMissingImports]
+
+        from .runs import LEDGER_FILENAME
+
+        return Path(str(get_hermes_home())) / LEDGER_FILENAME
+    except Exception:  # noqa: BLE001 — no home: the ledger has no file and fails closed
+        log.warning("hermes-kernel: Hermes's home is unknown; phrase results are not kept across a restart")
+        return None
+
+
 def register(ctx) -> None:
     if __name__ != _CANON:
         return _canonical().register(ctx)
@@ -74,12 +87,9 @@ def register(ctx) -> None:
                 shared.editor = guide.Editor(source, guide.load())
                 shared.turns = KernelTurns(shared.client, source=source, call_log=call_log)
             if shared.tools is None and shared.turns is not None and shared.client is not None:
-                # the ledger gets its file under Hermes's home from the first session that has one (`PhraseRun.bind`)
-                shared.runs = PhraseRun(
-                    shared.client, shared.source, getattr(ctx, "dispatch_tool", None), StepLedger(None)
-                )
+                shared.runs = PhraseRun(shared.client, shared.source, ctx.dispatch_tool, StepLedger(_ledger_path()))
                 shared.tools = new_tools = KernelTools(
-                    shared.client, shared.turns, shared.runs, shared.call_log, shared.source, shared.editor
+                    shared.client, shared.turns, shared.runs, shared.source, shared.editor
                 )
             turns, call_log = shared.turns, shared.call_log
         if turns is not None:

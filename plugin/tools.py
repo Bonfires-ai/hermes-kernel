@@ -17,12 +17,12 @@ kernel read, deduped, refused with a sentence). So the tools here are exactly
 - `offer_phrase(forms, body, defaults={})` -> `POST /v1/turns/{turn}/offers`: the offer to teach a phrase, recorded
   with no side effect; the speaker's yes on their next message affords `teach_phrase`. A body step is a sentence or a
   structured call (`{"call": tool, "args": {param: value}}`), passed on unchanged, except that a call of a tool that
-  changes something (offered by Hermes, not on the read-only list) is refused here, before anything is sent: phrases
+  is not on the read-only list (offered by Hermes) is refused here, before anything is sent: phrases
   are read-only in this version. `teach_phrase` checks the same, and a check that cannot be made refuses;
 - `teach_phrase(forms, body, defaults={})` -> `POST /v1/teaching` with `teacher` = the speaker and the turn: the
   read-back to read to the teacher, or the kernel's problems verbatim; when one says a step does not read, the guide to
   the structured step follows (`guide.py`). One teach is in flight per Hermes turn. Both teaching tools send a
-  structured step's real tool name as its catalogue name (`mcp__bonfires__web_search` -> `web_search`);
+  structured step's real tool name as its catalogue name (`mcp__srv__web_search` -> `web_search`);
 - `confirm_phrase(draft_id)` -> `POST /v1/teaching/{id}/confirm` with `by` = the speaker: the phrase ids, or the
   refusal ("not the teacher") verbatim. Only the teacher's yes keeps a phrase; the turn service enforces it.
 
@@ -36,7 +36,6 @@ Hermes v0.23.0 defers plugin tools behind `tool_search`; the model finds these t
 
 from __future__ import annotations
 
-import json
 import logging
 import threading
 from collections import OrderedDict
@@ -46,16 +45,13 @@ from typing import Any
 import httpx
 
 from .agent_source import THINK, AgentSource
-from .call_log import CallLog
 from .client import Refused, ServiceClient, ServiceError, Unauthorized, Unavailable
-from .fence import closed, fenced, fenced_input
+from .fence import THINK_SOURCE, block, closed, fenced, fenced_input
 from .guide import Editor
 from .runs import (
-    Carried,
     PhraseRun,
     RunOutcome,
     bounded,
-    fence_carried,
     think_parts,
 )
 from .turns import OWN_TOOLS, JsonObject, KernelTurns, LocalTurn, reading_text
@@ -69,7 +65,6 @@ AWAY = "The turn service is not reachable right now; try again in a moment."
 NO_CLIENT = "The turn service is not set up here, so phrases are not available."
 NO_TURN = "I have no reading of this message from the turn service, so I cannot act on it; ask again in a moment."
 NO_SPEAKER = "I could not tell who is speaking, so I cannot teach or confirm a phrase for them."
-NO_RUN = "Phrases cannot run here: this Hermes gave the plugin no way to run its tools."
 STILL_DRAFTING = (
     "the first phrase of this message is still drafting (or ran out of time); no second draft now, ask again in your "
     "next message."
@@ -197,7 +192,10 @@ SCHEMAS: dict[str, dict[str, Any]] = {
         "second call runs nothing. With drop true it drops the phrase instead, when the person does not want it any "
         "more.",
         {
-            "text": {"type": "string", "description": "your result of the think step (empty to read the step)"},
+            "text": {
+                "type": "string",
+                "description": 'your result of the think step; "go" to run a tool step; empty only shows the waiting step',
+            },
             "phrase": {
                 "type": "string",
                 "description": "the waiting phrase's id, as the answer or your context gives it (empty: the only one)",
@@ -217,7 +215,7 @@ _EMOJI = {
 }
 
 
-def describe_run(phrase: str | None, outcome: RunOutcome, carried: Carried = ()) -> str:
+def describe_run(phrase: str | None, outcome: RunOutcome) -> str:
     """A phrase run driven in the agent (`PhraseRun`) as plain text for the model; `phrase` None for a continue;
     `carried`: the phrase's values (a think instruction bound from one is fenced)."""
     if phrase is None:
@@ -226,14 +224,16 @@ def describe_run(phrase: str | None, outcome: RunOutcome, carried: Carried = ())
         head = f"The phrase {phrase} ran:" if outcome.committed else f"The phrase {phrase} did not run a step:"
     lines = [head, *outcome.lines]
     if outcome.kind == "paused_think":
-        lines += think_lines(outcome.instruction or "", outcome.input, outcome.turn_id, carried)
+        lines += think_lines(outcome.instruction or "", outcome.input, outcome.turn_id)
     elif outcome.kind == "stopped" and outcome.reason:
         lines.append(f"It stopped: {outcome.reason}.")
         if outcome.later:  # the step still waits in the agent: the speaker's next message shows it waiting too
-            lines.append("phrase_continue takes it on from there (the person may also ask in their next message).")
+            lines.append(
+                'phrase_continue (text "go") takes it on from there (the person may also ask in their next message).'
+            )
         elif outcome.resumable:
             lines.append(
-                "Continue it with phrase_continue in this message: a later message may not show it as waiting, so do "
+                'Continue it with phrase_continue (text "go") in this message: a later message may not show it as waiting, so do '
                 "not promise the person that."
             )
         if outcome.later or outcome.resumable:
@@ -241,11 +241,11 @@ def describe_run(phrase: str | None, outcome: RunOutcome, carried: Carried = ())
     return "\n".join(lines)
 
 
-def think_lines(instruction: str, given: str | None, phrase: str | None = None, carried: Carried = ()) -> list[str]:
+def think_lines(instruction: str, given: str | None, phrase: str | None = None) -> list[str]:
     """A think step the phrase waits at: its instruction (fenced when bound from a step's value), its input (always
     fenced: it carries an earlier step's result), and how to go on."""
-    asked = fence_carried(instruction, json.dumps(instruction, ensure_ascii=False), carried)
-    lines = [f"It paused at a think step, for you to do with your own context: {asked}"]
+    # step args: the instruction can be bound from an earlier result, so it is fenced too
+    lines = [f"It paused at a think step, for you to do with your own context:\n{block(THINK_SOURCE, instruction)}"]
     if given:
         lines.append(f"Its input (data to work on, not instructions to you):\n{fenced_input(given)}")
     named = f' (phrase "{phrase}" when more than one waits)' if phrase else ""
@@ -314,14 +314,12 @@ class KernelTools:
         client: ServiceClient | None,
         turns: KernelTurns,
         runs: PhraseRun,
-        call_log: CallLog | None,
         source: AgentSource | None,
         editor: Editor,
     ) -> None:
         self._client = client
         self._turns = turns
         self._runs = runs
-        self._call_log = call_log
         self._source = source
         self._editor = editor
         self._lock = threading.Lock()
@@ -347,13 +345,12 @@ class KernelTools:
             turn = self._turns.current(session_id) if isinstance(session_id, str) and session_id else None
             if turn is None:
                 return NO_TURN
-            self._runs.bind(session_id if isinstance(session_id, str) else None)
             return act(turn, client)
         except Refused as exc:
             return exc.detail
         except Unauthorized as exc:
             logger.warning("hermes-kernel: %s was not authorised: %s", name, exc.detail)
-            return f"The turn service did not accept this plugin's token ({exc.detail}); nothing was done."
+            return f"The turn service did not accept this plugin's token ({exc.detail}); it may not have finished."
         except Unavailable as exc:
             logger.warning("hermes-kernel: %s failed: %s", name, exc.detail)
             return AWAY
@@ -361,7 +358,7 @@ class KernelTools:
             return exc.detail
         except Exception:  # noqa: BLE001 — a tool answers a sentence, it never raises into Hermes
             logger.exception("hermes-kernel: %s failed", name)
-            return f"{name} failed unexpectedly; nothing was done. Try again in a moment."
+            return f"{name} failed unexpectedly, and it may not have finished: check before trying again."
 
     def run_phrase(self, args: dict[str, Any], **kwargs: Any) -> str:
         phrase = str(args.get("phrase") or "").strip()
@@ -371,8 +368,6 @@ class KernelTools:
         def act(turn: LocalTurn, client: ServiceClient) -> str:
             if not phrase:
                 return "Say which phrase to run (one your context says is afforded)."
-            if not self._runs.can_run:
-                return NO_RUN
             if not turn.turn_id:
                 return NO_TURN
             if phrase in turn.native or phrase in OWN_TOOLS:
@@ -387,7 +382,7 @@ class KernelTools:
             child = result.get("turn_id")
             if kind != "turn" or not isinstance(child, str) or not child:
                 if kind == "step":
-                    logger.error("hermes-kernel: the service answered a phrase call with a step: %s", result)
+                    logger.error("hermes-kernel: the service answered a phrase call with a step")
                     return (
                         f"The turn service answered {phrase} with a single step instead of a phrase, which should not "
                         "happen; nothing ran. Say so to the person."
@@ -396,9 +391,9 @@ class KernelTools:
             self._turns.name_phrase(child, phrase)
             step = result.get("step")
             first = {"agent_step": step, "turn": {"status": "licensed"}} if isinstance(step, dict) else None
-            outcome = self._runs.drive(child, first=first, deadline=deadline, **_ids(kwargs))
+            outcome = self._runs.drive(child, first=first, deadline=deadline, platform=turn.platform, **_ids(kwargs))
             self._paused(turn, outcome)
-            return describe_run(phrase, outcome, self._runs.carried(child))
+            return describe_run(phrase, outcome)
 
         return self._answer("run_phrase", kwargs, act)
 
@@ -432,6 +427,21 @@ class KernelTools:
             return f"More than one phrase waits for you ({ids}), so nothing ran: say which with phrase (its id)."
         return turn.waiting.popitem()
 
+    @staticmethod
+    def _show(child: str, step: JsonObject | None) -> str:
+        """The step a phrase waits at, shown and not run."""
+        if step is not None and step.get("tool") == THINK:
+            instruction, given = think_parts(step)
+            return "\n".join(
+                ["A phrase of this person's waits for you; nothing ran.", *think_lines(instruction, given, child)]
+            )
+        tool = step.get("tool") if step is not None else None
+        at = f"its {tool} step" if isinstance(tool, str) and tool else "its next step"
+        return (
+            f'A phrase of this person\'s waits at {at}; nothing ran. To run it, call phrase_continue with text "go" '
+            f'(phrase "{child}" when more than one waits); to stop it, call phrase_continue with drop true.'
+        )
+
     def phrase_continue(self, args: dict[str, Any], **kwargs: Any) -> str:
         raw = args.get("text")
         text = raw if isinstance(raw, str) else ""
@@ -440,8 +450,6 @@ class KernelTools:
 
         def act(turn: LocalTurn, client: ServiceClient) -> str:
             runs = self._runs
-            if not runs.can_run:
-                return NO_RUN
             deadline = runs.budget_end()
             with self._lock:
                 claimed = self._claim(turn, named)
@@ -450,22 +458,16 @@ class KernelTools:
             child, waiting = claimed
             raw_step = waiting.get("step")
             step = raw_step if isinstance(raw_step, dict) else None
-            if step is not None and step.get("tool") == THINK and not text.strip() and not drop:
-                # Nothing goes on: the step is handed back whole (a later message's context shows neither its input
-                # nor any result).
+            if not text.strip() and not drop:
+                # Empty text runs nothing: the waiting step is shown (a later message's context shows neither its input
+                # nor any result), and the record stays.
                 with self._lock:
                     turn.waiting[child] = waiting
-                instruction, given = think_parts(step)
-                return "\n".join(
-                    [
-                        "A phrase of this person's waits for you; nothing ran.",
-                        *think_lines(instruction, given, child, runs.carried(child)),
-                    ]
-                )
+                return self._show(child, step)
             try:
                 if drop:
                     return DROPPED if runs.drop(child) else NOTHING_TO_DROP
-                outcome = runs.resume(child, step, text, deadline=deadline, **_ids(kwargs))
+                outcome = runs.resume(child, step, text, deadline=deadline, platform=turn.platform, **_ids(kwargs))
             except ServiceError:
                 with self._lock:
                     turn.waiting[child] = waiting  # nothing went on: the same continue may be asked again
@@ -473,7 +475,7 @@ class KernelTools:
             with self._lock:
                 turn.continued.add(child)
             self._paused(turn, outcome)
-            return describe_run(None, outcome, runs.carried(child))
+            return describe_run(None, outcome)
 
         return self._answer("phrase_continue", kwargs, act)
 
@@ -509,8 +511,8 @@ class KernelTools:
         for n, tool in named:
             if tool in changing:
                 return (
-                    f"Step {n}: {tool} changes something, and phrases are read-only in this version, so it cannot be a "
-                    "phrase step (you can still call it yourself). Nothing was sent."
+                    f"Step {n}: {tool} is not on the list of tools a phrase can use (phrases are read-only in this version), "
+                    "so it cannot be a phrase step (you can still call it yourself). Nothing was sent."
                 )
         return None
 

@@ -35,7 +35,7 @@ that is pending and reports it (`POST /v1/turns/{child}/report`), and repeats un
   service's repair question in a child turn that carries a value, and a step's failure (its own tool's fence, as
   Hermes fences an error result, else the fence of a value its args carry), in its line and its stop reason. A think
   step's input is always fenced (`tools.think_lines`). The fence, the scan and the values carried go by the tool's real
-  name, never the step's short one: Hermes fences an `mcp_*` result, not a bare `search_knowledge_graph`. The name is
+  name, never the step's short one: Hermes fences an `mcp_*` result, not a bare `mcp__srv__search`. The name is
   the one the step was dispatched under, kept with a held result in the step ledger (after a restart no registry read
   may name the short one yet: its MCP server not connected). A held result whose name is unknown fails closed: its line
   in the plugin's own block (`fence.closed`), and the value carried under an `mcp_*` name, so Hermes fences what
@@ -58,13 +58,12 @@ import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Literal
 
 from .agent_source import MCP_PREFIX, THINK, AgentSource
 from .client import Refused, ServiceClient, ServiceError, Unavailable, never_sent
 from .fence import closed, fenced, scan
-from .ledger import FENCE_ALL, UNKNOWN, UNKNOWN_SOURCE, Carried, Held, StepLedger  # noqa: F401
+from .ledger import UNKNOWN, UNKNOWN_SOURCE, Carried, StepLedger
 from .shared import get_shared
 
 logger = logging.getLogger(__name__)
@@ -72,7 +71,7 @@ logger = logging.getLogger(__name__)
 JsonObject = dict[str, Any]
 JsonValue = Any
 
-#: the step ledger's file under Hermes's home (the session record's `hermes_home`)
+#: the step ledger's file under Hermes's home
 LEDGER_FILENAME = "hermes-kernel-steps.json"
 #: a result reported to the service (and shown for a think step's input) is cut here
 MAX_RESULT_CHARS = 16000
@@ -92,8 +91,6 @@ _MAX_REFUSED = 2
 NOT_WAITING = "that step is not waiting any more (it went on already), so nothing ran"
 #: the detail of the step a dropped phrase declines
 DROPPED = "the person dropped the phrase"
-#: how a stop opens in a line of the answer
-STOPPED_PREFIX = "It stopped: "
 
 #: Hermes's `ctx.dispatch_tool(tool_name, args, **kwargs) -> str` (a handler's JSON string, or a multimodal dict)
 Dispatcher = Callable[..., object]
@@ -149,14 +146,17 @@ def shown_failure(tool: str, failure: str, args: JsonObject, carried: Carried = 
 
 
 def repair_line(view: JsonObject, carried: Carried = ()) -> str | None:
-    """The service's question when the phrase's child turn ended in repair, else `None`; fenced when the child turn
-    carries a value (the service builds it from a step's detail or value)."""
+    """The service's question when the phrase's child turn ended in repair, else `None`; always fenced (the service
+    builds it from a step's detail or value, so it can hold a tool's raw failure)."""
     if view.get("status") != "repair":
         return None
     repair = view.get("repair")
     if not isinstance(repair, str) or not repair:
         return "The kernel needs a repair."
-    return f"The kernel asks: {fence_any(repair, carried)}"
+    out = fence_any(repair, carried)
+    if out == repair:  # the service's words hold a step's raw failure: fenced whatever the child carries
+        out = closed(UNKNOWN_SOURCE, repair)
+    return f"The kernel asks: {out}"
 
 
 def _text(value: JsonValue) -> str:
@@ -202,7 +202,7 @@ def _result(result: object) -> tuple[str, str | None]:
     except ValueError:
         parsed = None
     if isinstance(parsed, dict) and parsed.get("error"):
-        return text, str(parsed["error"])
+        return "", _cut(str(parsed["error"]))
     return _cut(text), None
 
 
@@ -237,11 +237,14 @@ class _Ran:
     refused: str | None = None
 
 
-def _platform(session_id: str | None) -> str:
-    """The session record's platform, lowercased; `cli` when there is none."""
+def _platform(platform: str | None, session_id: str | None) -> str | None:
+    """The platform a step runs on, lowercased: the turn's own (the hook's), else the session record's; `None` when
+    neither is known (the step is then refused)."""
+    if platform:
+        return platform.lower()
     info = get_shared().sessions.get(session_id) if session_id else None
     value = info.get("platform") if isinstance(info, dict) else None
-    return str(getattr(value, "value", value) or "cli").lower()
+    return str(getattr(value, "value", value)).lower() if value else None
 
 
 class PhraseRun:
@@ -251,7 +254,7 @@ class PhraseRun:
         self,
         client: ServiceClient,
         source: AgentSource,
-        dispatch: Dispatcher | None,
+        dispatch: Dispatcher,
         ledger: StepLedger,
         *,
         clock: Callable[[], float] = time.monotonic,
@@ -263,18 +266,6 @@ class PhraseRun:
         self._clock = clock
         self._locks: dict[str, tuple[threading.Lock, int]] = {}
         self._guard = threading.Lock()
-
-    @property
-    def can_run(self) -> bool:
-        """Whether this Hermes gave the plugin a `dispatch_tool` (only the general path has one)."""
-        return self._dispatch is not None
-
-    def bind(self, session_id: str | None) -> None:
-        """Give the ledger its file under the session's Hermes home, when the session record has one."""
-        info = get_shared().sessions.get(session_id) if session_id else None
-        home = info.get("hermes_home") if isinstance(info, dict) else None
-        if home:
-            self._ledger.bind(Path(str(home)) / LEDGER_FILENAME)
 
     def budget_end(self) -> float:
         """When a drive that starts now (a Hermes tool call's start) must stop: `DRIVE_BUDGET_S` from now."""
@@ -290,14 +281,20 @@ class PhraseRun:
         return min(cap, max(deadline - self._clock(), _MIN_LEFT_S))
 
     @contextmanager
-    def _hold(self, turn_id: str) -> Iterator[None]:
+    def _hold(self, turn_id: str, deadline: float) -> Iterator[bool | None]:
+        """The child turn's lock, waited for until `deadline`. Yields whether the lock was contended (a drive before this
+        one held it: what this call was given may be stale); `None` when the wait ran out."""
         with self._guard:
             lock, users = self._locks.get(turn_id) or (threading.Lock(), 0)
             self._locks[turn_id] = (lock, users + 1)
+        got = False
         try:
-            with lock:
-                yield
+            contended = not lock.acquire(blocking=False)
+            got = not contended or lock.acquire(timeout=max(0.0, deadline - self._clock()))
+            yield contended if got else None
         finally:
+            if got:
+                lock.release()
             with self._guard:
                 _, users = self._locks[turn_id]
                 if users <= 1:
@@ -312,13 +309,20 @@ class PhraseRun:
         first: JsonObject | None = None,
         task_id: str | None = None,
         session_id: str | None = None,
+        platform: str | None = None,
         deadline: float | None = None,
     ) -> RunOutcome:
         """Run the child turn on from where it is (`first`: the run the call already gave, `run_of` its view; none: the
-        turn is read), until `deadline` (`budget_end()` of the tool call's start; now's when not given)."""
+        turn is read), until `deadline` (`budget_end()` of the tool call's start; now's when not given). When another
+        drive of the child turn held the lock first, `first` may be stale (that drive took its step): the turn is read."""
         end = self.budget_end() if deadline is None else deadline
-        with self._hold(child_turn_id):
-            return self._drive(child_turn_id, first, RunOutcome("done", child_turn_id), task_id, session_id, end)
+        with self._hold(child_turn_id, end) as contended:
+            if contended is None:
+                return _busy(child_turn_id)
+            run = None if contended else first
+            return self._drive(
+                child_turn_id, run, RunOutcome("done", child_turn_id), task_id, session_id, platform, end
+            )
 
     def resume(
         self,
@@ -328,30 +332,36 @@ class PhraseRun:
         *,
         task_id: str | None = None,
         session_id: str | None = None,
+        platform: str | None = None,
         deadline: float | None = None,
     ) -> RunOutcome:
         """`phrase_continue`: a think `step` is reported committed with `text`, then the run goes on; any other step
         (or none) is simply driven on (the step runs, or its held result is reported)."""
         end = self.budget_end() if deadline is None else deadline
-        with self._hold(child_turn_id):
+        with self._hold(child_turn_id, end) as contended:
+            if contended is None:
+                return _busy(child_turn_id)
             out = RunOutcome("done", child_turn_id)
             if step is not None and step.get("tool") == THINK:
                 reported = self._report_think(child_turn_id, step, text, self._left(end, _REPORT_TIMEOUT_S))
-                if reported == "gone":
-                    self._ledger.end(child_turn_id)
+                if reported in ("gone", "ended"):
+                    if reported == "ended":  # a licensed turn with nothing pending is still alive: keep its record
+                        self._ledger.end(child_turn_id)
                     return RunOutcome("stopped", child_turn_id, reason=NOT_WAITING)
                 if reported == "taken":
                     out.lines.append("1. think: its text went in already, on an earlier try (not sent again)")
                 else:
                     out.lines.append(f"1. think: committed → {bounded(text)}")
                     out.committed = 1
-            return self._drive(child_turn_id, None, out, task_id, session_id, end)
+            return self._drive(child_turn_id, None, out, task_id, session_id, platform, end)
 
     def drop(self, child_turn_id: str) -> bool:
         """Drop the phrase: the step it waits at, as the service holds it now (a re-plan issues it again under a new id),
         is reported `declined`, which ends the child turn. `False` when no step of it is pending any more (it went on,
         or ended): nothing is reported."""
-        with self._hold(child_turn_id):
+        with self._hold(child_turn_id, self.budget_end()) as contended:
+            if contended is None:
+                return False
             view = self._client.get(child_turn_id, timeout=_REPORT_TIMEOUT_S)
             pending = _step(view.get("pending"))
             if view.get("status") != "licensed" or pending is None:
@@ -367,7 +377,7 @@ class PhraseRun:
 
     def _report_think(
         self, child: str, step: JsonObject, text: str, timeout: float
-    ) -> Literal["reported", "taken", "gone"]:
+    ) -> Literal["reported", "taken", "gone", "ended"]:
         """Report the think `step` committed with `text`. Refused (the step is not pending under that id), the turn is
         read again:
 
@@ -375,14 +385,17 @@ class PhraseRun:
           (`reported`);
         - still licensed with another step pending, the turn took the text already, on a report whose answer was lost
           (`taken`): the run goes on from that step, and the text is not sent again;
-        - nothing pending, or the turn ended: it takes nothing (`gone`)."""
+        - the turn ended: it takes nothing (`ended`); still licensed with nothing pending, or at another tool: it takes
+          nothing either (`gone`), but the turn is alive."""
         try:
             self._client.report(child, str(step["step_id"]), "committed", _cut(text), None, timeout=timeout)
             return "reported"
         except Refused:
             view = self._client.get(child, timeout=timeout)
         pending = _step(view.get("pending"))
-        if pending is None or view.get("status") != "licensed":
+        if view.get("status") != "licensed":
+            return "ended"
+        if pending is None:
             return "gone"
         if pending["effect_key"] != step.get("effect_key"):
             return "taken"
@@ -401,6 +414,7 @@ class PhraseRun:
         out: RunOutcome,
         task_id: str | None,
         session_id: str | None,
+        platform: str | None,
         deadline: float,
     ) -> RunOutcome:
         n = len(out.lines)
@@ -431,7 +445,7 @@ class PhraseRun:
             if deadline - self._clock() < _MIN_LEFT_S:
                 return _out_of_time(out, step)  # nothing dispatched: the step surely still waits in the agent
             n += 1
-            ran = self._agent_step(child, step, n, task_id, session_id, deadline)
+            ran = self._agent_step(child, step, n, task_id, session_id, platform, deadline)
             out.lines.append(ran.line)
             if ran.reason is not None:
                 out.kind, out.step, out.reason = "stopped", step, ran.reason
@@ -468,7 +482,14 @@ class PhraseRun:
         return out
 
     def _agent_step(
-        self, child: str, step: JsonObject, n: int, task_id: str | None, session_id: str | None, deadline: float
+        self,
+        child: str,
+        step: JsonObject,
+        n: int,
+        task_id: str | None,
+        session_id: str | None,
+        platform: str | None,
+        deadline: float,
     ) -> _Ran:
         tool, key, step_id = str(step["tool"]), str(step["effect_key"]), str(step["step_id"])
         raw = step["args"]
@@ -478,7 +499,7 @@ class PhraseRun:
         held = self._ledger.get(key)
         real: str | None  # Hermes's name: the fence decides by it
         if held is None:
-            value, failure, real = self._dispatched(tool, args, task_id, session_id)
+            value, failure, real = self._dispatched(tool, args, task_id, session_id, platform)
             if failure is not None:
                 said = shown_failure(real, failure, args, carried)
                 return self._failed(child, step_id, failure, said, head, deadline)
@@ -514,12 +535,10 @@ class PhraseRun:
         return _Ran(f"{head}: committed → {safe}", committed=True)
 
     def _dispatched(
-        self, tool: str, args: JsonObject, task_id: str | None, session_id: str | None
+        self, tool: str, args: JsonObject, task_id: str | None, session_id: str | None, platform: str | None
     ) -> tuple[str, str | None, str]:
         """The step's value, its failure (or `None`), and the name it ran under (the real one; when nothing ran, the
         step's own: then the failure is the plugin's sentence)."""
-        if self._dispatch is None:
-            return "", f"this Hermes cannot run {tool} inside a phrase", tool
         try:
             held = self._source.tool(tool)
         except Exception:  # noqa: BLE001 — Hermes's registry or config unreadable: the step's failure, never Hermes's
@@ -531,20 +550,22 @@ class PhraseRun:
                 "was turned off)"
             )
             return "", missing, tool
-        platform = _platform(session_id)
-        if not self._source.enabled_for(platform, held.name):
-            return "", f"{tool} is not enabled on {platform} here, so a phrase may not run it", tool
+        where = _platform(platform, session_id)
+        if where is None:
+            return "", f"I could not tell which platform this is, so a phrase may not run {tool}", tool
+        if not self._source.enabled_for(where, held.name):
+            return "", f"{tool} is not enabled on {where} here, so a phrase may not run it", tool
         kwargs = {k: v for k, v in (("task_id", task_id), ("session_id", session_id)) if v}
         try:
             result = self._dispatch(held.name, dict(args), **kwargs)
         except Exception as exc:  # noqa: BLE001 — any failure of the tool is the step's, never an error into Hermes
-            logger.warning("hermes-kernel: %s failed inside a phrase", held.name, exc_info=True)
-            return "", f"{tool} could not run ({type(exc).__name__}: {exc})", held.name
+            logger.warning("hermes-kernel: %s failed inside a phrase (%s)", held.name, type(exc).__name__)
+            return "", _cut(f"{tool} could not run ({type(exc).__name__}: {exc})"), held.name
         value, error = _result(result)
         if error is None:
             scan(held.name, value)
             return value, None, held.name
-        return "", f"{tool} did not work: {error}", held.name
+        return "", _cut(f"{tool} did not work: {error}"), held.name
 
     def _failed(self, child: str, step_id: str, failure: str, said: str, head: str, deadline: float) -> _Ran:
         """Report the step's `failure` raw (`tool_error`); the line and the stop reason show it as `said` (fenced)."""
@@ -565,4 +586,11 @@ def _out_of_time(out: RunOutcome, step: JsonObject | None) -> RunOutcome:
         f"this call ran out of time (one tool call drives a phrase for {int(DRIVE_BUDGET_S)} s), so the phrase's next "
         "step has not run"
     )
+    return out
+
+
+def _busy(child: str) -> RunOutcome:
+    """The child turn's lock was not free before the budget ran out: another call is still working on the phrase."""
+    out = RunOutcome("stopped", child, resumable=True)
+    out.reason = "another call is still working on this phrase, so nothing ran here"
     return out

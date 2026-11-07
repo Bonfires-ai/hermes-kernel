@@ -51,12 +51,16 @@ class Refused(MkError):
     """The kernel refused the request (400, 409, 422); ``detail`` is its reason."""
 
 
+#: how a ``NotFounded`` detail opens: a turn's problems carry it when its plan failed for want of a bonfire
+NOT_FOUNDED_SAID = "no conversation has been saved yet, so there is no memory"
+
+
 class NotFounded(Refused):
     """The bonfire does not exist yet: it is founded when the first session is built, which can be many minutes after
     install (mk answers 404). ``detail`` is neutral and factual; the kernel's own words follow in brackets."""
 
     def __init__(self, kernel_detail: str = "") -> None:
-        said = "no conversation has been saved yet, so there is no memory"
+        said = NOT_FOUNDED_SAID
         super().__init__(f"{said} [{kernel_detail}]" if kernel_detail else said)
 
 

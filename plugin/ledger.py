@@ -66,7 +66,7 @@ class StepLedger:
 
     What it cannot tell fails closed (`carried` answers `FENCE_ALL`): a child turn whose record is partial, one whose
     record was evicted (its id is kept as a tombstone), and every child turn without a record while the ledger is
-    `unsure` (its file could not be read, or is an older plugin's, which kept no values): for `UNSURE_FOR_S` from the
+    `unsure` (it has no file, its file could not be read, or is an older plugin's, which kept no values): for `UNSURE_FOR_S` from the
     restart that found it so, kept in the file across further restarts."""
 
     def __init__(self, path: Path | None, *, clock: Callable[[], float] = time.time) -> None:
@@ -77,18 +77,10 @@ class StepLedger:
         self._carried: OrderedDict[str, _Child] = OrderedDict()
         self._evicted: OrderedDict[str, None] = OrderedDict()
         self._unsure_until = 0.0
-        if path is not None and path.exists():
+        if path is None:  # nothing survives a restart: what it carried is not known after one, so it fences all
+            self._unsure_until = clock() + UNSURE_FOR_S
+        elif path.exists():
             self._load(path)
-
-    def bind(self, path: Path) -> None:
-        """Give a ledger made without a file its file (Hermes's home is known from the first session, not when the
-        plugin loads): read what is there. A ledger that has its file keeps it."""
-        with self._lock:
-            if self._path is not None:
-                return
-            self._path = path
-            if path.exists():
-                self._load(path)
 
     def _load(self, path: Path) -> None:
         try:
@@ -199,7 +191,10 @@ class StepLedger:
                 "evicted": list(self._evicted),
                 "unsure_until": self._unsure_until,
             }
-            tmp.write_text(json.dumps(body, ensure_ascii=False), encoding="utf-8")
+            # results are kept here: the file is the owner's alone
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps(body, ensure_ascii=False))
             os.replace(tmp, self._path)
         except OSError:
             logger.warning("hermes-kernel: the agent step ledger %s could not be written", self._path, exc_info=True)

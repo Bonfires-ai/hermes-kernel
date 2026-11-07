@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from kernel_turns.affordances import CONFIRM, TEACH
 from kernel_turns.groups import GroupFinder
-from kernel_turns.mk_client import KernelApi, MkError, NotFounded, Refused
+from kernel_turns.mk_client import NOT_FOUNDED_SAID, KernelApi, MkError, NotFounded, Refused
 from kernel_turns.models import BodyStep, Frame, JsonValue, Runner
 from kernel_turns.store import TurnStore
 from kernel_turns.turns import UnknownTurn
@@ -143,6 +143,8 @@ class Teaching:
             raise UnknownTurn(f"no turn {turn_id!r}")
         mine = turn.speaker == speaker and (chat is None or turn.chat == chat)
         if (turn.platform, turn.group) != (platform, group) or not mine or name not in turn.affordances:
+            if any(NOT_FOUNDED_SAID in problem for problem in turn.problems):
+                raise Refused(NOT_YET)  # no first conversation yet: the turn had no frames, so nothing is afforded
             afforded = ", ".join(turn.affordances) or "nothing"
             raise Refused(f"{name} is not afforded by this turn (afforded: {afforded})")
 

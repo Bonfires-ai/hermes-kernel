@@ -90,6 +90,38 @@ async def test_teach_before_founding_says_when_it_can_start(world: tuple[World, 
     assert "first conversation" in answer.json()["detail"]
 
 
+def test_teach_on_a_turn_read_before_founding_gets_the_first_conversation_sentence(
+    world: tuple[World, TestClient],
+) -> None:
+    # the natural path: the turn was begun while mk had no bonfire, so it has no frames and affords nothing
+    w, client = world
+    w.mk.unborn = True
+    begun = {
+        "platform": "telegram",
+        "group": "-100777",
+        "chat": "-100777",
+        "speaker": "Kira Dace",
+        "message_id": "m1",
+        "text": "teach a phrase for me",
+        "at": AT.isoformat(),
+        "participants": ["Kira Dace"],
+    }
+    turn = client.post("/v1/turns", json=begun, headers=AUTH).json()
+    assert "teach_phrase" not in turn["affordances"]
+    body = {
+        "turn_id": turn["turn_id"],
+        "platform": "telegram",
+        "group": "-100777",
+        "chat": "-100777",
+        "teacher": "Kira Dace",
+        "forms": ["brew {X}"],
+        "body": ["take water"],
+    }
+    answer = client.post("/v1/teaching", json=body, headers=AUTH)
+    assert answer.status_code == 409
+    assert "first conversation" in answer.json()["detail"]
+
+
 def test_status_names_a_failed_session_and_the_spend(world: tuple[World, TestClient]) -> None:
     w, client = world
     w.mk.healthz = {

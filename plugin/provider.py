@@ -82,7 +82,6 @@ class KernelMemory(MemoryProvider):
             "user_name": kwargs.get("user_name"),
             "chat_id": kwargs.get("chat_id"),
             "agent_identity": kwargs.get("agent_identity"),
-            "hermes_home": kwargs.get("hermes_home"),
         }
         with shared.lock:
             old = shared.sessions.get(session_id)
