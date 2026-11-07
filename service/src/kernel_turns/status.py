@@ -57,7 +57,17 @@ def _service_version() -> str:
 
 
 def _number(value: JsonValue) -> float | None:
-    return float(value) if isinstance(value, int | float) and not isinstance(value, bool) else None
+    """A JSON number, or a numeric string: ``mk serve`` sends its Decimal amounts as strings ("0.030284058")."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int | float):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return None
+    return None
 
 
 def _spend(health: dict[str, JsonValue], bonfire_id: str) -> Spend | None:

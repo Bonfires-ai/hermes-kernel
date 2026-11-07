@@ -108,6 +108,19 @@ def test_status_names_a_failed_session_and_the_spend(world: tuple[World, TestCli
     assert (got["open_messages"], got["sessions_waiting"], got["versions"]["mk"]) == (4, 1, "2.0.0")
 
 
+def test_status_reads_spend_sent_as_strings(world: tuple[World, TestClient]) -> None:
+    # `mk serve` sends its Decimal amounts as strings (seen live: "0.030284058" and "20")
+    w, client = world
+    w.mk.healthz = {
+        "status": "ok",
+        "version": "2.0.0",
+        "bonfires": {BONFIRE: "bootstrap"},
+        "spend": {BONFIRE: {"charged_usd": "0.030284058", "ceiling_usd": "20"}},
+    }
+    got = client.get("/v1/status", headers=AUTH).json()
+    assert got["spend"] == {"charged_usd": 0.030284058, "ceiling_usd": 20}
+
+
 def test_status_with_mk_down_still_answers(world: tuple[World, TestClient]) -> None:
     w, client = world
     w.mk.down = True
