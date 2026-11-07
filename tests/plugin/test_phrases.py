@@ -343,7 +343,7 @@ def test_a_step_on_an_unknown_platform_does_not_run_and_the_turn_still_reads_as_
     runs = PhraseRun(
         cast(Any, client), cast(Any, source), lambda n, a, **k: calls.append(n) or RESULT, StepLedger(None)
     )
-    tools = KernelTools(cast(Any, client), turns, runs, cast(Any, source), Editor(source, GuideData()))
+    tools = KernelTools(cast(Any, client), turns, runs, cast(Any, source), Editor(cast(Any, source), GuideData()))
     answer = ask(tools, "run_phrase", {"phrase": "research"})
     assert calls == [] and "could not tell which platform" in answer
     assert [r[1] for r in client.reports] == ["tool_error"]
@@ -486,7 +486,7 @@ def test_a_read_only_tool_off_the_list_gets_the_not_on_the_list_refusal(env):
 def test_a_drop_on_a_busy_phrase_says_so_and_keeps_the_record(env):
     tools, _, local, _ = build(Client())
     local.waiting = {"c1": {"turn_id": "c1", "step": step(1)}}
-    tools._runs.drop = lambda child: None  # the lock stayed taken past the budget
+    tools._runs.drop = lambda child_turn_id: None  # the lock stayed taken past the budget
     answer = ask(tools, "phrase_continue", {"text": "", "phrase": "c1", "drop": True})
     assert "Another call is still working" in answer and "c1" in local.waiting
 
