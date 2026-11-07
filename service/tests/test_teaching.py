@@ -11,6 +11,7 @@ from kernel_turns.mk_client import NotTeacher, Refused
 from kernel_turns.models import JsonValue, UseRecord
 from kernel_turns.store import MemoryTurnStore
 from kernel_turns.teaching import ConfirmRequest, TeachDraft, Teaching
+from kernel_turns.turns import UnknownTurn
 from tests.fakes import FakeMk, afforded_turn
 
 AT = datetime(2026, 10, 22, 18, 0, tzinfo=UTC)
@@ -260,3 +261,108 @@ async def test_a_confirm_refused_while_a_draft_waits_tells_the_person_to_answer_
     mk.rows = []
     with pytest.raises(Refused, match="confirm_phrase is not afforded"):
         await teaching.confirm("d1", request)
+
+
+def _kira_staged(mk: FakeMk) -> None:
+    mk.rows = [{"id": "brew.d1.0", "status": "staged", "provenance": {"teacher": "Kira Dace", "draft_id": "d1"}}]
+
+
+def _card(turn_id: str, **changes: object) -> ConfirmRequest:
+    fields: dict[str, object] = {
+        "platform": "telegram",
+        "group": "-100777",
+        "by": "Kira Dace",
+        "turn_id": turn_id,
+        "card": True,
+    }
+    return ConfirmRequest.model_validate({**fields, **changes})
+
+
+async def test_the_plain_read_back_has_no_plain_yes_and_a_refused_draft_has_none(groups: SingleBonfire) -> None:
+    mk = FakeMk()
+    store = MemoryTurnStore()
+    turn = await afforded_turn(store, "teach_phrase")
+    teaching = Teaching(mk, store, groups)
+    draft = await teaching.begin(_draft(turn_id=turn))
+    assert draft.plain == (
+        "brew {X} for {R} / brew {X}: take water → take herb → make {X} from them → give {X} to {R}"
+        " (if left out, R is me)"
+    )
+    assert draft.read_back == f'{draft.plain}. Answer with just "yes" to keep it.'  # as it always was
+    mk.teach_answer = {"draft_id": "", "specs": [], "problems": ["nope"]}
+    assert (await teaching.begin(_draft(turn_id=turn))).plain == ""
+
+
+async def test_a_card_confirms_with_no_yes_frame(groups: SingleBonfire) -> None:
+    mk = FakeMk()
+    store = MemoryTurnStore()
+    teaching = Teaching(mk, store, groups)
+    await teaching.begin(_draft(turn_id=await afforded_turn(store, "teach_phrase", turn_id="t-draft")))
+    _kira_staged(mk)
+    plain = await afforded_turn(store, "web_search", turn_id="t-card")  # no yes frame: confirm_phrase is not afforded
+    confirmed = await teaching.confirm("d1", _card(plain))
+    assert (confirmed.draft_id, confirmed.phrases) == ("d1", ["brew.d1.0", "brew.d1.1"])
+    assert mk.calls_of("confirm") == [{"draft_id": "d1", "by": "Kira Dace"}]
+
+
+async def test_a_card_needs_a_draft_of_this_person_waiting(groups: SingleBonfire) -> None:
+    mk = FakeMk()
+    store = MemoryTurnStore()
+    teaching = Teaching(mk, store, groups)
+    turn = await afforded_turn(store, "web_search", turn_id="t-card")
+    with pytest.raises(Refused):  # nothing staged at all
+        await teaching.confirm("d1", _card(turn))
+    mk.rows = [{"id": "brew.d1.0", "status": "staged", "provenance": {"teacher": "Milo", "draft_id": "d1"}}]
+    with pytest.raises(Refused):  # staged by somebody else
+        await teaching.confirm("d1", _card(turn))
+    assert mk.calls_of("confirm") == []
+
+
+async def test_a_card_from_another_speaker_or_group_is_refused_and_an_unknown_turn_is_unknown(
+    groups: SingleBonfire,
+) -> None:
+    mk = FakeMk()
+    store = MemoryTurnStore()
+    teaching = Teaching(mk, store, groups)
+    _kira_staged(mk)
+    milo = await afforded_turn(store, "web_search", speaker="Milo", turn_id="t-milo")
+    with pytest.raises(Refused):  # Milo's turn cannot carry Kira's card
+        await teaching.confirm("d1", _card(milo))
+    elsewhere = await afforded_turn(store, "web_search", turn_id="t-other")
+    other = await store.get_turn(elsewhere)
+    assert other is not None
+    await store.save_turn(other.model_copy(update={"group": "-100999"}))
+    with pytest.raises(Refused):  # a turn of another group
+        await teaching.confirm("d1", _card(elsewhere))
+    with pytest.raises(Refused):  # the request's own group is not the turn's
+        await teaching.confirm("d1", _card(await afforded_turn(store, "look", turn_id="t-g"), group="-100555"))
+    with pytest.raises(UnknownTurn):
+        await teaching.confirm("d1", _card("t-nowhere"))
+    assert mk.calls_of("confirm") == []
+
+
+async def test_a_card_that_is_not_the_teachers_is_the_kernels_to_refuse(groups: SingleBonfire) -> None:
+    mk = FakeMk()
+    store = MemoryTurnStore()
+    teaching = Teaching(mk, store, groups)
+    await teaching.begin(_draft(turn_id=await afforded_turn(store, "teach_phrase", turn_id="t-draft")))
+    # Milo has a draft of his own waiting, and the turn is his: only the kernel knows d1 is Kira's
+    mk.rows = [{"id": "stew.d2.0", "status": "staged", "provenance": {"teacher": "Milo", "draft_id": "d2"}}]
+    milo = await afforded_turn(store, "web_search", speaker="Milo", turn_id="t-milo")
+    with pytest.raises(NotTeacher):
+        await teaching.confirm("d1", _card(milo, by="Milo"))
+
+
+async def test_without_card_no_yes_frame_is_still_refused(groups: SingleBonfire) -> None:
+    mk = FakeMk()
+    store = MemoryTurnStore()
+    teaching = Teaching(mk, store, groups)
+    _kira_staged(mk)
+    plain = await afforded_turn(store, "web_search", turn_id="t-longer")
+    with pytest.raises(Refused, match='just "yes"'):
+        await teaching.confirm("d1", _card(plain, card=False))
+    with pytest.raises(Refused, match='just "yes"'):  # and absent means false
+        await teaching.confirm(
+            "d1", ConfirmRequest(platform="telegram", group="-100777", by="Kira Dace", turn_id=plain)
+        )
+    assert mk.calls_of("confirm") == []

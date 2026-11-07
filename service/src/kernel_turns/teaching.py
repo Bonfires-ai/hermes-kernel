@@ -6,6 +6,10 @@ default. A draft the kernel refuses comes back with ``draft_id == ""`` and the k
 draft's teacher may confirm it (the kernel's 403, ``NotTeacher``). A draft marks the open offer to teach on the
 teacher's previous turn as followed by it (``TeachOffer.drafted``): that offer is context no more.
 
+The teacher's yes is a ``yes`` reply frame, or their choice on a card (``ConfirmRequest.card``). The plugin sends
+``card`` only for a choice it saw in Hermes's ``clarify`` result, which a model cannot write (``plugin/card.py``): the
+confirm then needs no ``yes`` frame, and everything else still holds.
+
 A group's catalogue is the agent's tools: installed in ``mk serve`` (``PUT …/catalogue``) and stored once the kernel
 accepts it. The turn engine reads the stored copy for what a turn affords.
 """
@@ -45,6 +49,8 @@ class DraftView(BaseModel):
     #: "" when the kernel refused the draft
     draft_id: str
     read_back: str
+    #: the read-back without its last sentence about a plain yes, for a card; "" when the kernel refused the draft
+    plain: str
     problems: list[str]
     #: form text -> the frames the live grammar already reads that form's own renderings as (the kernel's ``competes``)
     competes: dict[str, list[Frame]] = Field(default_factory=dict)
@@ -60,8 +66,10 @@ class ConfirmRequest(BaseModel):
     platform: str = Field(min_length=1)
     group: str = Field(min_length=1)
     by: str = Field(min_length=1)
-    #: the turn whose reading afforded the confirmation (``confirm_phrase``)
+    #: the turn whose reading afforded the confirmation (``confirm_phrase``), or the card's turn
     turn_id: str = Field(min_length=1)
+    #: the person chose this on a card, so no ``yes`` frame is asked for (``Teaching.confirm``)
+    card: bool = False
 
 
 def step_text(step: BodyStep) -> str:
@@ -80,7 +88,11 @@ def read_back(forms: list[str], body: list[BodyStep], defaults: dict[str, str]) 
 
 def _with_plain_yes(text: str, draft_id: JsonValue) -> str:
     """A draft that was taken ends its read-back by asking for a plain yes; a refused one has nothing to keep."""
-    return f"{text}. {PLAIN_YES}" if isinstance(draft_id, str) and draft_id else text
+    return f"{text}. {PLAIN_YES}" if _taken(draft_id) else text
+
+
+def _taken(draft_id: JsonValue) -> bool:
+    return isinstance(draft_id, str) and bool(draft_id)
 
 
 def merge_sources(agent: dict[str, JsonValue] | None) -> dict[str, JsonValue]:
@@ -170,6 +182,17 @@ class Teaching:
             afforded = ", ".join(turn.affordances) or "nothing"
             raise Refused(f"{name} is not afforded by this turn (afforded: {afforded})")
 
+    async def _card_afforded(self, req: ConfirmRequest, bonfire: str) -> None:
+        """Refuse (409) a card's confirm unless the turn is this person's, in this group, and a draft of theirs waits.
+        No ``yes`` frame is asked for; the kernel still refuses anyone but the draft's teacher (``NotTeacher``)."""
+        turn = await self._store.get_turn(req.turn_id)
+        if turn is None:
+            raise UnknownTurn(f"no turn {req.turn_id!r}")
+        if (turn.platform, turn.group, turn.speaker) != (req.platform, req.group, req.by):
+            raise Refused(f"{CONFIRM} is not afforded by this turn: it is not {req.by}'s in this group")
+        if not await self._has_draft_waiting(bonfire, req.by):
+            raise Refused(f"{CONFIRM} is not afforded: {req.by} has no draft waiting")
+
     async def _has_draft_waiting(self, bonfire: str, speaker: str) -> bool:
         try:
             return has_staged_draft(await self._mk.constructions(bonfire), speaker)
@@ -194,9 +217,11 @@ class Teaching:
         draft_id = out.get("draft_id")
         if isinstance(draft_id, str) and draft_id:
             await self._follow_offer(req.turn_id, draft_id)
+        plain = read_back(req.forms, req.body, req.defaults)
         return DraftView(
             draft_id=draft_id if isinstance(draft_id, str) else "",
-            read_back=_with_plain_yes(read_back(req.forms, req.body, req.defaults), draft_id),
+            read_back=_with_plain_yes(plain, draft_id),
+            plain=plain if _taken(draft_id) else "",
             problems=_strings(out.get("problems")),
             competes=_competes(out.get("competes")),
         )
@@ -216,7 +241,10 @@ class Teaching:
 
     async def confirm(self, draft_id: str, req: ConfirmRequest) -> ConfirmView:
         found = await self._groups.find(req.platform, req.group)
-        await self._afforded(req.turn_id, req.platform, req.group, CONFIRM, req.by, bonfire=found.bonfire_id)
+        if req.card:
+            await self._card_afforded(req, found.bonfire_id)
+        else:
+            await self._afforded(req.turn_id, req.platform, req.group, CONFIRM, req.by, bonfire=found.bonfire_id)
         try:
             out = await self._mk.confirm(found.bonfire_id, draft_id, req.by)  # NotTeacher for anyone but the teacher
         except NotFounded as exc:
