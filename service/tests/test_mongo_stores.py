@@ -5,7 +5,8 @@ behaviour tests are the same for both.
 
 The behaviour tests share one database and empty it between tests. mongod keeps a file open for every collection and
 index until the checkpoint after its drop, so a database per test passes a container's default 1024 open files in a
-few fast runs, and WiredTiger's panic ends the server. Only the tests of the indexes themselves take a fresh one.
+few fast runs, and WiredTiger's panic ends the server. Only the tests of the indexes themselves take a fresh one. The
+shared database is ``conftest.shared_database``, which ``test_isolation`` uses too.
 """
 
 from __future__ import annotations
@@ -13,7 +14,7 @@ from __future__ import annotations
 import logging
 import os
 import uuid
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -21,7 +22,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
-from pymongo import ASCENDING, AsyncMongoClient, MongoClient
+from pymongo import ASCENDING, AsyncMongoClient
 from pymongo.errors import DuplicateKeyError
 
 from kernel_turns.app import create_app
@@ -78,15 +79,6 @@ async def mongo() -> AsyncIterator[Database]:
         pytest.skip(NO_MONGO)
     async with _database() as database:
         yield database
-
-
-@pytest.fixture(scope="session")
-def shared_database() -> Iterator[str]:
-    name = f"kt_test_{uuid.uuid4().hex}"
-    yield name
-    if MONGO_URI:
-        with MongoClient(MONGO_URI) as client:
-            client.drop_database(name)
 
 
 @pytest.fixture(params=["memory", pytest.param("mongo", marks=pytest.mark.skipif(not MONGO_URI, reason=NO_MONGO))])

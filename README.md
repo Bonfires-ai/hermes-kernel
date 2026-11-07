@@ -277,6 +277,45 @@ about $0.25 with its default model) and takes about 15 minutes. Read its header 
 `service/tests/contract` checks the service's client against a real `mk serve`; it is skipped unless `KT_CONTRACT_URL`
 is set. `mk serve` has no host port, so run it from a container on the stack's network; the test file's header says how.
 
+### One bonfire or many
+
+The turn service reads only `KT_*` settings (`service/src/kernel_turns/config.py`). These eight decide whether it serves
+the one bonfire of a local stack or the bonfire each key names:
+
+| Setting | |
+|---|---|
+| `KT_PORT` | the port it listens on (8000) |
+| `KT_BONFIRE_ID` | local: the one bonfire every conversation speaks to. Required unless both URLs below are set, refused if they are |
+| `KT_AUTH_URL`, `KT_AUTH_TOKEN` | hosted: where a key is checked, and the bearer sent there |
+| `KT_HANDOFF_URL`, `KT_HANDOFF_TOKEN` | hosted: where closed sessions go and each bonfire's worker status is read, and the bearer sent there |
+| `KT_HANDOFF_EVERY_S` | seconds between hand-off passes (15) |
+| `KT_RETENTION_DAYS` | turn and ledger rows expire after this many days (at least 1); unset keeps them |
+
+`KT_AUTH_URL` and `KT_HANDOFF_URL` are set together or not at all. With neither, nothing changes: the bearer is
+`KT_TOKEN`, for `KT_BONFIRE_ID`, and the writer builds closed sessions. With both, every request's bonfire comes from its
+key, and the service talks to the two seams:
+
+- **The key check.** `POST KT_AUTH_URL` with `{"key": "<the caller's bearer>"}` and `Authorization: Bearer
+  <KT_AUTH_TOKEN>`. `200 {"bonfire_id", "permission"}` is an answer: `write` or `admin` is served and kept for 60
+  seconds, `read` is a 403. `404` is an unknown or revoked key, a 401. Anything else, or an answer that doesn't parse,
+  is the seam failing: a 503 with `Retry-After`, never a 401.
+- **The hand-off.** Under the base URL `KT_HANDOFF_URL`, with `Authorization: Bearer <KT_HANDOFF_TOKEN>`:
+  - `POST {url}/bonfires/{bonfire_id}/sessions` takes each bonfire's oldest closed session, as `{conversation_id,
+    messages: [{message_id, speaker, text, timestamp, addressees}], agent_handles: ["hermes"]}`. A 2xx hands it over and
+    its text is removed here. A 400, 409, 413 or 422 refuses it: the session fails with the answer's `message` or
+    `detail` and keeps its text for `POST /v1/sessions/{id}/retry`. Anything else, a 404 included, means it waits and is
+    sent again with the same body.
+  - `GET {url}/bonfires/{bonfire_id}/status` answers `{engine, agent_handles, waiting, failed: [{key, conversation_id,
+    reason, attempts}], held, last_built_at}`. It's read for `/v1/status`, and the first time a bonfire's key is used:
+    only a bonfire with `engine` `kernel` and `agent_handles` exactly `["hermes"]` is served, and any other key gets a
+    403 on every route.
+
+With `KT_HANDOFF_URL` set, don't run the writer. The hand-off sends each closed session to be built, and a writer would
+build it as well.
+
+`service/tests/test_isolation.py` calls every `/v1` route with one customer's key on another's ids, with no key, and with
+the key of a bonfire that isn't served. It fails for a route it has no probe for, so a new route needs a probe there.
+
 ## Licence
 
 Apache-2.0, matching memory-kernel. See `LICENSE` and `NOTICE`. The images are built on your machine and nothing is

@@ -39,3 +39,6 @@ that make memory-kernel a person's own Hermes memory and turn reader.
   plugin's token and call the service directly (as it already could to forge a plain yes). Everywhere else, and when
   there is no card, a plain "yes" keeps it as before. Throw it away and Change it close the draft, so a later "yes"
   cannot revive it while this Hermes runs.
+- The turn service can serve many bonfires: with `KT_AUTH_URL` and `KT_HANDOFF_URL` set, each key names its bonfire and
+  closed sessions are handed over to be built; with neither set it is the local service as before. A test calls every
+  route with one customer's key on another's ids, and fails for a new route until the route has a probe.
