@@ -36,8 +36,8 @@ SHUTDOWN_FLUSH_S = 5.0
 #: bounds the spool; the writer splits long text itself, so nothing shorter is cut
 TEXT_MAX_CHARS = 100_000
 
-#: a 4xx that is the service's trouble, not the message's
-TRANSIENT_STATUSES = frozenset({408, 409, 429})
+#: the only 4xx answers that are about the message itself; any other 4xx is the service or the setup, so we hold
+MESSAGE_STATUSES = frozenset({400, 413, 422})
 TOKEN_HINT = "the turn service rejected the token: check HERMES_KERNEL_TOKEN"
 
 
@@ -296,10 +296,10 @@ class Capture:
         except Unavailable as exc:
             return "hold", f"turn service unavailable: {exc.detail}"
         except Refused as exc:
-            if exc.status in TRANSIENT_STATUSES:
-                return "hold", f"turn service busy ({exc.status}): {exc.detail}"
+            if exc.status not in MESSAGE_STATUSES:
+                return "hold", f"turn service answered {exc.status}: {exc.detail}"
             return "drop", f"the turn service refused captured items with {exc.status}: {exc.detail}"
-        except (ValueError, TypeError) as exc:  # cannot be encoded: it never will be
+        except UnicodeError as exc:  # cannot be encoded: it never will be
             return "drop", f"a captured item could not be sent: {type(exc).__name__}: {exc}"
         except Exception as exc:  # noqa: BLE001 - unexpected: keep the data and retry
             return "hold", f"capture failed: {type(exc).__name__}: {exc}"

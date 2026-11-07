@@ -257,3 +257,25 @@ def test_a_turn_without_a_conversation_is_skipped_and_empty_names_are_filled(tmp
     cap.turn("c", "", "hello", "hi", session_id="s", turn_number=2)
     cap.drain_once()
     assert [m["speaker"] for m in client.sent] == ["user", "hermes"]
+
+
+def test_a_404_holds_every_queued_message_and_drops_nothing(tmp_path):
+    cap, client, spool = make(tmp_path)
+    client.error = Refused(404, "no such path")
+    turn(cap, n=1)
+    turn(cap, n=2)
+    assert not cap.drain_once()
+    assert cap.backlog == 4 and spool.exists()
+    assert cap.last_error and "404" in cap.last_error
+    client.error = None
+    while cap.backlog:
+        assert cap.drain_once()
+    assert len(client.sent) == 4
+
+
+def test_a_plain_value_error_from_the_client_holds_rather_than_drops(tmp_path):
+    cap, client, _ = make(tmp_path)
+    client.error = ValueError("a bug in the client")
+    turn(cap)
+    assert not cap.drain_once()
+    assert cap.backlog == 2 and cap.last_error and "ValueError" in cap.last_error
