@@ -12,6 +12,12 @@ log = logging.getLogger(__name__)
 
 USAGE = "Use /kernel for the status, or /kernel retry <session id> to retry a session that failed to build."
 NOT_SELECTED = "memory.provider is not hermes-kernel: set it with `hermes config set memory.provider hermes-kernel`"
+NOT_SET_UP = "Memory is not set up: HERMES_KERNEL_TOKEN is missing. Run `hermes memory setup`."
+#: a Hermes that loaded the plugin with no token, and found one later: the client heals, what `register` wires does not
+PHRASES_OFF = (
+    "Phrases are off: this Hermes loaded the plugin before it had the token. Restart its gateway to turn them on: "
+    "hermes gateway restart"
+)
 
 
 def _money(value: Any) -> str:
@@ -100,7 +106,7 @@ def kernel_command(raw_args: str = "", **session_kwargs: Any) -> str:
         shared = get_shared()
         client = shared.client
         if client is None:
-            return "Memory is not set up: HERMES_KERNEL_TOKEN is missing."
+            return NOT_SET_UP
         parts = (raw_args or "").split()
         if parts and parts[0] == "retry":
             if len(parts) != 2:
@@ -113,9 +119,10 @@ def kernel_command(raw_args: str = "", **session_kwargs: Any) -> str:
         known, problem = _provider_state()
         problem = problem or (capture.last_error if capture is not None else None)
         try:
-            return status_line(client.status(), problem, saving_known=known)
+            said = status_line(client.status(), problem, saving_known=known)
         except Unavailable:
-            return status_line(None, problem, saving_known=known)
+            said = status_line(None, problem, saving_known=known)
+        return f"{said}\n{PHRASES_OFF}" if shared.turns is None else said
     except Unauthorized:
         return "The memory service refused the token: check HERMES_KERNEL_TOKEN."
     except Unavailable:

@@ -49,8 +49,8 @@ Install the plugin into Hermes and give it the token:
 
 ```bash
 hermes plugins install Bonfires-ai/hermes-kernel/plugin --enable
-hermes plugins enable hermes-kernel
 hermes memory setup         # arrow up to "hermes-kernel", Enter; Enter for the URL; paste KT_TOKEN
+hermes plugins enable hermes-kernel
 ```
 
 `hermes memory setup` writes the token to `~/.hermes/.env` as `HERMES_KERNEL_TOKEN`. Use the menu: in Hermes v0.23.0,

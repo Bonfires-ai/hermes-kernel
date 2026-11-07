@@ -60,19 +60,39 @@ def configured_url() -> str:
         return ""
 
 
-def _build() -> Shared:
-    breaker = Breaker()
+def _token() -> str:
+    """This process's token, else the one in the `.env` of Hermes's home. A gateway that started before
+    `hermes memory setup` holds an environment from before the token, and only takes the file in on its next turn."""
     token = os.environ.get("HERMES_KERNEL_TOKEN", "").strip()
+    if token:
+        return token
+    try:
+        from hermes_cli.config import get_env_value  # pyright: ignore[reportMissingImports]
+
+        return (get_env_value("HERMES_KERNEL_TOKEN") or "").strip()
+    except Exception:  # noqa: BLE001  no Hermes, or its .env unreadable: no token yet
+        return ""
+
+
+def _client(breaker: Breaker) -> ServiceClient | None:
+    token = _token()
+    if not token:
+        return None
     url = os.environ.get("HERMES_KERNEL_URL", "").strip() or configured_url() or DEFAULT_URL
-    client = ServiceClient(url, token, breaker=breaker) if token else None
-    return Shared(client, breaker)
+    return ServiceClient(url, token, breaker=breaker)
 
 
 def get_shared() -> Shared:
+    """The one `Shared`. With no client yet, the token is looked for again on every call, so a Hermes that was already
+    running picks up `hermes memory setup` without a restart. What `register` wires only arrives with a later `register`
+    (`hermes plugins enable` makes a running gateway do one): `/kernel` says so until then."""
     global _shared
     with _lock:
         if _shared is None:
-            _shared = _build()
+            breaker = Breaker()
+            _shared = Shared(_client(breaker), breaker)
+        elif _shared.client is None:
+            _shared.client = _client(_shared.breaker)
         return _shared
 
 

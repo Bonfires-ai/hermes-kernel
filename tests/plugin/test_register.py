@@ -1,5 +1,6 @@
 import importlib
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -119,6 +120,56 @@ def test_register_with_no_token_registers_the_provider_and_the_command_only(impl
     collector = CollectorCtx()
     plugin.register(collector)
     assert len(collector.providers) == 1
+
+
+STATUS = {"founded": True, "last_built_at": "2026-11-07T10:00:00Z", "sessions_waiting": 0}
+
+
+def _late_token(impl_shared, monkeypatch, own_hermes_home):
+    """A Hermes that registered with no token; then `hermes memory setup`, in another process, wrote its .env."""
+    monkeypatch.delenv("HERMES_KERNEL_TOKEN")
+    impl_shared.reset_shared()
+    ctx = GeneralCtx()
+    plugin.register(ctx)
+    assert "not set up" in ctx.commands["kernel"]("")
+    (own_hermes_home / ".env").write_text("HERMES_KERNEL_TOKEN=late\n", encoding="utf-8")
+    return ctx
+
+
+def test_a_token_saved_after_register_reaches_a_running_hermes_without_a_restart(
+    impl_shared, monkeypatch, own_hermes_home
+):
+    ctx = _late_token(impl_shared, monkeypatch, own_hermes_home)
+    sh = impl_shared.get_shared()
+    assert sh.client is not None  # no process restarted, and this process's environment still has no token
+    assert "HERMES_KERNEL_TOKEN" not in os.environ
+    monkeypatch.setattr(sh.client, "status", lambda **_: STATUS)
+    said = ctx.commands["kernel"]("")
+    assert "not set up" not in said and "Last built" in said
+    assert "Phrases are off" in said and "hermes gateway restart" in said  # hooks and tools came with no register
+    assert ctx.hooks == [] and ctx.tools == []
+
+
+def test_a_reload_after_the_token_brings_the_hooks_and_tools_and_ends_the_restart_line(
+    impl_shared, monkeypatch, own_hermes_home
+):
+    _late_token(impl_shared, monkeypatch, own_hermes_home)
+    reloaded = GeneralCtx()  # `hermes plugins enable`: the running gateway rediscovers its plugins
+    plugin.register(reloaded)
+    assert reloaded.tools == TOOLS
+    assert sorted(reloaded.hooks) == ["post_tool_call", "pre_gateway_dispatch", "pre_llm_call"]
+    assert reloaded.skills
+    monkeypatch.setattr(impl_shared.get_shared().client, "status", lambda **_: STATUS)
+    assert "Phrases are off" not in reloaded.commands["kernel"]("")
+
+
+def test_no_token_anywhere_stays_not_set_up_and_says_what_to_run(impl_shared, monkeypatch):
+    monkeypatch.delenv("HERMES_KERNEL_TOKEN")
+    impl_shared.reset_shared()
+    ctx = GeneralCtx()
+    plugin.register(ctx)
+    assert impl_shared.get_shared().client is None
+    assert "hermes memory setup" in ctx.commands["kernel"]("")
 
 
 def test_a_second_register_after_a_reload_still_has_the_five_tools(impl_shared):

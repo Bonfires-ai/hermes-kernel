@@ -267,11 +267,12 @@ echo "stack up in $(( $(now) - t0 )) s; the kernel has spent $(spend) USD"
 "$HERMES" config set telemetry.shared_metrics.send false >/dev/null
 "$HERMES" config set telemetry.shared_metrics.offer_version 2 --force >/dev/null
 "$HERMES" plugins install "$PLUGIN_SOURCE" --enable
+# The README's way to give the plugin its token: the memory setup menu (the token itself is never printed).
+E2E_SETUP_TOKEN="$KT_TOKEN_VALUE" "$PY" "$ROOT/scripts/e2e_setup.py" "$HERMES" || fail "hermes memory setup did not store the token"
+# Last, as in the README: this is the step that makes a Hermes that is already running load the plugin, with the token.
 "$HERMES" plugins enable hermes-kernel
 "$HERMES" plugins list >"$OUT/plugins-list.txt"
 grep -Eq '^│ hermes-kernel +│ enabled +│' "$OUT/plugins-list.txt" || fail "the plugin is not enabled after install (see $OUT/plugins-list.txt)"
-# The README's way to give the plugin its token: the memory setup menu (the token itself is never printed).
-E2E_SETUP_TOKEN="$KT_TOKEN_VALUE" "$PY" "$ROOT/scripts/e2e_setup.py" "$HERMES" || fail "hermes memory setup did not store the token"
 curl -fsS "http://127.0.0.1:$PORT/healthz" >/dev/null || fail "the turn service does not answer"
 [ "$(status | jq -r '.founded')" = "false" ] || fail "a fresh stack says it already has memory"
 pass "1. install from nothing (stack and plugin up, no memory yet)"
