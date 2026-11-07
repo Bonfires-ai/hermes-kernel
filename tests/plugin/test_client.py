@@ -1,4 +1,5 @@
 import importlib.util
+import sys
 from pathlib import Path
 
 import httpx
@@ -57,7 +58,7 @@ def test_a_refused_connection_trips_the_breaker_too():
 
     client, breaker, _, _ = make(refuse)
     with pytest.raises(Unavailable) as info:
-        client.status()
+        client.begin({})
     assert never_sent(info.value)
     assert not breaker.allow()
 
@@ -66,9 +67,9 @@ def test_a_5xx_trips_and_a_success_resets():
     answers = [httpx.Response(503, json={"detail": "busy"}), httpx.Response(200, json={"ok": True})]
     client, breaker, clock, _ = make(lambda request: answers.pop(0))
     with pytest.raises(Unavailable):
-        client.status()
+        client.begin({})
     clock.now += 61
-    assert client.status() == {"ok": True}
+    assert client.begin({}) == {"ok": True}
     assert breaker.allow()
     assert breaker.allow()
 
@@ -76,7 +77,7 @@ def test_a_5xx_trips_and_a_success_resets():
 def test_a_409_is_an_answer_not_a_failure():
     client, breaker, _, seen = make(lambda request: httpx.Response(409, json={"detail": "already reported"}))
     with pytest.raises(Refused) as info:
-        client.report("t1", "s1", "ok")
+        client.begin({})
     assert info.value.detail == "already reported"
     assert info.value.status == 409
     assert breaker.allow()
@@ -86,7 +87,7 @@ def test_a_409_is_an_answer_not_a_failure():
 def test_a_wrong_token_is_its_own_error():
     client, breaker, _, _ = make(lambda request: httpx.Response(401, json={"detail": "bad token"}))
     with pytest.raises(Unauthorized):
-        client.status()
+        client.begin({})
     assert breaker.allow()
     assert not issubclass(Unauthorized, Refused)
 
@@ -104,27 +105,60 @@ def test_the_bearer_and_the_routes():
     assert [r.url.raw_path.decode() for r in seen] == ["/v1/context", "/v1/turns/t%201/calls"]
 
 
-def test_two_imports_share_one_state(monkeypatch):
-    monkeypatch.setenv("HERMES_KERNEL_TOKEN", "tok")
-    shared_mod.reset_shared()
-    first = shared_mod.get_shared()
-    path = Path(shared_mod.__file__).parent / "__init__.py"
-    spec = importlib.util.spec_from_file_location("_other_name", path, submodule_search_locations=[str(path.parent)])
+def _load_copy(name):
+    root = Path(shared_mod.__file__).parent
+    spec = importlib.util.spec_from_file_location(name, root / "__init__.py", submodule_search_locations=[str(root)])
     assert spec and spec.loader
-    other = importlib.util.module_from_spec(spec)
-    import sys
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
 
-    sys.modules["_other_name"] = other
-    try:
-        spec.loader.exec_module(other)
-        from _other_name import shared as other_shared  # type: ignore[import-not-found]
 
-        assert other_shared is not shared_mod
-        assert other_shared.get_shared() is first
-    finally:
-        for name in [n for n in sys.modules if n == "_other_name" or n.startswith("_other_name.")]:
-            del sys.modules[name]
-        shared_mod.reset_shared()
+@pytest.fixture
+def copies():
+    sys.modules.pop("hermes_kernel_impl", None)
+    yield
+    for n in [n for n in sys.modules if n.startswith(("_copy_a", "_copy_b", "hermes_kernel_impl"))]:
+        del sys.modules[n]
+
+
+class FakeCtx:
+    pass
+
+
+def test_two_imports_share_one_state(copies):
+    a, b = _load_copy("_copy_a"), _load_copy("_copy_b")
+    a.register(FakeCtx())
+    b.register(FakeCtx())
+    canon = sys.modules["hermes_kernel_impl"]
+    assert a._canonical() is canon and b._canonical() is canon
+    # the copies themselves hold no client code: one set of classes, so one `Refused`
+    assert "client" not in vars(a) and "client" not in vars(b)
+    refused = a._canonical().client.Refused
+    assert b._canonical().client.Refused is refused
+    with pytest.raises(sys.modules["hermes_kernel_impl.client"].Refused):
+        raise refused(409, "x")
+    assert a._canonical().shared.get_shared() is b._canonical().shared.get_shared()
+
+
+def test_only_begin_and_context_use_the_breaker():
+    client, breaker, _, seen = make(lambda request: httpx.Response(200, json={}))
+    breaker.trip()
+    client.post_messages([], [])
+    client.status()
+    assert len(seen) == 2
+    with pytest.raises(Unavailable):
+        client.begin({})
+    assert len(seen) == 2
+
+    def boom(request):
+        return httpx.Response(500, json={"detail": "x"})
+
+    client, breaker, _, _ = make(boom)
+    with pytest.raises(Unavailable):
+        client.post_messages([], [])
+    assert breaker.allow()
 
 
 def test_no_token_means_no_client(monkeypatch):

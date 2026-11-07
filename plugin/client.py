@@ -1,7 +1,8 @@
 """Sync HTTP client for the turn service, with a circuit breaker.
 
 Hermes runs hooks and tool handlers on worker threads; `httpx.Client` is thread-safe and `Breaker` takes a lock.
-Only connection failures, timeouts and 5xx answers trip the breaker. A 4xx never does: the service answered.
+Only connection failures, timeouts and 5xx answers trip the breaker, and only on the two calls that hold up a
+reply (`begin`, `context`). A 4xx never does: the service answered.
 """
 
 from __future__ import annotations
@@ -123,21 +124,34 @@ class ServiceClient:
     def close(self) -> None:
         self._http.close()
 
-    def _call(self, method: str, path: str, body: Any = None, *, timeout: float = DEFAULT_TIMEOUT_S) -> Any:
-        if not self.breaker.allow():
+    def _call(
+        self,
+        method: str,
+        path: str,
+        body: Any = None,
+        *,
+        timeout: float = DEFAULT_TIMEOUT_S,
+        guarded: bool = False,
+    ) -> Any:
+        """`guarded` calls (the two that hold up a reply: `begin`, `context`) check, trip and reset the breaker;
+        every other call ignores it, so capture, reports and `status` always try."""
+        if guarded and not self.breaker.allow():
             exc = Unavailable("turn service: breaker open, call skipped")
             exc.short_circuited = True
             raise exc
         try:
             response = self._http.request(method, path, json=body, timeout=timeout)
         except httpx.HTTPError as exc:  # connect errors, timeouts, protocol errors
-            self.breaker.trip()
+            if guarded:
+                self.breaker.trip()
             raise Unavailable(f"turn service: {type(exc).__name__}: {exc}") from exc
         status = response.status_code
         if status >= 500:
-            self.breaker.trip()
+            if guarded:
+                self.breaker.trip()
             raise Unavailable(f"turn service answered {status}: {_detail(response)}")
-        self.breaker.reset()  # it answered, so it is up
+        if guarded:
+            self.breaker.reset()  # it answered, so it is up
         if status in (401, 403):
             raise Unauthorized(status, _detail(response))
         if status >= 400:
@@ -147,7 +161,8 @@ class ServiceClient:
         try:
             return response.json()
         except ValueError as exc:
-            self.breaker.trip()
+            if guarded:
+                self.breaker.trip()
             raise Unavailable(f"turn service answered {status} with a body that is not JSON") from exc
 
     def _object(self, value: Any, what: str) -> dict[str, Any]:
@@ -158,7 +173,7 @@ class ServiceClient:
     # turn calls
 
     def begin(self, body: dict[str, Any], *, timeout: float = BEGIN_TIMEOUT_S) -> dict[str, Any]:
-        return self._object(self._call("POST", "/v1/turns", body, timeout=timeout), "a turn")
+        return self._object(self._call("POST", "/v1/turns", body, timeout=timeout, guarded=True), "a turn")
 
     def get(self, turn_id: str, *, timeout: float = DEFAULT_TIMEOUT_S) -> dict[str, Any]:
         return self._object(self._call("GET", f"/v1/turns/{_seg(turn_id)}", timeout=timeout), "a turn")
@@ -221,7 +236,7 @@ class ServiceClient:
     def context(self, query: str, speaker: str | None, timeout: float = CONTEXT_TIMEOUT_S) -> str:
         """The recalled context, or "" when the service could not read memory (degraded)."""
         body = {"query": query, "speaker": speaker}
-        view = self._object(self._call("POST", "/v1/context", body, timeout=timeout), "a context")
+        view = self._object(self._call("POST", "/v1/context", body, timeout=timeout, guarded=True), "a context")
         text = view.get("context")
         return text if isinstance(text, str) else ""
 
