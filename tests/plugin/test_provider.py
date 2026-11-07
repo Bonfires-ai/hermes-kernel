@@ -1,4 +1,5 @@
 import json
+from functools import partial
 from pathlib import Path
 
 import pytest
@@ -29,16 +30,12 @@ class FakeCapture:
         self.turns = []
         self.closed = []
         self.last_error = None
-        self.handle = None
 
     def turn(self, *args):
         self.turns.append(args)
 
     def close(self, conversation_id):
         self.closed.append(conversation_id)
-
-    def set_agent_handle(self, handle):
-        self.handle = handle
 
 
 @pytest.fixture
@@ -217,3 +214,20 @@ def test_the_suite_never_runs_on_the_real_hermes_home(env):
 
     assert Path(get_hermes_home()).resolve() != (Path.home() / ".hermes").resolve()
     assert shared.configured_url() == ""
+
+
+@pytest.mark.parametrize("profile", ["default", "custom", "work"])
+def test_the_agent_is_named_hermes_whatever_the_profile_is_called(tmp_path, monkeypatch, profile):
+    monkeypatch.setenv("HERMES_KERNEL_TOKEN", "t")
+    shared.reset_shared()
+    monkeypatch.setattr(shared, "Capture", partial(shared.Capture, autostart=False))
+    sh = shared.get_shared()
+    sh.client = FakeClient()  # pyright: ignore[reportAttributeAccessIssue]
+    provider = KernelMemory()
+    provider.initialize("s1", hermes_home=str(tmp_path), agent_identity=profile, platform="cli")
+    provider.sync_turn("hello", "hi there", session_id="s1", turn_author={"name": "Ana"})
+    items = [payload for _, payload in sh.made_capture._queue]  # pyright: ignore[reportOptionalMemberAccess]
+    shared.reset_shared()
+    assert [i["handle"] for i in items] == ["hermes", "hermes"]
+    assert [i["message"]["speaker"] for i in items] == ["Ana", "hermes"]
+    assert [i["message"]["addressees"] for i in items] == [["hermes"], ["Ana"]]

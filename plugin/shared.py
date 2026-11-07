@@ -40,7 +40,7 @@ class Shared:
         """The one Capture, made on first call (it starts no thread until first use). None without a client."""
         with self.lock:
             if self.made_capture is None and self.client is not None:
-                self.made_capture = Capture(self.client, spool_path, agent_handle="hermes")
+                self.made_capture = Capture(self.client, spool_path)
             return self.made_capture
 
 

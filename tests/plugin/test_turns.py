@@ -42,7 +42,6 @@ def session(sh, sid="s1", **over):
         "user_id": "U1",
         "user_name": "Ana",
         "chat_id": "C1",
-        "agent_identity": "hermes",
         "conversation_id": "slack:C1",
         "turns": 0,
     }

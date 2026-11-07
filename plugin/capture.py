@@ -28,6 +28,8 @@ from .spool import Spool
 
 logger = logging.getLogger(__name__)
 
+#: what the agent is called in memory, on every Hermes: Hermes's `agent_identity` is the profile's name ("default")
+AGENT_HANDLE = "hermes"
 QUEUE_MAX = 1000
 BATCH_MAX = 64
 BACKOFF_START_S = 1.0
@@ -71,16 +73,13 @@ class Capture:
         client: Sender,
         spool_path: Path | None,
         *,
-        agent_handle: str,
         clock: Callable[[], datetime] = _utc_now,
         queue_max: int = QUEUE_MAX,
         autostart: bool = True,
     ) -> None:
-        """One Hermes has one handle, so it is fixed per instance; `set_agent_handle` is for a handle that is only
-        known at `initialize`. `autostart=False` leaves the worker unstarted so tests can call `drain_once`."""
+        """`autostart=False` leaves the worker unstarted so tests can call `drain_once`."""
         self._client = client
         self._spool = Spool(spool_path) if spool_path is not None else None
-        self._handle = agent_handle
         self._clock = clock
         self._queue_max = queue_max
         self._autostart = autostart
@@ -100,9 +99,6 @@ class Capture:
         self._spool_error: str | None = None
 
     # public
-
-    def set_agent_handle(self, handle: str) -> None:
-        self._handle = handle
 
     @property
     def backlog(self) -> int:
@@ -124,7 +120,7 @@ class Capture:
             logger.warning("hermes-kernel: skipped a turn with no conversation id")
             return
         now = self._clock()
-        handle = self._handle or "hermes"
+        handle = AGENT_HANDLE
         speaker = speaker or "user"
         items: list[dict[str, Any]] = []
         for role, who, text, addressee, when in (

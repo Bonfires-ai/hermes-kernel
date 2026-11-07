@@ -81,7 +81,6 @@ class KernelMemory(MemoryProvider):
             "user_id": kwargs.get("user_id"),
             "user_name": kwargs.get("user_name"),
             "chat_id": kwargs.get("chat_id"),
-            "agent_identity": kwargs.get("agent_identity"),
         }
         with shared.lock:
             old = shared.sessions.get(session_id)
@@ -94,9 +93,7 @@ class KernelMemory(MemoryProvider):
             shared.sessions[session_id] = info
         home = kwargs.get("hermes_home")
         if home:
-            capture = shared.capture(Path(home) / SPOOL_NAME)
-            if capture is not None:
-                capture.set_agent_handle(str(info["agent_identity"] or "hermes"))
+            shared.capture(Path(home) / SPOOL_NAME)
 
     def shutdown(self) -> None:
         pass  # durability does not depend on it; the shared Capture outlives any one provider

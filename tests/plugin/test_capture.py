@@ -39,7 +39,7 @@ class FakeClient:
 def make(tmp_path, client=None, **kw):
     client = client or FakeClient()
     spool = tmp_path / "spool.jsonl"
-    cap = Capture(client, spool, agent_handle="hermes", clock=lambda: T0, autostart=False, **kw)
+    cap = Capture(client, spool, clock=lambda: T0, autostart=False, **kw)
     return cap, client, spool
 
 
@@ -152,7 +152,7 @@ def test_a_full_spool_drops_oldest_and_logs_once(tmp_path, caplog):
 def test_nothing_runs_until_the_first_turn_and_the_worker_sends(tmp_path):
     client = FakeClient()
     before = threading.active_count()
-    cap = Capture(client, tmp_path / "s.jsonl", agent_handle="hermes", clock=lambda: T0)
+    cap = Capture(client, tmp_path / "s.jsonl", clock=lambda: T0)
     assert threading.active_count() == before
     turn(cap)
     assert client.arrived.wait(5)
@@ -180,7 +180,6 @@ def test_a_poison_batch_is_dropped_and_later_turns_still_send(tmp_path):
         return real(batch, agent_handles)
 
     client.post_messages = post
-    cap.set_agent_handle("hermes")
     cap._enqueue([{"kind": "message", "handle": "hermes", "message": {"text": "\ud800"}}])  # pyright: ignore
     turn(cap, n=2)
     assert cap.drain_once()  # the poison item, alone at the head
@@ -221,7 +220,7 @@ def test_a_409_keeps_the_batch_and_retries(tmp_path):
 
 def test_a_dead_worker_is_replaced_on_the_next_turn(tmp_path):
     client = FakeClient()
-    cap = Capture(client, tmp_path / "s.jsonl", agent_handle="hermes", clock=lambda: T0)
+    cap = Capture(client, tmp_path / "s.jsonl", clock=lambda: T0)
     dead = threading.Thread(target=lambda: None)
     dead.start()
     dead.join()
@@ -253,7 +252,6 @@ def test_a_turn_without_a_conversation_is_skipped_and_empty_names_are_filled(tmp
     cap, client, _ = make(tmp_path)
     cap.turn("", "Kira", "hello", "hi", session_id="s", turn_number=1)
     assert cap.backlog == 0
-    cap.set_agent_handle("")
     cap.turn("c", "", "hello", "hi", session_id="s", turn_number=2)
     cap.drain_once()
     assert [m["speaker"] for m in client.sent] == ["user", "hermes"]
