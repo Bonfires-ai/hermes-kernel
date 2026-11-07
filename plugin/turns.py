@@ -125,6 +125,9 @@ class LocalTurn:
     waiting: dict[str, JsonObject] = field(default_factory=dict)
     #: the phrases continued in this turn (an unnamed continue never goes to another one)
     continued: set[str] = field(default_factory=set)
+    #: what the reading afforded the model, and the afforded tools it calls natively (`None`: not read)
+    affordances: list[str] | None = None
+    native: set[str] = field(default_factory=set)
 
 
 def _as_str(value: Any) -> str:
@@ -506,6 +509,9 @@ class KernelTurns:
         child = waiting.get("turn_id") if isinstance(waiting, dict) else None
         local.waiting = {child: waiting} if isinstance(waiting, dict) and isinstance(child, str) and child else {}
         affordances = view.get("affordances")
+        raw_native = view.get("native")
+        local.affordances = [a for a in affordances if isinstance(a, str)] if isinstance(affordances, list) else None
+        local.native = {a for a in raw_native if isinstance(a, str)} if isinstance(raw_native, list) else set()
         drafting = isinstance(affordances, list) and "teach_phrase" in affordances
         calls = self._call_log.block(local.session_id) if drafting and self._call_log is not None else ""
         with self._lock:

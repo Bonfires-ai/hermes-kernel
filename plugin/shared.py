@@ -32,6 +32,9 @@ class Shared:
         self.source: Any = None
         self.call_log: Any = None
         self.editor: Any = None
+        #: the phrase runner and the phrase tools, built once by the general path's `register`; None before
+        self.runs: Any = None
+        self.tools: Any = None
 
     def capture(self, spool_path: Path) -> Capture | None:
         """The one Capture, made on first call (it starts no thread until first use). None without a client."""
