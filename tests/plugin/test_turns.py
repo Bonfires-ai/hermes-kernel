@@ -294,3 +294,24 @@ def test_a_repair_gives_a_generic_line_and_none_of_its_text(env):
     assert out is not None
     assert "MARKER-5521" not in out["context"] and "fetch" not in out["context"]
     assert "answer" in out["context"]
+
+
+def test_an_old_unaddressed_message_is_not_taken_by_a_rewritten_turn(env):
+    session(env)
+    client = FakeClient()
+    turns = KernelTurns(client)
+    turns.on_gateway_dispatch(event("chatter nobody asked", message_id="m1"))
+    turns.on_pre_llm_call(**hook(turn_id="h3", user_message="[reply to Bo] a new question", sender_id="U1"))
+    body, _ = client.calls[0]
+    assert body["message_id"] == "h3" and body["text"] == "[reply to Bo] a new question"
+
+
+def test_a_taken_message_retires_the_senders_older_ones(env):
+    session(env)
+    client = FakeClient()
+    turns = KernelTurns(client)
+    turns.on_gateway_dispatch(event("", message_id="m1"))
+    turns.on_gateway_dispatch(event("second", message_id="m2"))
+    turns.on_pre_llm_call(**hook(turn_id="h1", user_message="second", sender_id="U1"))
+    turns.on_pre_llm_call(**hook(turn_id="h2", user_message="a voice note", sender_id="U1"))
+    assert [c[0]["message_id"] for c in client.calls] == ["m2", "h2"]

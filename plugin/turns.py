@@ -397,18 +397,19 @@ class KernelTurns:
 
     def _take(self, conversation: str, user_text: str, sender_id: str) -> Inbound | None:
         """The message this turn answers, marked used: among the sender's unused messages (all unused ones when the
-        sender or the messages carry no id) the one with equal text, else, for a known sender, their oldest (a voice
-        message has no text). `None`: no message of this person's is waiting, so never another person's."""
+        sender or the messages carry no id) the one with equal text, else, for a known sender, their oldest one with no text (a voice
+        message). Taking one retires the sender's older ones. `None`: no message of this person's is waiting, so never another person's."""
         with self._lock:
             events = [e for e in self._inbound.get(conversation) or () if not e.used]
             if sender_id:
                 events = [e for e in events if e.user_id == sender_id]
             wanted = user_text.strip()
             found = next((e for e in events if e.text.strip() == wanted), None)
-            if found is None and sender_id and events:
-                found = events[0]
+            if found is None and sender_id:
+                found = next((e for e in events if not e.text.strip()), None)  # a voice message: no text
             if found is not None:
-                found.used = True
+                for e in events[: events.index(found) + 1]:  # older ones were never addressed: they match no later turn
+                    e.used = True
             return found
 
     # -- pre_llm_call ------------------------------------------------------------------------------------------------
