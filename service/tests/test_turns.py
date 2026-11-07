@@ -184,3 +184,25 @@ async def test_a_report_after_a_lost_save_completes_the_refusal_and_cannot_overt
     step = {"step_id": view.pending.step_id, "tool": "take", "args": WATER}
     assert mk.calls_of("resume") == [[{**step, **declined}]]  # the kernel took the verdict itself
     assert [u.outcome for u in await store.uses(view.bonfire_id)] == ["declined"]
+
+
+async def test_report_refuses_a_step_that_is_not_pending_and_builds_its_row_from_the_stored_step(
+    groups: SingleBonfire,
+) -> None:
+    mk = FakeMk({"brew thé for Kira Dace": BREW})
+    engine, store = _engine(mk, groups)
+    view = await engine.begin(team_turn("brew thé for Kira Dace"), parent=PARENT)
+    assert view.pending is not None
+    later_step = f"{view.plan_id}:1:0"  # a real step of the program, but not the pending one
+
+    for stale in ("p1:9:0", later_step, "nonsense"):
+        with pytest.raises(Refused):
+            await engine.report(view.turn_id, stale, "committed", "nothing")
+    assert await store.ledger(view.turn_id) == []  # nothing was written for them
+
+    after = await engine.report(view.turn_id, view.pending.step_id, "committed", "water#1")
+    assert after.pending is not None and after.pending.tool == "make"
+    (row,) = await store.ledger(view.turn_id)
+    assert (row.step_id, row.tool, row.args, row.value) == (view.pending.step_id, "take", WATER, "water#1")
+    with pytest.raises(Refused):  # the reported step is no longer pending
+        await engine.report(view.turn_id, view.pending.step_id, "committed", "water#2")
