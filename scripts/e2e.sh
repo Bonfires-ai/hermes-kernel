@@ -169,7 +169,8 @@ cleanup() {
   if [ "${E2E_KEEP_HOME:-no}" != "yes" ]; then
     stop_home_processes "$HERMES_HOME"
     rm -rf "$HERMES_HOME"
-    leftover="$(home_processes "$HERMES_HOME" | tr '\n' ' ')"
+    leftover="$(home_processes "$HERMES_HOME")"
+    leftover="${leftover//$'\n'/ }"
     if [ -n "${leftover// /}" ]; then
       RESULTS+=("FAIL  cleanup: processes still hold the temporary Hermes home after the stop: $leftover")
       [ $code -ne 0 ] || code=1
