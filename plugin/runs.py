@@ -35,8 +35,10 @@ that is pending and reports it (`POST /v1/turns/{child}/report`), and repeats un
   was written by an older plugin), every line of it is fenced (`FENCE_ALL`). So is what may echo those args: the
   service's repair question (always, whatever the child carries), and a step's failure (its own tool's fence, as
   Hermes fences an error result, else the fence of a value its args carry), in its line and its stop reason. A think
-  step's input is always fenced (`tools.think_lines`). The fence, the scan and the values carried go by the tool's real
-  name, never the step's short one: Hermes fences an `mcp_*` result, not a bare `mcp__srv__search`. The name is
+  step's input is always fenced, and so is its instruction when it may hold an earlier step's value (`carries`:
+  whichever tool gave it, a think step's own text included; `tools.think_lines`). The fence, the scan and the values
+  carried go by the tool's real name, never the step's short one: Hermes fences an `mcp_*` result, not a bare
+  `mcp__srv__search`. The name is
   the one the step was dispatched under, kept with a held result in the step ledger (after a restart no registry read
   may name the short one yet: its MCP server not connected). A held result whose name is unknown fails closed: its line
   in the plugin's own block (`fence.closed`), and the value carried under an `mcp_*` name, so Hermes fences what
@@ -64,7 +66,7 @@ from typing import Any, Literal
 from .agent_source import MCP_PREFIX, THINK, AgentSource
 from .client import Refused, ServiceClient, ServiceError, Unavailable, never_sent
 from .fence import closed, fenced, scan
-from .ledger import UNKNOWN, UNKNOWN_SOURCE, Carried, StepLedger
+from .ledger import FENCE_ALL, UNKNOWN, UNKNOWN_SOURCE, Carried, StepLedger
 
 logger = logging.getLogger(__name__)
 
@@ -105,13 +107,25 @@ def bounded(value: JsonValue) -> str:
     return text if len(text) <= _MAX_VALUE_CHARS else text[: _MAX_VALUE_CHARS - 1] + "…"
 
 
+def _holds(probe: str, value: str) -> bool:
+    """Whether `probe` (a JSON text) holds `value`."""
+    needle = json.dumps(value, ensure_ascii=False)[1:-1]
+    return bool(needle) and needle in probe
+
+
+def carries(text: str, carried: Carried) -> bool:
+    """Whether `text` may hold a value of `carried`: `FENCE_ALL`, or any value's text appears in it, whichever tool gave
+    the value and whether or not Hermes fences that tool."""
+    probe = _probe(text)
+    return any(tool == UNKNOWN or _holds(probe, value) for tool, value in carried)
+
+
 def fence_carried(text: str, probe: str, carried: Carried) -> str:
     """`text` inside the fence of the first tool whose result `probe` (a JSON text) carries and Hermes fences."""
     for tool, result in carried:
         if tool == UNKNOWN:
             return closed(UNKNOWN_SOURCE, text)
-        needle = json.dumps(result, ensure_ascii=False)[1:-1]
-        if needle and needle in probe and (out := fenced(tool, text)) != text:
+        if _holds(probe, result) and (out := fenced(tool, text)) != text:
             return out
     return text
 
@@ -209,9 +223,9 @@ def _result(result: object) -> tuple[str, str | None]:
 @dataclass
 class RunOutcome:
     """Where a drive left the phrase: `done` (no step is left: the turn finished), `paused_think` (a think step waits for
-    the model: `instruction`, `input`, `step`), or `stopped` (`reason`; `resumable` when `phrase_continue` can take it
-    on from `step`; `later` when the step surely still waits in the agent, so the speaker's next message shows it
-    waiting too)."""
+    the model: `instruction`, `input`, `step`, and `carried`, what the child's lines are fenced by), or `stopped`
+    (`reason`; `resumable` when `phrase_continue` can take it on from `step`; `later` when the step surely still waits
+    in the agent, so the speaker's next message shows it waiting too)."""
 
     kind: Literal["done", "paused_think", "stopped"]
     turn_id: str
@@ -220,6 +234,7 @@ class RunOutcome:
     instruction: str | None = None
     input: str | None = None
     step: JsonObject | None = None
+    carried: Carried = FENCE_ALL
     reason: str | None = None
     resumable: bool = False
     later: bool = False
@@ -338,6 +353,8 @@ class PhraseRun:
                     if reported == "ended":  # a licensed turn with nothing pending is still alive: keep its record
                         self._ledger.end(child_turn_id)
                     return RunOutcome("stopped", child_turn_id, reason=NOT_WAITING)
+                # The model's text can repeat what it read, and a later step can bind it, so it counts as carried.
+                self._ledger.carry(child_turn_id, THINK, _cut(text))
                 if reported == "taken":
                     out.lines.append("1. think: its text went in already, on an earlier try (not sent again)")
                 else:
@@ -430,7 +447,7 @@ class PhraseRun:
                     self._ledger.end(child)  # the child turn ended: its values are no longer kept
                 return out
             if step["tool"] == THINK:
-                out.kind, out.step = "paused_think", step
+                out.kind, out.step, out.carried = "paused_think", step, self.carried(child)
                 out.instruction, out.input = think_parts(step)
                 return out
             if deadline - self._clock() < _MIN_LEFT_S:
