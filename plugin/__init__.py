@@ -50,6 +50,16 @@ def register(ctx) -> None:
 
     get_shared()
     if hasattr(ctx, "dispatch_tool"):
-        log.info("hermes-kernel loaded (general path)")  # hooks, tools and commands arrive in later tasks
+        from .turns import KernelTurns
+
+        shared = get_shared()
+        with shared.lock:
+            if shared.turns is None and shared.client is not None:
+                shared.turns = KernelTurns(shared.client)
+            turns = shared.turns
+        if turns is not None:
+            ctx.register_hook("pre_gateway_dispatch", turns.on_gateway_dispatch)
+            ctx.register_hook("pre_llm_call", turns.on_pre_llm_call)
+        log.info("hermes-kernel loaded (general path)")  # tools and commands arrive in later tasks
         return
     ctx.register_memory_provider(KernelMemory())

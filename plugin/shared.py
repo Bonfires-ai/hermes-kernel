@@ -26,6 +26,8 @@ class Shared:
         self.lock = threading.RLock()
         #: the Capture once `capture()` made it; None before, or with no client
         self.made_capture: Capture | None = None
+        #: the turn reader, built by the general path's `register`; None before, or with no client
+        self.turns: Any = None
 
     def capture(self, spool_path: Path) -> Capture | None:
         """The one Capture, made on first call (it starts no thread until first use). None without a client."""
