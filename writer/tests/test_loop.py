@@ -476,3 +476,36 @@ def test_the_writer_never_touches_another_bonfires_sessions(db) -> None:
     claimed = queue.claim()  # the oldest closed session is theirs, and it is waiting out a delay: neither stops this
     assert claimed is not None and claimed["id"] == "mine"
     assert list(db.sessions.find({"bonfire_id": "other"}).sort("_id")) == before
+
+
+@pytest.mark.parametrize("new_rows", [0, 1])
+def test_a_session_spanning_the_upgrade_builds_its_old_messages(db, settings, new_rows) -> None:
+    # A chat open at the restart: a message stored before the bonfire was in the key has its plain id as `_id` and no
+    # `message_id`. Skipping it would build without it, and `built` would then remove its text for good.
+    add_session(db, "A", 1, messages=new_rows)
+    old = "said before the upgrade"
+    db.messages.insert_one({"_id": "old-1", "session_id": "A", "seq": 0, "speaker": "me", "text": old, "timestamp": T0})
+    handed: list[SimpleNamespace] = []
+
+    def append_session(bonfire_id, session, **kw):
+        handed.append(session)
+        return {"status": "appended"}
+
+    def build(claimed: Claimed) -> BuildResult:
+        return build_session(settings, claimed, api=_api(append_session), ops=object(), parse=None)
+
+    assert run_once(Queue(db, "bf"), build, Release(), settings)
+    assert state(db, "A")["state"] == "built"
+    assert state(db, "A").get("reason") is None  # nothing dropped
+    (session,) = handed
+    assert [m["message_id"] for m in session.messages][0] == "old-1"
+    assert session.messages[0]["text"] == old
+    assert len(session.messages) == 1 + new_rows
+
+
+def test_built_leaves_the_text_of_a_session_it_did_not_mark(db) -> None:
+    add_session(db, "theirs", 0)
+    db.sessions.update_one({"_id": "theirs"}, {"$set": {"bonfire_id": "other"}})
+    Queue(db, "bf").built("theirs")
+    assert state(db, "theirs")["state"] == "closed"
+    assert [m.get("text") for m in db.messages.find({"session_id": "theirs"})] == ["text theirs 0", "text theirs 1"]

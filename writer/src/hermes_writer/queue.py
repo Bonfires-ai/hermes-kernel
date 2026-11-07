@@ -102,12 +102,13 @@ class Queue:
 
     @staticmethod
     def _message(m: dict[str, Any]) -> dict[str, Any] | None:
-        """A message in the kernel's shape; None for one with no text (built) or a missing field (warned)."""
+        """A message in the kernel's shape; None for one with no text (built) or a missing field (warned). A message
+        stored before the bonfire was in the key has no ``message_id``: its ``_id`` is the plain id."""
         if not m.get("text"):
             return None
         try:
             return {
-                "message_id": str(m["message_id"]),
+                "message_id": str(m.get("message_id", m["_id"])),
                 "speaker": m["speaker"],
                 "text": m["text"],
                 "timestamp": _utc(m["timestamp"]).isoformat(),
@@ -121,7 +122,10 @@ class Queue:
         fields: dict[str, Any] = {"state": "built", "built_at": self._clock()}
         if reason:
             fields["reason"] = reason
-        self._sessions.update_one(self._mine(_id=session_id), {"$set": fields})
+        marked = self._sessions.update_one(self._mine(_id=session_id), {"$set": fields})
+        if marked.matched_count == 0:  # the write below is keyed by session id alone: never on its own
+            log.warning("session %s is not this writer's to mark built: its text stays", session_id)
+            return
         self._messages.update_many({"session_id": session_id}, {"$unset": {"text": ""}})
 
     def stopped(self, session_id: str, reason: str) -> int:

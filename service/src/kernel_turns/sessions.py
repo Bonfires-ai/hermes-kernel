@@ -10,8 +10,9 @@ The two collections below (in ``KT_MONGO_DB``) are the contract between the two 
   from it); ``last_ts`` is the latest *stored message* timestamp (the writer ignores it).
 * ``messages``: ``{_id: keys.message_key(bonfire_id, message_id), bonfire_id, message_id, session_id, seq, speaker,
   text, timestamp, addressees}``. ``_id`` is unique, so a resend is a duplicate, and the same ``message_id`` in another
-  bonfire is another message. The kernel is only ever handed the plain ``message_id``. ``timestamp`` is timezone-aware
-  and strictly increasing within a session (mk refuses anything else).
+  bonfire is another message. The kernel is only ever handed the plain ``message_id``. A message stored before the
+  bonfire was in the key has neither field and its plain id as ``_id``; the writer reads it as that id. ``timestamp`` is
+  timezone-aware and strictly increasing within a session (mk refuses anything else).
 
 Guarantees the writer may rely on, and what it must not assume:
 

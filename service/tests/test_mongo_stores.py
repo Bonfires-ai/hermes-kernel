@@ -15,7 +15,7 @@ import uuid
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
@@ -25,7 +25,7 @@ from pymongo.errors import DuplicateKeyError
 
 from kernel_turns.app import create_app
 from kernel_turns.config import Settings
-from kernel_turns.models import LedgerRow, TurnRecord
+from kernel_turns.models import LedgerRow, PendingStep, TurnRecord
 from kernel_turns.sessions import MemorySessionStore, MessageIn, MongoSessionStore, SessionStore, SessionTake
 from kernel_turns.store import Doc, MemoryTurnStore, MongoTurnStore, TurnStore
 from kernel_turns.turns import TurnEngine, UnknownTurn
@@ -202,6 +202,33 @@ async def test_each_bonfire_has_its_own_ledger_rows(store: Stores) -> None:
     assert [(r.bonfire_id, r.value) for r in await store.turns.ledger(A, "t1")] == [(A, "a's")]
     assert [(r.bonfire_id, r.value) for r in await store.turns.ledger(B, "t1")] == [(B, "b's")]
     assert await store.turns.ledger("bonfire-c", "t1") == []
+
+
+async def test_previous_and_waiting_turns_stay_in_their_bonfire(store: Stores) -> None:
+    def later(turn: TurnRecord, minutes: int) -> TurnRecord:
+        return turn.model_copy(update={"at": AT + timedelta(minutes=minutes)})
+
+    def paused(turn_id: str, bonfire_id: str) -> TurnRecord:
+        step = PendingStep(step_id="s", tool="think", args={}, effect_key="k", needs_confirmation=False)
+        return _turn(turn_id, bonfire_id).model_copy(update={"parent": "parent", "status": "licensed", "pending": step})
+
+    # A and B share a chat and a speaker, and B's are always the nearer in time
+    for turn in (
+        _turn("a-before", A),
+        later(_turn("b-before", B), 1),
+        paused("a-paused", A),
+        later(paused("b-paused", B), 1),
+    ):
+        await store.turns.save_turn(turn)
+    now = later(_turn("now", A), 2)
+    previous, waiting = await store.turns.previous_turn(now), await store.turns.waiting_turn(now)
+    assert previous is not None
+    assert previous.turn_id == "a-before"
+    assert waiting is not None
+    assert waiting.turn_id == "a-paused"
+    alone = later(_turn("alone", "bonfire-c"), 2)  # the same chat and speaker in a bonfire with neither
+    assert await store.turns.previous_turn(alone) is None
+    assert await store.turns.waiting_turn(alone) is None
 
 
 async def test_the_same_message_in_two_bonfires_is_two_turns(store: Stores) -> None:
