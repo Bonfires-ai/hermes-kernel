@@ -15,7 +15,6 @@ Needs `pexpect`.
 from __future__ import annotations
 
 import json
-import os
 import re
 import subprocess
 import sys
@@ -24,25 +23,11 @@ from pathlib import Path
 from typing import Any
 
 import pexpect  # pyright: ignore[reportMissingModuleSource]
+from e2e_guard import require_own_hermes_home
 
 # CSI sequences, OSC strings (ended by BEL or ST; a bare "up to the next BEL" would swallow the text after one that ends
 # with ST), character-set selections, and carriage returns.
 ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][A-Za-z0-9]|\r")
-
-
-def require_own_hermes_home() -> Path:
-    """Refuse, before anything is spawned, unless HERMES_HOME is set, absolute, and not the real ~/.hermes (after realpath)."""
-    raw = os.environ.get("HERMES_HOME", "")
-    if not raw:
-        sys.exit(
-            "refusing to run: HERMES_HOME is not set. Hermes migrates the home it starts on, so point it at a throwaway directory first."
-        )
-    if not os.path.isabs(raw):
-        sys.exit(f"refusing to run: HERMES_HOME must be an absolute path, got '{raw}'.")
-    real = os.path.realpath(os.path.expanduser("~/.hermes"))
-    if os.path.realpath(raw) == real:
-        sys.exit(f"refusing to run: HERMES_HOME resolves to the real Hermes home ({real}). Use a throwaway directory.")
-    return Path(raw)
 
 
 def clean(raw: bytes) -> str:

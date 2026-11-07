@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The whole thing from nothing, the way the README says to do it, on a real Hermes and a real stack.
 #
-#   E2E_CONFIRM=yes scripts/e2e.sh
+#   HERMES_HOME=/some/throwaway/directory E2E_CONFIRM=yes scripts/e2e.sh
 #
 # THIS SCRIPT DELETES DATA. It starts with `docker compose down -v` on its own project (E2E_PROJECT, default
 # hermes-kernel-e2e): that project's Neo4j and Mongo volumes, and with them every memory built under it. It accepts
@@ -10,11 +10,11 @@
 # compose), so a Hermes of yours that points at port 8787 later is refused (401) and keeps its data instead of feeding a
 # stack that is about to be wiped. It never reads or writes ~/.hermes: Hermes runs in a fresh temporary home, removed at
 # the end, after every process that was started on that home (Hermes leaves a background gateway per home) is stopped.
-# It refuses to start unless HERMES_HOME is set in your shell to an absolute path that is not ~/.hermes (also through a
+# It refuses to start unless HERMES_HOME is set in your shell to an absolute path outside ~/.hermes (also through a
 # symlink): that value is only checked, the run uses its own temporary home. It needs Hermes v0.23.0 exactly, and 9 GiB of RAM available.
 #
 # It spends real money (a few cents to build the memory, and a chat model for about a dozen turns; the target is under
-# $1) and takes about half an hour, most of it waiting for memory to build.
+# $1) and takes about 15 minutes, most of it waiting for memory to build.
 #
 # Settings (all optional except E2E_CONFIRM):
 #   E2E_PROJECT          compose project name, must start with hermes-kernel-e2e   (hermes-kernel-e2e)
@@ -28,7 +28,7 @@
 #   E2E_BUILD            `no` skips `docker compose build`           (yes)
 #   E2E_BUILT_WAIT_S     seconds to wait for each session to be built   (1800)
 #   E2E_KEEP_STACK       `yes` leaves the stack running at the end      (no: it is removed with `down -v`)
-#   E2E_KEEP_HOME        `yes` keeps the temporary HERMES_HOME           (no)
+#   E2E_KEEP_HOME        `yes` keeps the temporary HERMES_HOME; what ran on it is still stopped   (no)
 #   E2E_KT_TOKEN         use this bearer token instead of a fresh one    (a fresh one; needed to use a kept stack later)
 #
 # Needs OPENROUTER_API_KEY, VOYAGE_API_KEY and NEO4J_PASSWORD in .env (copied from .env.example). They are read from
@@ -51,13 +51,29 @@ PORT=8787
 
 die() { echo "e2e: $*" >&2; exit 2; }
 
-# Refuse, before anything is spawned, unless HERMES_HOME is set, absolute, and not the real ~/.hermes (after realpath).
+# Refuse, before anything is spawned, unless HERMES_HOME is an absolute path outside the real Hermes home. The rule of
+# e2e_guard.py: Hermes strips the value, expands variables in it and takes a profile under the real home as a home, and
+# the real home comes from the password database as well as from HOME, which can be unset or point elsewhere.
 require_own_hermes_home() {
-  local raw="${HERMES_HOME:-}"
+  local raw="${HERMES_HOME:-}" target home real checked=0
+  raw="${raw#"${raw%%[![:space:]]*}"}"
+  raw="${raw%"${raw##*[![:space:]]}"}"
   [ -n "$raw" ] || die "refusing to run: HERMES_HOME is not set. Hermes migrates the home it starts on, so point it at a throwaway directory first."
-  case "$raw" in /*) ;; *) die "refusing to run: HERMES_HOME must be an absolute path, got '$raw'." ;; esac
-  [ "$(realpath -m -- "$raw")" != "$(realpath -m -- "$HOME/.hermes")" ] \
-    || die "refusing to run: HERMES_HOME resolves to the real Hermes home ($HOME/.hermes). Use a throwaway directory."
+  case "$raw" in
+    *'$'*) die "refusing to run: HERMES_HOME must be a plain absolute path, got '$raw'." ;;
+    /*) ;;
+    *) die "refusing to run: HERMES_HOME must be a plain absolute path, got '$raw'." ;;
+  esac
+  target="$(realpath -m -- "$raw")"
+  for home in "$(getent passwd "$(id -u)" | cut -d: -f6)" "${HOME:-}"; do
+    [ -n "$home" ] || continue
+    checked=1
+    real="$(realpath -m -- "$home/.hermes")"
+    case "$target/" in
+      "$real/"*) die "refusing to run: HERMES_HOME is in the real Hermes home ($real). Use a throwaway directory." ;;
+    esac
+  done
+  [ "$checked" -eq 1 ] || die "refusing to run: cannot tell where the real Hermes home is, so HERMES_HOME cannot be checked."
 }
 require_own_hermes_home
 
@@ -121,6 +137,7 @@ fi
 command -v "$HERMES" >/dev/null || die "no '$HERMES' on PATH (set E2E_HERMES)."
 "$PY" -c 'import pexpect' 2>/dev/null || die "'$PY' has no pexpect (pip install pexpect, or set E2E_PYTHON)."
 command -v jq >/dev/null || die "jq is needed."
+command -v openssl >/dev/null || die "openssl is needed."
 avail_mb="$(awk '/MemAvailable/ {print int($2 / 1024)}' /proc/meminfo)"
 [ "$avail_mb" -ge 9216 ] || die "less than 9 GiB of RAM available (${avail_mb} MiB): the stack peaked at 8 GiB while it built memory."
 
@@ -133,15 +150,19 @@ dc() { docker compose -p "$PROJECT" "${FILES[@]}" "$@"; }
 
 # ---- a fresh Hermes home, and the keys, read without printing ----------------------------------------------------------
 
-HERMES_HOME="$(mktemp -d)"
+# Resolved: Hermes gives its gateway the resolved path, and the stop below matches a process by that exact value.
+HERMES_HOME="$(realpath -- "$(mktemp -d)")"
 export HERMES_HOME
+# Until the real trap below: any exit from here on still removes this home.
+trap 'stop_home_processes "$HERMES_HOME"; rm -rf "$HERMES_HOME"' EXIT
 require_own_hermes_home
 [ -n "$OUT" ] || OUT="$(mktemp -d)"
 mkdir -p "$OUT"
-hermes_version="$("$HERMES" --version 2>&1 | head -1)"
+hermes_said="$("$HERMES" --version 2>&1)" || die "'$HERMES --version' failed: $(head -1 <<<"$hermes_said")"
+hermes_version="$(head -1 <<<"$hermes_said")"
 case "$hermes_version" in
   "Hermes Agent v0.23.0 "*) ;;
-  *) stop_home_processes "$HERMES_HOME"; rm -rf "$HERMES_HOME"; die "this needs Hermes v0.23.0, and '$HERMES' says: $hermes_version" ;;
+  *) die "this needs Hermes v0.23.0, and '$HERMES' says: $hermes_version" ;;
 esac
 env_value() { grep -E "^$1=" .env | head -1 | cut -d= -f2- || true; }
 OPENROUTER_VALUE="$(env_value OPENROUTER_API_KEY)"
@@ -158,28 +179,32 @@ STAGE=""
 RESULTS=()
 cleanup() {
   code=$?
+  trap - EXIT INT TERM HUP
   CHAT_COST="chat model cost: not available"
   if [ -f "$HERMES_HOME/state.db" ] && command -v sqlite3 >/dev/null; then
     CHAT_COST="chat model cost as Hermes estimated it: $(sqlite3 "$HERMES_HOME/state.db" 'select printf("%.4f", coalesce(sum(estimated_cost_usd), 0)) from sessions' 2>/dev/null || echo unknown) USD"
   fi
   if [ $code -ne 0 ]; then dc logs --no-color --tail 300 >"$OUT/stack-logs.txt" 2>&1 || true; fi
+  # Every run, passed or failed: what the turn service refused, and what Hermes itself logged about each model call.
+  dc logs --no-color turn-service >"$OUT/turn-service.log" 2>&1 || true
+  RESULTS+=("INFO  calls the turn service refused: $(grep -c 'kernel_turns.call_refused' "$OUT/turn-service.log" || true)")
+  cp -r "$HERMES_HOME/logs" "$OUT/hermes-logs" 2>/dev/null || true
   rm -f "$OUT/.auth-header"
   # Hermes starts a background gateway for the home it runs on, and it outlives the chat: stop everything on this home
-  # first, and only then remove the home (a gateway still running would recreate part of it).
-  if [ "${E2E_KEEP_HOME:-no}" != "yes" ]; then
-    stop_home_processes "$HERMES_HOME"
-    rm -rf "$HERMES_HOME"
-    leftover="$(home_processes "$HERMES_HOME")"
-    leftover="${leftover//$'\n'/ }"
-    if [ -n "${leftover// /}" ]; then
-      RESULTS+=("FAIL  cleanup: processes still hold the temporary Hermes home after the stop: $leftover")
-      [ $code -ne 0 ] || code=1
-      STAGE="${STAGE:-cleanup}"
-    else
-      RESULTS+=("PASS  cleanup: no process holds the temporary Hermes home")
-    fi
-    rm -rf "$HERMES_HOME"
+  # first, and only then remove the home (a gateway still running would recreate part of it). E2E_KEEP_HOME keeps the
+  # files and nothing that runs.
+  stop_home_processes "$HERMES_HOME"
+  [ "${E2E_KEEP_HOME:-no}" = "yes" ] || rm -rf "$HERMES_HOME"
+  leftover="$(home_processes "$HERMES_HOME")"
+  leftover="${leftover//$'\n'/ }"
+  if [ -n "${leftover// /}" ]; then
+    RESULTS+=("FAIL  cleanup: processes still hold the temporary Hermes home after the stop: $leftover")
+    [ $code -ne 0 ] || code=1
+    STAGE="${STAGE:-cleanup}"
+  else
+    RESULTS+=("PASS  cleanup: no process holds the temporary Hermes home")
   fi
+  [ "${E2E_KEEP_HOME:-no}" = "yes" ] || rm -rf "$HERMES_HOME"
   echo
   echo "== summary ($(( $(date +%s) - START )) s wall) =="
   for line in "${RESULTS[@]}"; do echo "$line"; done
@@ -189,6 +214,7 @@ cleanup() {
   fi
   echo "$CHAT_COST"
   echo "transcripts and logs: $OUT"
+  [ "${E2E_KEEP_HOME:-no}" != "yes" ] || echo "the temporary Hermes home is kept: $HERMES_HOME"
   if [ "${E2E_KEEP_STACK:-no}" = "yes" ]; then
     echo "the stack '$PROJECT' is still running (E2E_KEEP_STACK=yes); remove it with: docker compose -p $PROJECT ${FILES[*]} down -v"
   else
@@ -198,6 +224,10 @@ cleanup() {
   exit $code
 }
 trap cleanup EXIT
+# Without these the EXIT trap would see status 0 on a signal, and report nothing.
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 stage() { STAGE="$1"; echo; echo "== $1 =="; }
 pass() { RESULTS+=("PASS  $1"); echo "PASS  $1"; }
@@ -294,6 +324,14 @@ MEM_BUILT_FOUND=$(( $(now) - S1_END ))
 wait_recall "What is the sourdough starter called?" "bramble" || fail "2. built, but recall does not return the first session (Bramble)"
 MEM_DELAY_FOUND=$(( $(now) - S1_END ))
 echo "memory delay (session end to recall returning it, founding): ${MEM_DELAY_FOUND} s (built after ${MEM_BUILT_FOUND} s)"
+# What was stored: the agent is hermes whatever the Hermes profile is called, and the person is someone else.
+handles="$(mongo 'print(JSON.stringify(db.sessions.find().toArray().map(s => s.agent_handles)))' | tr -d '\r')"
+replies="$(mongo 'db.messages.countDocuments({speaker: "hermes"})' | tr -d '[:space:]')"
+person="$(mongo 'print(JSON.stringify(db.messages.distinct("speaker", {addressees: "hermes"})))' | tr -d '\r')"
+echo "stored: agent_handles $handles, replies by hermes $replies, spoken to hermes by $person"
+[ "$handles" = '[["hermes"]]' ] || fail "2. the session's agent_handles are $handles, not hermes"
+[ "$replies" = "2" ] || fail "2. expected the agent's two replies stored under the speaker hermes, found $replies"
+jq -e 'length == 1 and .[0] != "hermes"' <<<"$person" >/dev/null || fail "2. the person's speaker is $person"
 pass "2. a first conversation, then founding (${MEM_DELAY_FOUND} s from session end to recall returning it; kernel spend $(spend) USD)"
 
 # ---- 3. a new session recalls it; /kernel against the live stack --------------------------------------------------------
