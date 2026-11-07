@@ -349,6 +349,7 @@ def test_no_v1_route_goes_without_its_caller(client: TestClient) -> None:
         assert isinstance(path, str) and isinstance(route, APIRoute)
         assert "who" in inspect.signature(route.endpoint).parameters, path
         assert any(d.call is app.state.caller for d in route.dependant.dependencies), path
+        assert route.methods, path
         for method in route.methods:
             assert client.request(method, re.sub(r"{[^}]+}", "x", path)).status_code == 401, (method, path)
 
