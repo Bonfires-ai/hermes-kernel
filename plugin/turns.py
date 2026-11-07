@@ -12,7 +12,7 @@ block is bounded (`_MAX_BLOCK_CHARS`). The hook is held to `READ_BUDGET_S`: a la
 
 So the chat, the message id and the speaker come from `pre_gateway_dispatch` (`event`, a `MessageEvent`), recorded
 per conversation (the session record's `conversation_id`, the same string capture uses) and found again from the
-session id. The observer does no network and no disk (Hermes puts no time limit on that hook) and always returns
+session id, matched to the turn by the sender's id and the text, each message used once. The observer does no network and no disk (Hermes puts no time limit on that hook) and always returns
 `None`. With no gateway (the CLI) no such hook fires: the message id is Hermes' `turn_id` and the speaker is the
 session record's `user_name`, then `sender_id`, then "user".
 
@@ -36,7 +36,7 @@ import logging
 import threading
 import uuid
 from collections import OrderedDict
-from collections.abc import Callable, Collection, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Protocol
@@ -49,10 +49,6 @@ logger = logging.getLogger(__name__)
 
 #: the whole read, passed to `begin` as its timeout
 READ_BUDGET_S = 10.0
-#: the step tool a phrase hands back to the model
-THINK = "think"
-#: agent values a phrase's child turn carried: `(tool, result)` pairs
-Carried = Collection[tuple[str, object]]
 
 #: the block stays well under Hermes' 10 000-char spill: role values and the number of lines are capped
 _MAX_BLOCK_CHARS = 6000
@@ -60,8 +56,12 @@ _MAX_ROLE_CHARS = 120
 _MAX_FRAME_LINES = 12
 #: the accepted offer's forms, body and defaults in the never-cut lines (still bounded)
 _MAX_OFFER_CHARS = 1500
-#: a waiting think step's instruction is shown up to this long (a longer one may be a result)
-_MAX_INSTRUCTION_CHARS = 200
+#: a phrase's name, id and step tool are shown up to this long
+_MAX_NAME_CHARS = 80
+#: a repair's text (the kernel may quote a step's outcome) is shown up to this long
+_MAX_REPAIR_CHARS = 300
+#: a recorded message's text is kept up to this long
+_MAX_INBOUND_CHARS = 4000
 #: the two affordances that are tools of their own, not phrases to run
 OWN_TOOLS = ("teach_phrase", "confirm_phrase")
 
@@ -88,9 +88,9 @@ class Log(Protocol):
     def block(self, session_id: str) -> str: ...
 
 
-@dataclass(frozen=True)
+@dataclass
 class Inbound:
-    """A message as the gateway dispatched it."""
+    """A message as the gateway dispatched it (before it was authorised: it may never become a turn)."""
 
     message_id: str
     text: str
@@ -98,6 +98,10 @@ class Inbound:
     at: str
     #: the platform's chat id
     chat: str
+    #: the sender's platform id, to match the hook's `sender_id`
+    user_id: str | None = None
+    #: a turn took this message: no other turn takes it
+    used: bool = False
 
 
 @dataclass
@@ -156,14 +160,10 @@ def message_text(user_message: Any) -> str:
     return ""
 
 
-def carries(text: str, carried: Carried) -> bool:
-    """Whether `text` carries one of the agent values `carried`."""
-    probe = json.dumps(text, ensure_ascii=False)
-    for _tool, result in carried:
-        needle = json.dumps(result, ensure_ascii=False)[1:-1]
-        if needle and needle in probe:
-            return True
-    return False
+def _short(value: object, limit: int = _MAX_NAME_CHARS) -> str:
+    """One line of at most `limit` characters."""
+    text = " ".join(str(value).split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
 def _role(role: str, value: object) -> str:
@@ -198,12 +198,11 @@ def frames_block(
     view: JsonObject,
     *,
     names: Mapping[str, str] | None = None,
-    carried: Callable[[str], Carried] | None = None,
 ) -> str:
     """What the model may run and what the kernel read in the message, one short block ("" when it read nothing:
     no frames, no waiting phrase, no offer). The lines naming the calls and the teaching tools come first and are
     never cut; the frame lines get the budget that is left (`_MAX_BLOCK_CHARS`), whole lines only. `names`: phrase
-    names by child turn id, and `carried`: a child turn's agent values, for the waiting line."""
+    names by child turn id, for the waiting line."""
     raw = view.get("frames")
     frames = [f for f in raw if isinstance(f, dict)] if isinstance(raw, list) else []
     waiting = view.get("waiting")
@@ -226,7 +225,7 @@ def frames_block(
         lines.append(f"Your own tools, afforded too: {', '.join(native)}. Call them directly, not with run_phrase.")
     if isinstance(waiting, dict):
         child = str(waiting.get("turn_id"))
-        lines.append(waiting_line(waiting, (names or {}).get(child), carried(child) if carried is not None else ()))
+        lines.append(waiting_line(waiting, (names or {}).get(child)))
     if "teach_phrase" in afford and isinstance(offer, dict):
         lines.append(offer_line(offer, also_confirm="confirm_phrase" in afford))
     elif "teach_phrase" in afford:
@@ -244,30 +243,23 @@ def frames_block(
     return "\n".join(lines)
 
 
-def waiting_line(waiting: JsonObject, name: str | None = None, carried: Carried = ()) -> str:
+def waiting_line(waiting: JsonObject, name: str | None = None) -> str:
     """The speaker's phrase waiting at a step that runs in the agent (`TurnView.waiting`): the phrase (`name` when
-    known, and its id), the step's tool and a think step's short instruction (not one bound from an agent value this
-    process saw, `carried`), never its input or args (an earlier step's result: someone else's words, here as the
-    person's). `phrase_continue` with empty text hands back a think step whole, fenced."""
+    known, and its id) and the step's tool. Never the step's input or args: they may be bound from an earlier result
+    (a web page's text), and this block is stored with the person's message and replayed. `phrase_continue` with
+    empty text hands the step back, fenced as an untrusted result."""
     step = waiting.get("step")
     step = step if isinstance(step, dict) else {}
-    child = waiting.get("turn_id")
-    phrase = f'"{name}" ({child})' if name else str(child)
+    child = _short(waiting.get("turn_id"))
+    phrase = f'"{_short(name)}" ({child})' if name else child
     tool = step.get("tool")
-    at = f"its {tool} step" if isinstance(tool, str) and tool else "its next step"
-    args = step.get("args")
-    instruction = args.get("instruction") if isinstance(args, dict) and tool == THINK else None
-    short = isinstance(instruction, str) and instruction.strip() and len(instruction) <= _MAX_INSTRUCTION_CHARS
-    if isinstance(instruction, str) and short and not carries(instruction, carried):
-        at += f' ("{" ".join(instruction.split())}")'
-    line = (
-        f"A phrase this person started, {phrase}, is waiting at {at}: continue it with the phrase_continue tool "
-        f'(phrase "{child}"; at a think step, its text is your result of that step), or drop it when they do not want '
-        'it any more (phrase_continue with "drop": true).'
+    at = f"its {_short(tool)} step" if isinstance(tool, str) and tool else "its next step"
+    return (
+        f"A phrase this person started, {phrase}, is waiting at {at}: read the step with the phrase_continue tool "
+        f'(phrase "{child}", empty text; that shows it and runs nothing), then continue it with phrase_continue (its '
+        "text is your result of that step), or drop it when they do not want it any more "
+        '(phrase_continue with "drop": true).'
     )
-    if tool == THINK:
-        line += " phrase_continue with empty text shows the whole step first and runs nothing."
-    return line
 
 
 def offer_line(offer: JsonObject, *, also_confirm: bool) -> str:
@@ -317,7 +309,7 @@ def _reading_lines(frames: list[JsonObject], budget: int) -> list[str]:
 
 
 def repair_block(repair: str) -> str:
-    return f"For this message only, the kernel could not run it as asked: {repair}"
+    return f"For this message only, the kernel could not run it as asked: {_short(repair, _MAX_REPAIR_CHARS)}"
 
 
 class KernelTurns:
@@ -329,13 +321,10 @@ class KernelTurns:
         *,
         source: Source | None = None,
         call_log: Log | None = None,
-        carried: Callable[[str], Carried] | None = None,
     ) -> None:
         self._client = client
         self._source = source
         self._call_log = call_log
-        #: a phrase child turn's agent values, so the waiting line never shows one
-        self._carried = carried
         self._lock = threading.Lock()
         self._inbound: OrderedDict[str, list[Inbound]] = OrderedDict()
         self._participants: OrderedDict[str, OrderedDict[str, None]] = OrderedDict()
@@ -374,10 +363,11 @@ class KernelTurns:
         key = conversation_id(platform, chat, "")
         inbound = Inbound(
             message_id=message_id,
-            text=_as_str(getattr(event, "text", None)),
+            text=_as_str(getattr(event, "text", None))[:_MAX_INBOUND_CHARS],
             speaker=speaker_of(event),
             at=_iso(getattr(event, "timestamp", None)),
             chat=chat,
+            user_id=_as_str(getattr(source, "user_id", None)) or None,
         )
         with self._lock:
             events = self._inbound.pop(key, None) or []
@@ -385,7 +375,6 @@ class KernelTurns:
             self._inbound[key] = events
             while len(self._inbound) > _SESSIONS_KEPT:
                 self._inbound.popitem(last=False)
-        self._note_speaker(key, inbound.speaker)
 
     def latest(self, conversation: str) -> Inbound | None:
         """The newest message recorded for `conversation`."""
@@ -407,14 +396,21 @@ class KernelTurns:
                 self._participants.popitem(last=False)
             return list(people)
 
-    def _inbound_for(self, conversation: str, user_text: str) -> Inbound | None:
-        """The message this turn answers: the newest recorded one whose text the turn carries, else the newest."""
+    def _take(self, conversation: str, user_text: str, sender_id: str) -> Inbound | None:
+        """The message this turn answers, marked used: among the sender's unused messages (all unused ones when the
+        sender or the messages carry no id) the one with equal text, else, for a known sender, their oldest (a voice
+        message has no text). `None`: no message of this person's is waiting, so never another person's."""
         with self._lock:
-            events = list(self._inbound.get(conversation) or ())
-        for inbound in reversed(events):
-            if inbound.text and inbound.text in user_text:
-                return inbound
-        return events[-1] if events else None
+            events = [e for e in self._inbound.get(conversation) or () if not e.used]
+            if sender_id:
+                events = [e for e in events if e.user_id == sender_id]
+            wanted = user_text.strip()
+            found = next((e for e in events if e.text.strip() == wanted), None)
+            if found is None and sender_id and events:
+                found = events[0]
+            if found is not None:
+                found.used = True
+            return found
 
     # -- pre_llm_call ------------------------------------------------------------------------------------------------
 
@@ -446,18 +442,23 @@ class KernelTurns:
         platform = _as_str(kwargs.get("platform")).lower() or _as_str(info.get("platform")).lower() or "cli"
         conversation = str(info.get("conversation_id") or conversation_id(platform, "", session_id))
         user_text = message_text(kwargs.get("user_message"))
-        inbound = self._inbound_for(conversation, user_text)
+        sender_id = _as_str(kwargs.get("sender_id"))
+        inbound = self._take(conversation, user_text, sender_id)
         if inbound is not None:
-            message_id, text, at, speaker = inbound.message_id, inbound.text or user_text, inbound.at, inbound.speaker
+            message_id, at, speaker = inbound.message_id, inbound.at, inbound.speaker
         else:
-            message_id, text, at, speaker = hermes_turn or uuid.uuid4().hex, user_text, _iso(None), None
-        speaker = speaker or info.get("user_name") or kwargs.get("sender_id") or "user"
+            message_id, at, speaker = hermes_turn or uuid.uuid4().hex, _iso(None), None
+        text = user_text
+        speaker = speaker or info.get("user_name") or sender_id or "user"
         speaker = _as_str(speaker)
         participants = self._note_speaker(conversation, speaker)
         local = LocalTurn(hermes_turn, session_id, platform, conversation, conversation, speaker)
         self._remember(local)
         if self._source is not None:
-            self._source.sync_soon()
+            try:
+                self._source.sync_soon()
+            except Exception:  # noqa: BLE001 — the catalogue sync costs a later turn at worst, never this block
+                self._warn("source", "could not start the tool sync", exc_info=True)
         try:
             local.context = self._read(local, message_id, text, at, participants)
         except ServiceError as exc:
@@ -495,7 +496,7 @@ class KernelTurns:
         calls = self._call_log.block(local.session_id) if drafting and self._call_log is not None else ""
         with self._lock:
             names = dict(self._phrases)
-        block = frames_block(view, names=names, carried=self._carried)
+        block = frames_block(view, names=names)
         lines = [block, calls] if block else []
         repair = view.get("repair")
         if view.get("status") == "repair" and isinstance(repair, str) and repair:
