@@ -17,3 +17,17 @@ that make memory-kernel a person's own Hermes memory and turn reader.
   the spend-ceiling line in `/kernel` says to restart `mk-serve`.
 - Neo4j's anonymous usage report is off.
 - Needs Hermes v0.23.0 and Docker on Linux x86_64. The stack is built on your machine; nothing is published.
+- A think step whose instruction holds an earlier result treats it as data: a search snippet can no longer become the
+  job the model is told to do. An instruction the teacher wrote stays a job.
+- The agent is named `hermes` in memory on every Hermes profile; it used to take the profile's name.
+- A Hermes that was already running picks up the token: `hermes plugins enable` now comes after `hermes memory setup`,
+  and reloads the running gateway with nothing restarted. Otherwise `/kernel` says that phrases are off and how to turn
+  them on.
+- `run_phrase` takes a role given beside `phrase`, the block shows its arguments, and the service logs a refused call by
+  its reason, never its words.
+- `search_memory` results are fenced; a step ledger that could not be saved leaves the next start unsure; a step's
+  failure is cut with its fence intact; tied message times can no longer make a session unbuildable.
+- The scripts refuse every way Hermes could reach the real home, and the name scan stops on a failed grep and on a names
+  file with no names. The plugin's tests each run on a temporary home.
+- README: upgrading, a Hermes that was already running, what `/kernel` can show. `.env.example` lists the optional
+  settings. A root `.dockerignore`.
