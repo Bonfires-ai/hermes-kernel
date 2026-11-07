@@ -76,6 +76,8 @@ something outside (send a message, write a file) is refused, both when you teach
 
 ## Teaching a phrase
 
+**A phrase is not a Hermes skill.** To teach one use `offer_phrase` and `teach_phrase`, never `skill_manage`.
+
 A phrase is a name the person gives to a routine: one or more forms (how they say it, with `{X}` slots) and a body
 (the steps, in order). A step is a sentence, or a call of one of your read-only tools:
 `{"call": "web_search", "args": {"query": "{X}"}}`. A value is a slot (`"{X}"`), `"it"` (the step just before's
@@ -93,8 +95,10 @@ result), `"them"`, or literal text. `think` is a step you do yourself:
 3. **Fix problems yourself** (a misnamed slot, a step said differently from its form) and call `teach_phrase` again
    in the same message. If a form "also reads as" something the kernel already knows, tell the teacher and let them
    decide.
-4. **Read the read-back to the teacher,** word for word, and ask whether to keep it.
+4. **Read the read-back to the teacher,** word for word, and ask whether to keep it. Ask them to answer with just
+   "yes": the kernel reads a bare "yes" as a yes, and a longer sentence ("yes, keep it") may not be read as one.
 5. **Only on the teacher's yes,** call `confirm_phrase(draft_id)`. Someone else's yes does not count, and never confirm
-   without it. A no drops the draft.
+   without it. A no drops the draft. If `confirm_phrase` says the draft is waiting for a plain "yes", ask the teacher
+   to answer with just "yes" and call it again; it is not broken or unavailable.
 
 Once kept, the phrase is the person's: they say it, the block lists it, and you run it with `run_phrase`.

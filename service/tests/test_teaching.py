@@ -41,7 +41,7 @@ async def test_teaching_reads_back_and_confirms_by_teacher_only(groups: SingleBo
     draft = await teaching.begin(_draft(turn_id=turn))
     assert draft.read_back == (
         "brew {X} for {R} / brew {X}: take water → take herb → make {X} from them → give {X} to {R}"
-        " (if left out, R is me)"
+        ' (if left out, R is me). Answer with just "yes" to keep it.'
     )
     assert draft.draft_id == "d1" and draft.problems == []
     assert mk.calls_of("teach")[-1] == {
@@ -235,5 +235,28 @@ async def test_teach_accepts_structured_steps(groups: SingleBonfire) -> None:
     assert mk.calls_of("teach")[-1]["body"] == steps  # unchanged: the kernel compiles them
     assert (
         view.read_back
-        == "sitrep {X}: web_search(query={X}) → think(instruction=summarise it in three lines, input=it) → write it"
+        == 'sitrep {X}: web_search(query={X}) → think(instruction=summarise it in three lines, input=it) → write it. Answer with just "yes" to keep it.'
     )
+
+
+async def test_a_confirm_refused_while_a_draft_waits_tells_the_person_to_answer_with_just_yes(
+    groups: SingleBonfire,
+) -> None:
+    mk = FakeMk()
+    store = MemoryTurnStore()
+    teaching = Teaching(mk, store, groups)
+    longer = await afforded_turn(store, "web_search", turn_id="t-longer")  # "yes, keep it": no yes frame, no confirm
+    mk.rows = [{"id": "brew.d1.0", "status": "staged", "provenance": {"teacher": "Kira Dace", "draft_id": "d1"}}]
+    request = ConfirmRequest(platform="telegram", group="-100777", by="Kira Dace", turn_id=longer)
+    with pytest.raises(Refused, match='just "yes"') as waiting:
+        await teaching.confirm("d1", request)
+    assert "not afforded" not in str(waiting.value) and "not available" not in str(waiting.value)
+    assert mk.calls_of("confirm") == []
+    # another speaker's draft is not this speaker's: the plain refusal stays
+    mk.rows = [{"id": "brew.d1.0", "status": "staged", "provenance": {"teacher": "Milo", "draft_id": "d1"}}]
+    with pytest.raises(Refused, match="confirm_phrase is not afforded"):
+        await teaching.confirm("d1", request)
+    # and with no draft staged at all
+    mk.rows = []
+    with pytest.raises(Refused, match="confirm_phrase is not afforded"):
+        await teaching.confirm("d1", request)

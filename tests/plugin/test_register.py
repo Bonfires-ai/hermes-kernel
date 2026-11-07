@@ -171,6 +171,7 @@ def test_the_ceiling_hold_gives_a_command_that_runs():
         "spend": {"charged_usd": 19.9, "ceiling_usd": 20.0},
     }
     line = status_line(held, None)
+    assert "docker compose restart mk-serve" in line and line.index("restart") > line.index("mk bonfire ceiling")
     assert "docker compose exec writer mk bonfire ceiling hermes <new total in USD>" in line
     assert "hermes-kernel directory" in line and "Spent $19.90 of $20.00" in line and "long session" in line
     assert "Spent $" not in status_line({**held, "spend": None}, None)

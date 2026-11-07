@@ -33,6 +33,7 @@ def _held_lines(status: dict[str, Any], held: str) -> list[str]:
         f"docker compose exec writer mk bonfire ceiling {status.get('bonfire_id', '<bonfire id>')} "
         "<new total in USD>"
     )
+    lines.append("Then restart the memory engine so that this shows the new ceiling: docker compose restart mk-serve")
     return lines
 
 

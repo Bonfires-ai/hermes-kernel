@@ -17,7 +17,7 @@ import logging
 
 from pydantic import BaseModel, Field, ValidationError
 
-from kernel_turns.affordances import CONFIRM, TEACH
+from kernel_turns.affordances import CONFIRM, TEACH, has_staged_draft
 from kernel_turns.groups import GroupFinder
 from kernel_turns.mk_client import NOT_FOUNDED_SAID, KernelApi, MkError, NotFounded, Refused
 from kernel_turns.models import BodyStep, Frame, JsonValue, Runner
@@ -78,6 +78,11 @@ def read_back(forms: list[str], body: list[BodyStep], defaults: dict[str, str]) 
     return text + "".join(f" (if left out, {slot} is {default})" for slot, default in defaults.items())
 
 
+def _with_plain_yes(text: str, draft_id: JsonValue) -> str:
+    """A draft that was taken ends its read-back by asking for a plain yes; a refused one has nothing to keep."""
+    return f"{text}. {PLAIN_YES}" if isinstance(draft_id, str) and draft_id else text
+
+
 def merge_sources(agent: dict[str, JsonValue] | None) -> dict[str, JsonValue]:
     """The catalogue the kernel installs: the agent's tools, each stamped ``x-runner: agent`` (the kernel's contract
     for a tool the agent runs). A tool whose name an earlier row has is skipped, logged. With no agent source, no
@@ -127,6 +132,14 @@ def _competes(value: JsonValue) -> dict[str, list[Frame]]:
 NOT_YET = "I can start learning phrases once the first conversation has been saved."
 
 
+#: what the read-back ends with, and what a refused confirm says while a draft waits: the kernel reads a bare yes only
+PLAIN_YES = 'Answer with just "yes" to keep it.'
+WAITING_FOR_YES = (
+    "This draft is waiting for the person's yes, but this message was not read as a yes. "
+    'Ask them to answer with just "yes" (nothing else in the message), then call confirm_phrase again.'
+)
+
+
 class Teaching:
     def __init__(self, mk: KernelApi, store: TurnStore, groups: GroupFinder) -> None:
         self._mk = mk
@@ -135,7 +148,14 @@ class Teaching:
         self._installing: dict[tuple[str, str], asyncio.Lock] = {}
 
     async def _afforded(
-        self, turn_id: str, platform: str, group: str, name: str, speaker: str, chat: str | None = None
+        self,
+        turn_id: str,
+        platform: str,
+        group: str,
+        name: str,
+        speaker: str,
+        chat: str | None = None,
+        bonfire: str | None = None,
     ) -> None:
         """Refuse (409) unless ``name`` is afforded by that turn of this group, spoken by ``speaker`` (in ``chat``)."""
         turn = await self._store.get_turn(turn_id)
@@ -145,8 +165,16 @@ class Teaching:
         if (turn.platform, turn.group) != (platform, group) or not mine or name not in turn.affordances:
             if any(NOT_FOUNDED_SAID in problem for problem in turn.problems):
                 raise Refused(NOT_YET)  # no first conversation yet: the turn had no frames, so nothing is afforded
+            if name == CONFIRM and bonfire is not None and await self._has_draft_waiting(bonfire, speaker):
+                raise Refused(WAITING_FOR_YES)
             afforded = ", ".join(turn.affordances) or "nothing"
             raise Refused(f"{name} is not afforded by this turn (afforded: {afforded})")
+
+    async def _has_draft_waiting(self, bonfire: str, speaker: str) -> bool:
+        try:
+            return has_staged_draft(await self._mk.constructions(bonfire), speaker)
+        except MkError:
+            return False
 
     async def begin(self, req: TeachDraft) -> DraftView:
         group = await self._groups.find(req.platform, req.group)
@@ -168,7 +196,7 @@ class Teaching:
             await self._follow_offer(req.turn_id, draft_id)
         return DraftView(
             draft_id=draft_id if isinstance(draft_id, str) else "",
-            read_back=read_back(req.forms, req.body, req.defaults),
+            read_back=_with_plain_yes(read_back(req.forms, req.body, req.defaults), draft_id),
             problems=_strings(out.get("problems")),
             competes=_competes(out.get("competes")),
         )
@@ -188,7 +216,7 @@ class Teaching:
 
     async def confirm(self, draft_id: str, req: ConfirmRequest) -> ConfirmView:
         found = await self._groups.find(req.platform, req.group)
-        await self._afforded(req.turn_id, req.platform, req.group, CONFIRM, req.by)
+        await self._afforded(req.turn_id, req.platform, req.group, CONFIRM, req.by, bonfire=found.bonfire_id)
         try:
             out = await self._mk.confirm(found.bonfire_id, draft_id, req.by)  # NotTeacher for anyone but the teacher
         except NotFounded as exc:

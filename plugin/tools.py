@@ -608,7 +608,7 @@ class KernelTools:
                 return "\n".join(["The kernel did not take this draft:", *(f"- {p}" for p in problems), *told])
             lines = [
                 f"Draft {draft_id}: {draft.get('read_back')}",
-                f"Read this back to {turn.speaker}; keep it with confirm_phrase only when they say yes.",
+                f'Read this back to {turn.speaker}; keep it with confirm_phrase only when they say yes (ask for a plain "yes").',
             ]
             if problems:
                 lines += ["The kernel noted:", *(f"- {p}" for p in problems), *told]

@@ -132,7 +132,9 @@ def test_teach_and_offer_routes_accept_structured_steps(client: TestClient, mk: 
     }
     taught = client.post("/v1/teaching", json=draft, headers=AUTH)
     assert taught.status_code == 200
-    assert taught.json()["read_back"] == "sitrep {X}: web_search(query={X}) → write it"
+    assert (
+        taught.json()["read_back"] == 'sitrep {X}: web_search(query={X}) → write it. Answer with just "yes" to keep it.'
+    )
     assert mk.calls_of("teach")[-1].get("body") == [step, "write it"]
     offer = client.post(
         f"/v1/turns/{editor['turn_id']}/offers", json={"forms": ["sitrep {X}"], "body": [step]}, headers=AUTH

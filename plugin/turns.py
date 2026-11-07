@@ -249,6 +249,10 @@ def frames_block(
             "This message reads as teaching: draft it with the teach_phrase tool (not run_phrase), and read the "
             "read-back to the teacher."
         )
+    if "teach_phrase" in afford:
+        lines.append(
+            "A phrase is not a Hermes skill: to teach one use offer_phrase and teach_phrase, never skill_manage."
+        )
     if "confirm_phrase" in afford:
         lines.append(
             "The teacher said yes: keep the draft with the confirm_phrase tool, confirm_phrase(draft_id) "

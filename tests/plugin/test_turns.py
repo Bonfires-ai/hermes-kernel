@@ -354,3 +354,22 @@ def test_a_tool_hermes_does_not_offer_now_is_left_out_and_a_short_name_is_called
     block = frames_block(view, hidden={"web_search"}, natively={"lookup": "mcp__srv__lookup"})
     assert "web_search" not in block
     assert "lookup (call it as mcp__srv__lookup)" in block
+
+
+def test_a_block_that_affords_teaching_says_a_phrase_is_not_a_skill() -> None:
+    from plugin.turns import frames_block
+
+    editor = {"name": "teach_phrase", "kind": "editor", "roles": {}, "complete": False}
+    plain = frames_block({"frames": [editor], "affordances": ["teach_phrase"]})
+    offered = frames_block(
+        {
+            "frames": [editor],
+            "affordances": ["teach_phrase"],
+            "offer": {"forms": ["go {X}"], "body": ["look"], "defaults": {}},
+        }
+    )
+    for block in (plain, offered):
+        assert "not a Hermes skill" in block and "never skill_manage" in block
+    assert "skill_manage" not in frames_block(
+        {"frames": [{"name": "yes", "kind": "reply"}], "affordances": ["web_search"]}
+    )
