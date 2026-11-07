@@ -1,0 +1,9 @@
+# Applies to plugin/ and tests/plugin (service/ has its own). Lives at the root: plugin/ is what gets installed.
+# The plugin must run on Python 3.12 and up.
+target-version = "py312"
+line-length = 120
+extend-exclude = ["service", "writer", ".dev"]
+
+[lint]
+select = ["E", "F", "I", "B", "UP", "W", "BLE"]
+ignore = ["E501"]

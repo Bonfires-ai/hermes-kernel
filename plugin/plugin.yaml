@@ -1,0 +1,8 @@
+name: hermes-kernel
+version: "0.1"
+# `standalone` is required: without it Hermes sees MemoryProvider in the source, classes the plugin
+# `exclusive`, and never loads the general side.
+kind: standalone
+description: Makes the memory-kernel turn service this Hermes's memory and turn reader.
+# Nothing is mandatory here: a missing token is reported by the provider's is_available(), visibly.
+requires_env: []
