@@ -1,7 +1,7 @@
 """The client of ``mk serve``'s runtime routes (memory-kernel, ``memory_kernel/serve/http.py``).
 
 This service is the only caller of plan, resume, retry, teach, confirm, constructions and catalogue. ``mk serve`` has
-no auth and no host port: it is reached on the compose ``default`` network only.
+no auth and no host port: it is reached on the stack's own network only.
 
 Status codes become domain exceptions (the app maps them to HTTP):
 

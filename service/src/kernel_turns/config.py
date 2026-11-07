@@ -18,7 +18,7 @@ class Settings(BaseSettings):
         env_ignore_empty=True,
     )
 
-    # `mk serve`: unauthenticated, reachable on the compose network only.
+    # `mk serve`: unauthenticated, reachable on the stack's own network only.
     mk_url: str = "http://mk-serve:8000"
     mongo_uri: SecretStr = SecretStr("mongodb://mongo:27017")
     mongo_db: str = "kernel_turns"

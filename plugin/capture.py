@@ -6,8 +6,8 @@ mirrored to a disk spool (`spool.py`) so a restart finds it; a new `Capture` on 
 first. A `close` rides the same queue, so a session closes after its last turn.
 
 Failure rules: `Unavailable` and `Unauthorized` keep the data and retry with backoff (the second says to check
-`HERMES_KERNEL_TOKEN`); `Refused` (a 4xx the service will always give) drops that batch, because one bad message must
-not block every later one.
+`HERMES_KERNEL_TOKEN`); `Refused` with 400, 413 or 422 (the service will always give that for these items) drops that batch,
+because one bad message must not block every later one; any other 4xx keeps the data and retries.
 """
 
 from __future__ import annotations

@@ -228,7 +228,7 @@ def _hermes_check(check_fn: Callable[[], object], memo: dict[object, bool]) -> b
     """Hermes' own availability check, through its TTL cache with a memo per read (as `get_definitions`, whose cache
     it is in a single-profile Hermes). Where Hermes bypasses that cache (a multiplex profile not resolved from this
     thread, a request-bound browser session) a probe here could fail closed on a tool Hermes does offer, so the tool
-    counts as offered; so it does without Hermes' registry to ask."""
+    counts as offered. The same holds when Hermes' registry cannot be imported: there is nothing to ask."""
     try:
         from tools.registry import (  # pyright: ignore[reportMissingImports]
             CHECK_FN_CACHE_BYPASS,
