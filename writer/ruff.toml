@@ -1,0 +1,11 @@
+# The writer runs on Python 3.12 in its own image. Pinning the target keeps ruff from rewriting
+# `except (A, B):` into PEP 758's `except A, B:`, a SyntaxError on 3.12.
+target-version = "py312"
+
+line-length = 120
+src = ["src", "tests"]
+
+[lint]
+# BLE keeps `except Exception` honest.
+select = ["E", "F", "I", "B", "UP", "W", "BLE"]
+ignore = ["E501"]
