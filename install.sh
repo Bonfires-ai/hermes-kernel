@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # One script that sets up hermes-kernel for a person's Hermes: the local stack, the plugin, and the token that joins them.
 #
-#   ./install.sh [--mode local] [--hermes PATH] [--project NAME] [--compose-file FILE] [--no-build]
+#   ./install.sh [--mode local|hosted] [--hermes PATH] [--project NAME] [--compose-file FILE] [--no-build]
 #                [--plugin-source SOURCE] [--url URL]
 #
+# Without --mode it asks: local (a Docker stack on this machine) or hosted (a Bonfires key, no Docker).
 # Each option has an environment equivalent: HERMES_KERNEL_MODE, HERMES_BIN, HERMES_KERNEL_PROJECT,
 # HERMES_KERNEL_COMPOSE_FILE, HERMES_KERNEL_NO_BUILD, HERMES_KERNEL_PLUGIN_SOURCE, HERMES_KERNEL_URL.
-# Keys come from the environment only (OPENROUTER_API_KEY, VOYAGE_API_KEY, NEO4J_PASSWORD, KT_TOKEN) or a hidden prompt,
-# never from the command line.
+# Keys come from the environment only (local: OPENROUTER_API_KEY, VOYAGE_API_KEY, NEO4J_PASSWORD, KT_TOKEN;
+# hosted: HERMES_KERNEL_TOKEN) or a hidden prompt, never from the command line.
 #
 # This writes to your real Hermes home ($HERMES_HOME, default ~/.hermes). It never installs or upgrades Hermes.
 # Bash 3.2 and POSIX tools only: the same file runs on a Mac.
@@ -17,8 +18,9 @@ ROOT=$(cd "$(dirname "$0")" && pwd)
 
 WANT_HERMES="v0.23.0"
 LOCAL_URL="http://127.0.0.1:8787"
+HOSTED_URL="https://kernel.staging-bonfires.dev"
 
-MODE=${HERMES_KERNEL_MODE:-local}
+MODE=${HERMES_KERNEL_MODE:-}
 HERMES_BIN=${HERMES_BIN:-hermes}
 PROJECT=${HERMES_KERNEL_PROJECT:-hermes-kernel}
 COMPOSE_FILE=${HERMES_KERNEL_COMPOSE_FILE:-$ROOT/compose.yaml}
@@ -36,7 +38,7 @@ die() {
 }
 
 usage() {
-  sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 # ---------------------------------------------------------------- small file helpers
@@ -44,8 +46,12 @@ usage() {
 # Temp files live next to their target; one is tracked here so an interrupt or a failure never leaves a copy of a
 # secrets file behind.
 HK_TMP=""
+HK_CFG=""
+HK_BODY=""
 cleanup() {
   if [ -n "$HK_TMP" ]; then rm -f "$HK_TMP"; fi
+  if [ -n "$HK_CFG" ]; then rm -f "$HK_CFG"; fi
+  if [ -n "$HK_BODY" ]; then rm -f "$HK_BODY"; fi
 }
 trap cleanup EXIT
 trap 'exit 130' INT
@@ -335,6 +341,106 @@ run_local() {
   finish
 }
 
+# ---------------------------------------------------------------- the hosted path
+
+ask_mode() {
+  while :; do
+    printf 'Run hermes-kernel hosted (a Bonfires key, no Docker) or local (a Docker stack on this machine)? [hosted/local]: ' >&2
+    _ans=""
+    read -r _ans || [ -n "$_ans" ] || die "no mode was given and there is nothing to ask: pass --mode local or --mode hosted."
+    _ans=$(printf '%s' "$_ans" | tr 'A-Z' 'a-z' | tr -d ' \t')
+    case "$_ans" in
+      local | l)
+        MODE=local
+        return 0
+        ;;
+      hosted | h)
+        MODE=hosted
+        return 0
+        ;;
+    esac
+    say "please answer hosted or local."
+  done
+}
+
+# check_url URL: the key is a bearer, so a plain http:// URL is refused unless it stays on this machine.
+check_url() {
+  case "$1" in
+    *[!A-Za-z0-9._~:/?#@%+=\&,-]*) die "the URL has characters that do not belong in one." ;;
+    https://*) ;;
+    http://localhost | http://localhost[:/]* | http://127.0.0.1 | http://127.0.0.1[:/]*) ;;
+    http://*) die "refusing $1: your key would travel unencrypted. Use an https:// URL (http:// is allowed only for localhost)." ;;
+    *) die "the URL must start with https:// (got \"$1\")." ;;
+  esac
+}
+
+resolve_key() {
+  HK_KEY=${HERMES_KERNEL_TOKEN:-}
+  if [ -z "$HK_KEY" ]; then
+    printf 'Your Bonfires API key (input hidden): ' >&2
+    read -r -s HK_KEY || true
+    printf '\n' >&2
+  fi
+  [ -n "$HK_KEY" ] || die "no Bonfires API key. Set HERMES_KERNEL_TOKEN in the environment (it is never taken from the command line) and run again."
+  case "$HK_KEY" in
+    *[!A-Za-z0-9._~+/=:-]*) die "that key has characters a Bonfires key does not have. Check that you copied all of it and nothing else." ;;
+  esac
+}
+
+# json_field NAME FILE: the first string value of "NAME" in a one-object JSON file. No jq, no Python.
+json_field() {
+  tr '\n' ' ' <"$2" | sed -n 's/.*"'"$1"'"[[:space:]]*:[[:space:]]*"\(\([^"\\]\|\\.\)*\)".*/\1/p'
+}
+
+# The service's own wording of why it said no, when it gave one.
+detail_of() {
+  _d=$(json_field detail "$HK_BODY")
+  if [ -n "$_d" ]; then say " ($_d)"; fi
+}
+
+# check_service: GET /v1/status with the key, before anything is written. The key goes to curl in a private config
+# file, never on a command line.
+check_service() {
+  command -v curl >/dev/null 2>&1 || die "curl was not found."
+  HK_CFG=$(mktemp "${TMPDIR:-/tmp}/hk-curl.XXXXXX") || die "could not create a temporary file."
+  HK_BODY=$(mktemp "${TMPDIR:-/tmp}/hk-body.XXXXXX") || die "could not create a temporary file."
+  chmod 600 "$HK_CFG" "$HK_BODY"
+  printf 'url = "%s/v1/status"\nheader = "Authorization: Bearer %s"\n' "$1" "$HK_KEY" >"$HK_CFG"
+  _code=$(curl -sS --max-time 20 -o "$HK_BODY" -w '%{http_code}' -K "$HK_CFG" 2>/dev/null) || true
+  case "$_code" in
+    200) ;;
+    401) die "the service refused this key: it is not a key it knows. Check that you copied all of it.$(detail_of)" ;;
+    403) die "the service will not take this key$(detail_of)" ;;
+    000 | 5??) die "the service at $1 cannot be reached or is away just now (answer: $_code). Your key was not refused. Try again in a minute.$(detail_of)" ;;
+    *) die "the service at $1 answered $_code, which this script does not know.$(detail_of)" ;;
+  esac
+  _have=$(tr '\n' ' ' <"$HK_BODY" | sed -n 's/.*"versions"[[:space:]]*:[[:space:]]*{[^}]*"service"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+  _want=$(sed -n 's/^version:[[:space:]]*"\{0,1\}\([^"[:space:]]*\)"\{0,1\}.*/\1/p' "$ROOT/plugin/plugin.yaml" | head -n 1)
+  [ -n "$_want" ] || die "could not read the plugin's version from $ROOT/plugin/plugin.yaml."
+  _mm=$(printf '%s' "$_have" | sed -n 's/^\([0-9][0-9]*\.[0-9][0-9]*\)\([^0-9].*\)\{0,1\}$/\1/p')
+  if [ -z "$_mm" ] || [ "$_mm" != "$_want" ]; then
+    die "the service is version \"${_have:-unknown}\" and this plugin is version \"$_want\"; they must share major.minor. Nothing was written."
+  fi
+  say "the service at $1 took the key (version $_have)"
+}
+
+run_hosted() {
+  resolve_profile
+  check_hermes
+  _url=${URL:-$HOSTED_URL}
+  _url=${_url%/}
+  check_url "$_url"
+  resolve_key
+  check_service "$_url"
+  install_plugin
+  write_hermes_token "$HK_KEY"
+  write_url "$_url"
+  "$HERMES_BIN" config set memory.provider hermes-kernel
+  # Last, so a running gateway reloads its plugins and finds the token already there.
+  "$HERMES_BIN" plugins enable hermes-kernel
+  finish
+}
+
 # ---------------------------------------------------------------- main
 
 main() {
@@ -363,10 +469,11 @@ main() {
       *) die "unknown option: $1 (try --help)" ;;
     esac
   done
+  if [ -z "$MODE" ]; then ask_mode; fi
   case "$MODE" in
     local) run_local ;;
-    hosted) die "hosted mode is not offered yet." ;;
-    *) die "unknown mode: $MODE (local)" ;;
+    hosted) run_hosted ;;
+    *) die "unknown mode: $MODE (local or hosted)" ;;
   esac
 }
 

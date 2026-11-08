@@ -51,9 +51,25 @@ esac
 exit 0
 """
 
+# Without -K it is the local path's health check. With -K it is the hosted status call: the answer is chosen by
+# HK_CURL_CODE and HK_CURL_BODY, and the config file it was handed is kept for the test to look at.
 CURL = """#!/bin/sh
 {log_line}
-echo '{{"ok": true}}'
+out=""; cfg=""; fmt=""
+while [ $# -gt 0 ]; do
+  case "$1" in -o) out=$2; shift ;; -K) cfg=$2; shift ;; -w) fmt=$2; shift ;; esac
+  shift
+done
+if [ -z "$cfg" ]; then echo '{{"ok": true}}'; exit 0; fi
+cp "$cfg" "$HK_RIG/curl_config"
+ls -l "$cfg" | cut -c1-10 > "$HK_RIG/curl_config_mode"
+code=${{HK_CURL_CODE:-200}}
+default='{{"bonfire_id":"b","founded":false,"versions":{{"service":"0.1.0","mk":"2.0.1"}}}}'
+body=${{HK_CURL_BODY-$default}}
+[ -z "$out" ] || printf '%s' "$body" > "$out"
+[ -z "$fmt" ] || printf '%s' "$code"
+[ "$code" != 000 ] || exit 7
+exit 0
 """
 
 UNAME = """#!/bin/sh
@@ -132,6 +148,8 @@ class Rig:
             "HK_RIG": str(self.base),
             "HK_PROC_MEMINFO": str(self.base / "meminfo"),
             "LANG": "C",
+            # The local tests pass no --mode; tests of the first question set this to "".
+            "HERMES_KERNEL_MODE": "local",
         }
         child.update(env or {})
         assert Path(child["HERMES_HOME"]).resolve().is_relative_to(self.base.resolve()), "HERMES_HOME escaped"
@@ -143,8 +161,20 @@ class Rig:
     def run(self, *args: str, env: dict | None = None, input: str | None = None) -> subprocess.CompletedProcess:
         child = self.child_env(env)
         stdin = {"input": input} if input is not None else {"stdin": subprocess.DEVNULL}
+        argv = [str(self.root / "install.sh"), *args]
+        image = os.environ.get("HK_TEST_BASH_IMAGE")
+        if image:
+            # The same script under the image's bash, with the throwaway tree mounted at the same path. The fakes are
+            # plain sh; the plain tools come from the image, not from the host links.
+            child["PATH"] = f"{self.bin}:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+            flags = [f"-e{k}={v}" for k, v in child.items()]
+            argv = [
+                "docker", "run", "--rm", "-i", "--user", f"{os.getuid()}:{os.getgid()}",
+                "-v", f"{self.base}:{self.base}", "-w", str(self.root), *flags, image, "bash", *argv,
+            ]  # fmt: skip
+            child = {"PATH": os.environ["PATH"], "HOME": str(self.user_home)}
         return subprocess.run(
-            [str(self.root / "install.sh"), *args],
+            argv,
             cwd=str(self.root),
             env=child,
             capture_output=True,

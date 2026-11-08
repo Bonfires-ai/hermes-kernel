@@ -181,13 +181,10 @@ def test_low_disk_stops_unless_the_image_is_there(rig):
     assert result.returncode == 0, result.stderr
 
 
-def test_no_build_skips_build_and_hosted_is_not_offered(rig):
+def test_no_build_skips_the_build(rig):
     result = rig.run("--no-build", env=KEYS)
     assert result.returncode == 0, result.stderr
     assert not any(" build" in line for line in rig.log if line.startswith("docker"))
-    hosted = rig.run("--mode", "hosted", env=KEYS)
-    assert hosted.returncode != 0
-    assert "not offered yet" in hosted.stderr
 
 
 def test_a_bare_source_gives_no_local_warning(rig):

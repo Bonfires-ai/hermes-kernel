@@ -23,6 +23,15 @@ messages and runs.
 
 ## Install
 
+There are two ways to run it, and `./install.sh` asks which (or pass `--mode hosted` or `--mode local`):
+
+- **Hosted** (the first choice): you paste a Bonfires API key and Bonfires runs the memory. No Docker, no OpenRouter or
+  Voyage key, no 10 GiB of RAM. Your messages and memory live on Bonfires' servers; see [Hosted](#hosted).
+- **Local**: a Docker stack on your machine builds and holds the memory. It is the private option: nothing of yours is
+  kept anywhere but your machine, apart from the calls to OpenRouter and Voyage listed under "What leaves your machine".
+
+For the local stack:
+
 ```bash
 git clone https://github.com/Bonfires-ai/hermes-kernel && cd hermes-kernel
 export OPENROUTER_API_KEY=...   # in a terminal you can leave them out and the script asks, input hidden
@@ -77,6 +86,46 @@ everything the service runs stays stopped until you start it again.
 
 **Only the turn service has a host port**, `127.0.0.1:8787`, behind the bearer token. The memory engine, Neo4j and
 Mongo are reachable only from inside the stack.
+
+## Hosted
+
+```bash
+git clone https://github.com/Bonfires-ai/hermes-kernel && cd hermes-kernel
+export HERMES_KERNEL_TOKEN=...   # your Bonfires API key; in a terminal you can leave it out and the script asks, input hidden
+./install.sh --mode hosted
+```
+
+You need Hermes v0.23.0 and a Bonfires API key that may write, for a bonfire set up for hermes-kernel. The script checks
+the key against the service **before it writes anything**, and says plainly if the key is not known (401), is read-only
+or belongs to the wrong kind of bonfire (403, with the service's own words), or if the key check is away just now (try
+again in a minute: that is not a bad key). It also stops if the service and the plugin do not share a major.minor
+version. Then it installs the plugin, writes the key to `HERMES_KERNEL_TOKEN` in your Hermes `.env` (mode 0600, every
+other line kept) and the URL to `hermes-kernel.json`, and enables the plugin. It never writes a `.env` in this
+repository, needs no Docker, and passes the key to `curl` in a private temporary config file, never on a command line.
+`--url` points it at another service (default `https://kernel.staging-bonfires.dev`); a plain `http://` URL is refused
+unless it is `localhost` or `127.0.0.1`, because the key is a bearer.
+
+**Where your data goes.** Your messages and your memory are on Bonfires' servers: AWS eu-central-1, MongoDB Atlas and
+Neo4j. When a session is built, its messages go on to OpenRouter and Voyage AI from there; recall queries go to Voyage
+from the service. Nothing in "What leaves your machine" below applies to hosted except your normal Hermes chat and a
+phrase's `web_search`; the rest happens on Bonfires' side.
+
+- The turn records the service keeps expire after **30 days**.
+- A session's text leaves the turn service when it is handed to the build, **but it stays in the build queue's record
+  with no expiry, and memory itself holds each message's text with its speaker** (the `Episodic.content` field),
+  because recall reads it back to you.
+- **Hosted cannot promise that Bonfires is unable to read your messages.** The service has to read them to build and to
+  search. What is promised is the list above: where they are, where they go, and that turn records expire. If that is not
+  acceptable, run local: it is the private option.
+- **Spend:** the ceiling is **$5** and founding the memory (the first session) is capped at **$1**. Hitting the ceiling
+  means asking Bonfires to raise it; you cannot change it yourself.
+
+Memory arrives later than local's 2 to 3 minutes; the measured time is added after the first hosted run.
+<!-- TASK16: hosted arrival time -->
+
+Known limits, besides the above: one memory per key (not split by chat or person, as at the top); the service is a
+staging service today; and the key is the whole of your access, so keep it out of chats and repositories. Hosted was
+tested on Linux and under bash 3.2 (the oldest bash a Mac ships); it has not been run on a Mac.
 
 ## How memory arrives
 
