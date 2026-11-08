@@ -277,3 +277,22 @@ def test_a_plain_value_error_from_the_client_holds_rather_than_drops(tmp_path):
     turn(cap)
     assert not cap.drain_once()
     assert cap.backlog == 2 and cap.last_error and "ValueError" in cap.last_error
+
+
+def test_one_add_never_holds_more_than_64_messages(tmp_path):
+    """The service refuses an add of more than 64 (a 422 drops the batch): a backlog goes in batches of at most 64."""
+    cap, client, _ = make(tmp_path)
+    sizes: list[int] = []
+    real = client.post_messages
+
+    def post(batch, agent_handles, *, timeout=30.0):
+        sizes.append(len(batch))
+        return real(batch, agent_handles, timeout=timeout)
+
+    client.post_messages = post
+    for n in range(1, 71):  # 140 messages queued while the worker was not running
+        turn(cap, n, user=f"hello {n}", reply=f"hi {n}")
+    while cap.drain_once() and len(client.sent) < 140:
+        pass
+    assert len(client.sent) == 140
+    assert max(sizes) == 64

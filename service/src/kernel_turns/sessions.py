@@ -62,6 +62,13 @@ State = Literal["open", "closed", "running", "built", "failed", "held", "handed"
 Retry = Literal["retried", "unknown", "not_failed"]
 
 
+#: the longest ``conversation_id`` taken: graph-memory's ``KERNEL_CONVERSATION_ID_MAX_CHARS``, so a session the hand-off
+#: sends is never refused there for its id
+CONVERSATION_ID_MAX_CHARS = 512
+#: the most messages one add holds: the plugin's batch (``capture.BATCH_MAX``)
+ADD_MAX_MESSAGES = 64
+
+
 class SessionClosed(Exception):
     """The session was closed between being opened for an add and the add."""
 
@@ -69,9 +76,10 @@ class SessionClosed(Exception):
 class MessageIn(BaseModel):
     """A message at the door. mk refuses a blank ``conversation_id`` and an empty addressee, for good, so a session
     holding one blocks every later session of its bonfire: they stop here, where the caller hears of it. The tests are
-    mk's own and no stricter, because a refusal costs the plugin its whole batch."""
+    mk's own and no stricter, because a refusal costs the plugin its whole batch; only the id's length is held to the
+    hand-off receiver's limit, which would otherwise refuse the whole session."""
 
-    conversation_id: str = Field(min_length=1)
+    conversation_id: str = Field(min_length=1, max_length=CONVERSATION_ID_MAX_CHARS)
     message_id: str = Field(min_length=1)
     speaker: str = Field(min_length=1)
     text: str = Field(min_length=1)
@@ -88,7 +96,7 @@ class MessageIn(BaseModel):
 
 
 class AddRequest(BaseModel):
-    messages: list[MessageIn] = Field(max_length=500)
+    messages: list[MessageIn] = Field(max_length=ADD_MAX_MESSAGES)
     agent_handles: list[str] = []
 
 
@@ -98,7 +106,7 @@ class AddResult(BaseModel):
 
 
 class CloseRequest(BaseModel):
-    conversation_id: str = Field(min_length=1)
+    conversation_id: str = Field(min_length=1, max_length=CONVERSATION_ID_MAX_CHARS)
 
 
 class CloseResult(BaseModel):

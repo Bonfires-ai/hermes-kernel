@@ -255,3 +255,32 @@ def test_what_mk_takes_still_comes_in(api: tuple[TestClient, MemorySessionStore]
     assert r.json() == {"accepted": 1, "duplicates": 0}
     (session,) = store.sessions.values()
     assert session.conversation_id == message["conversation_id"]
+
+
+# --- What one add may hold: the plugin sends at most 64 messages, and graph-memory takes conversation ids up to 512 ---
+
+
+def _batch(n: int, chat: str = "telegram:1") -> list[dict[str, object]]:
+    sent = [_msg(f"m{i}", ts=T0 + timedelta(seconds=i)).model_dump(mode="json") for i in range(n)]
+    return [{**m, "conversation_id": chat} for m in sent]  # as the wire has it: MessageIn would refuse a long one
+
+
+def test_an_add_takes_at_most_64_messages(api: tuple[TestClient, MemorySessionStore]) -> None:
+    client, store = api
+    r = client.post("/v1/messages", json={"messages": _batch(65), "agent_handles": HANDLES}, headers=AUTH)
+    assert r.status_code == 422
+    assert not store.sessions and not store.messages
+    r = client.post("/v1/messages", json={"messages": _batch(64), "agent_handles": HANDLES}, headers=AUTH)
+    assert r.json() == {"accepted": 64, "duplicates": 0}
+
+
+def test_a_conversation_id_is_at_most_512_characters(api: tuple[TestClient, MemorySessionStore]) -> None:
+    client, store = api
+    longest, too_long = "c" * 512, "c" * 513
+    r = client.post("/v1/messages", json={"messages": _batch(1, too_long), "agent_handles": HANDLES}, headers=AUTH)
+    assert r.status_code == 422
+    assert not store.sessions
+    assert client.post("/v1/sessions/close", json={"conversation_id": too_long}, headers=AUTH).status_code == 422
+    r = client.post("/v1/messages", json={"messages": _batch(1, longest), "agent_handles": HANDLES}, headers=AUTH)
+    assert r.json() == {"accepted": 1, "duplicates": 0}
+    assert client.post("/v1/sessions/close", json={"conversation_id": longest}, headers=AUTH).json() == {"closed": True}
