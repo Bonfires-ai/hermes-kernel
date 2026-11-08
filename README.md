@@ -347,6 +347,10 @@ fresh token, and refuses to run without `E2E_CONFIRM=yes`, under any project nam
 `hermes-kernel-e2e`, or while port 8787 answers. It spends real money (the kernel's share is under a cent; the chat model
 about $0.25 with its default model) and takes about 15 minutes. Read its header first.
 
+`service/constraints.txt` pins every distribution the service and its tests install; CI's service job installs with
+`-c service/constraints.txt`, and so does the hosted image. To move a pin, upgrade it in `.venv` (Python 3.12), run the
+service's tests, then `.venv/bin/python scripts/service_constraints.py > service/constraints.txt` and commit the result.
+
 `service/tests/contract` checks the service's client against a real `mk serve`; it is skipped unless `KT_CONTRACT_URL`
 is set. `mk serve` has no host port, so run it from a container on the stack's network; the test file's header says how.
 

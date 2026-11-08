@@ -40,7 +40,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install ./service pytest pytest-asyncio
+      # The pins are what is tested, and what the hosted image installs (scripts/service_constraints.py makes them).
+      - run: pip install -c service/constraints.txt ./service pytest pytest-asyncio
       - run: cd service && pytest tests -q
 
   writer:

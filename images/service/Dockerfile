@@ -8,7 +8,8 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 
 COPY service /tmp/service
-RUN pip install /tmp/service && rm -rf /tmp/service
+# The pins CI tests with (service/constraints.txt), so the local stack runs what was tested.
+RUN pip install -c /tmp/service/constraints.txt /tmp/service && rm -rf /tmp/service
 
 RUN useradd --create-home --home-dir /srv/kturns --uid 10002 kturns
 USER kturns

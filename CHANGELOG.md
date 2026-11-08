@@ -51,3 +51,5 @@ that make memory-kernel a person's own Hermes memory and turn reader.
 - A restarted turn service no longer installs a catalogue the kernel already has: an install drops the bonfire's runtime
   and its staged drafts, so a restart could cost a person the draft they were about to keep. An add takes at most 64
   messages (the plugin's batch) and a conversation id at most 512 characters (what the hosted builder takes).
+- The turn service's dependencies are pinned in `service/constraints.txt` (made by `scripts/service_constraints.py`):
+  CI tests with those pins and the local image installs them.
