@@ -3,7 +3,8 @@
 #
 #   scripts/name-scan.sh
 #
-# Generic checks always run: a home-directory path, an `sk-` key, a `bf_` token. Private names (a company's internal
+# Generic checks always run: a home-directory path, an `sk-` key, a `bf_` token (a key-shaped hit is shown as file:line
+# only, never its text, since it may be a real key). Private names (a company's internal
 # project names, people) are not listed here, because a tracked list would publish what it hunts. They are read from
 # .dev/private-names.txt, which is git-ignored: one name per line, optionally `name|text` to exempt matches that hold
 # `text`. The scan FAILS CLOSED: without a name to look for it fails, unless NAME_SCAN_GENERIC_ONLY=1 says that only the generic
@@ -49,10 +50,25 @@ scan() { # scan <label> <grep args...>
   report "$label" "$out"
 }
 
+# places: grep --null's "file NUL line:text" lines as "file:line", the text dropped.
+places() {
+  local file num rest
+  while IFS= read -r -d '' file && IFS=: read -r num rest; do printf '%s:%s\n' "$file" "$num"; done
+}
+
+scan_keys() { # scan_keys <label> <grep args...>: as scan, but a hit is only file:line, because its text may be a real key
+  local label="$1" out status=0
+  shift
+  # grep's own errors go to stderr as they are; they name files, never the text of a line.
+  out="$(grep -InH --null "$@" -- "${files[@]}" | places)" || status=$?
+  if [ "$status" -gt 1 ]; then echo "name-scan: grep failed (status $status) in the $label scan." >&2; exit 2; fi
+  report "$label" "$out"
+}
+
 # Generic. The brackets keep this file from matching its own patterns.
 scan "a home-directory path" -E '[/]home[/]'
-scan "something shaped like an sk- key" -E '(^|[^A-Za-z0-9])sk-[A-Za-z0-9_-]{10,}'
-scan "something shaped like a bf_ token" -E '(^|[^A-Za-z0-9])bf_[A-Za-z0-9_-]{16,}'
+scan_keys "something shaped like an sk- key" -E '(^|[^A-Za-z0-9])sk-[A-Za-z0-9_-]{10,}'
+scan_keys "something shaped like a bf_ token" -E '(^|[^A-Za-z0-9])bf_[A-Za-z0-9_-]{16,}'
 
 # Private.
 mode="generic and private names"

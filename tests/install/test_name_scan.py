@@ -30,3 +30,15 @@ def test_name_scan_sees_a_real_key(tmp_path: Path) -> None:
 def test_name_scan_passes_a_clean_repo(tmp_path: Path) -> None:
     done = _scan(tmp_path, "nothing here\n")
     assert done.returncode == 0, done.stdout + done.stderr
+
+
+def test_a_key_shaped_hit_is_shown_by_place_never_by_its_text(tmp_path: Path) -> None:
+    """The scan's output lands in CI logs and terminals: a real key it finds must not be printed there."""
+    bf = "b" + "f_" + "Qw3eR6tY" + "_" + "Ui9oP8aS7dF6gH5jK4lZ3xC2vB1nM0qW"  # built apart: this file is scanned too
+    sk = "s" + "k-" + "or-v1-" + "0123456789abcdef0123456789abcdef"
+    done = _scan(tmp_path, f"first line\ntoken {bf}\nkey={sk}\n")
+    assert done.returncode == 1, done.stdout + done.stderr
+    out = done.stdout + done.stderr
+    assert bf not in out and sk not in out
+    assert bf[:12] not in out and sk[:12] not in out  # not a prefix either
+    assert "notes.txt:2" in out and "notes.txt:3" in out
