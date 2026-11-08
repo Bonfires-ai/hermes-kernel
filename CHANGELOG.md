@@ -48,3 +48,6 @@ that make memory-kernel a person's own Hermes memory and turn reader.
   warning with its status; a 404 is an unknown key only when it is the key check's own `api_keys.not_found`, so a wrong
   URL is never "your key is bad"; a hand-off 401 or 403 logs `kernel_turns.handoff_token_rejected`; a blank
   `KT_AUTH_TOKEN` or `KT_HANDOFF_TOKEN` refuses to start, and a refused start never prints the values it was given.
+- A restarted turn service no longer installs a catalogue the kernel already has: an install drops the bonfire's runtime
+  and its staged drafts, so a restart could cost a person the draft they were about to keep. An add takes at most 64
+  messages (the plugin's batch) and a conversation id at most 512 characters (what the hosted builder takes).

@@ -75,16 +75,45 @@ async def test_an_unborn_bonfire_with_nothing_kept_is_not_warmed() -> None:
     assert mk.calls_of("plan") == []
 
 
-async def test_boot_warms_a_bonfire_that_already_exists() -> None:
-    mk, teaching, _ = _setup()
+async def test_a_second_warm_with_nothing_changed_makes_no_put() -> None:
+    """An install drops the bonfire's runtime and its staged drafts, and the kernel keeps its catalogue in the graph: a
+    restarted service whose stored catalogue is what it would install warms the bonfire without installing again."""
+    mk, store = FakeMk(), MemoryTurnStore()
     _found(mk)
-    await teaching.put_catalogue(BONFIRE, "hermes", "main", AGENT)  # installed and stored before the restart
+    await Teaching(mk, store).put_catalogue(BONFIRE, "hermes", "main", AGENT)  # installed and stored before the restart
+    installed = mk.catalogues[BONFIRE]
     mk.calls.clear()
-    del mk.catalogues[BONFIRE]  # the kernel no longer holds it
-    warmer = Warmer(mk, teaching, BONFIRE)  # the restarted service
+    warmer = Warmer(mk, Teaching(mk, store), BONFIRE)  # the restarted service, on the same store
     assert await warmer.tick() is True
-    assert "web_search" in str(mk.catalogues[BONFIRE])
+    assert mk.calls_of("put_catalogue") == []
+    assert mk.catalogues[BONFIRE] == installed
     assert len(mk.calls_of("plan")) == 1
+
+
+async def test_boot_installs_a_kept_catalogue_the_kernel_never_took() -> None:
+    mk, store = FakeMk(), MemoryTurnStore()
+    mk.unborn = True  # the catalogue is kept and installed nowhere
+    await Teaching(mk, store).put_catalogue(BONFIRE, "hermes", "main", AGENT)
+    _found(mk)
+    warmer = Warmer(mk, Teaching(mk, store), BONFIRE)  # the restarted service
+    assert await warmer.tick() is True
+    assert len(mk.calls_of("put_catalogue")) == 1 and "web_search" in str(mk.catalogues[BONFIRE])
+
+
+async def test_boot_installs_again_when_the_stored_catalogue_is_not_what_it_would_install() -> None:
+    mk, store = FakeMk(), MemoryTurnStore()
+    _found(mk)
+    await Teaching(mk, store).put_catalogue(BONFIRE, "hermes", "main", AGENT)
+    stale: dict[str, JsonValue] = {
+        "schema_version": "kernel-catalogue/v1",
+        "tools": [],
+    }  # e.g. merged by an older service
+    await store.save_catalogue(BONFIRE, "hermes", "main", stale)
+    mk.calls.clear()
+    warmer = Warmer(mk, Teaching(mk, store), BONFIRE)
+    assert await warmer.tick() is True
+    assert len(mk.calls_of("put_catalogue")) == 1 and "web_search" in str(mk.catalogues[BONFIRE])
+    assert await store.catalogue(BONFIRE, "hermes", "main") == mk.catalogues[BONFIRE]
 
 
 async def test_a_tick_that_raises_does_not_end_the_loop() -> None:

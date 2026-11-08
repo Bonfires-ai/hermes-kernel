@@ -308,13 +308,17 @@ class Teaching:
     async def install_kept(self, bonfire_id: str) -> bool:
         """Install the bonfire's kept agent catalogues in the kernel and store the merged ones. True when installed or
         when nothing is kept; False when the bonfire does not exist yet, or the kernel refused or was away (retry
-        later)."""
+        later). As in ``put_catalogue``, a group whose stored catalogue is already what it would install installs
+        nothing: the kernel keeps its catalogue in its graph, and every install drops the bonfire's runtime and its
+        staged drafts, so a restart must not cost a person their waiting draft."""
         for platform, group in await self._store.kept_groups(bonfire_id, "agent"):
             async with self._installing.setdefault((bonfire_id, platform, group), asyncio.Lock()):
                 source = await self._store.source(bonfire_id, platform, group, "agent")
                 if source is None:
                     continue
                 merged = merge_sources(source)
+                if await self._store.catalogue(bonfire_id, platform, group) == merged:
+                    continue
                 try:
                     await self._mk.put_catalogue(bonfire_id, merged)
                 except MkError as exc:  # not founded, refused, busy or away
