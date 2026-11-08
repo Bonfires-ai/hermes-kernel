@@ -103,7 +103,9 @@ version. Then it installs the plugin, writes the key to `HERMES_KERNEL_TOKEN` in
 other line kept) and the URL to `hermes-kernel.json`, and enables the plugin. It never writes a `.env` in this
 repository, needs no Docker, and passes the key to `curl` in a private temporary config file, never on a command line.
 `--url` points it at another service (default `https://kernel.staging-bonfires.dev`); a plain `http://` URL is refused
-unless it is `localhost` or `127.0.0.1`, because the key is a bearer.
+unless it is `localhost` or `127.0.0.1`, because the key is a bearer. Every message about the service names its URL. The
+plugin prefers `HERMES_KERNEL_URL` to the URL written, so if it is set, in your environment or in your Hermes `.env`, to
+another URL, the script warns and says how to remove it; it never edits either itself.
 
 **Where your data goes.** Your messages and your memory are on Bonfires' servers: AWS eu-central-1, MongoDB Atlas and
 Neo4j. When a session is built, its messages go on to OpenRouter and Voyage AI from there; recall queries go to Voyage

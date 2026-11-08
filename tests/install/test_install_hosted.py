@@ -288,3 +288,58 @@ def test_a_pasted_key_is_trimmed(rig):
     result = hosted(rig, env={"HERMES_KERNEL_TOKEN": f"  {SENTINEL} "})
     assert result.returncode == 0, result.stderr
     assert f'Bearer {SENTINEL}"\n' in (rig.base / "curl_config").read_text()
+
+
+# --- Which service: every failure names it, and a HERMES_KERNEL_URL that would win over it is warned about -----------
+
+OTHER = "https://kernel.other.example"
+
+
+def test_every_failure_about_the_service_names_its_url(rig):
+    cases = [
+        {"HK_CURL_CODE": "401", "HK_CURL_BODY": detail("unknown or revoked key")},
+        {"HK_CURL_CODE": "403", "HK_CURL_BODY": detail("this key is read-only: it needs write permission")},
+        {"HK_CURL_CODE": "503", "HK_CURL_BODY": detail("the key check is unavailable")},
+        {"HK_CURL_CODE": "000", "HK_CURL_BODY": ""},
+        {"HK_CURL_CODE": "418", "HK_CURL_BODY": ""},
+        {"HK_CURL_BODY": status_body("0.2.0")},
+    ]
+    for env in cases:
+        result = hosted(rig, env=env)
+        assert result.returncode != 0, env
+        assert URL in result.stderr, (env, result.stderr)
+        untouched(rig)
+
+
+def test_a_different_hermes_kernel_url_in_the_environment_is_warned_about(rig):
+    result = hosted(rig, "--url", OTHER, env={"HERMES_KERNEL_URL": URL + "/elsewhere"})
+    assert result.returncode == 0, result.stderr
+    assert json.loads((rig.home / "hermes-kernel.json").read_text()) == {"url": OTHER}
+    warning = [line for line in result.stderr.splitlines() if "HERMES_KERNEL_URL" in line]
+    assert len(warning) == 1, result.stderr
+    assert "environment" in warning[0] and "prefers it" in warning[0] and "unset HERMES_KERNEL_URL" in warning[0]
+    assert OTHER in warning[0]
+
+
+def test_a_different_hermes_kernel_url_in_hermes_env_is_warned_about_and_kept(rig):
+    original = f"OPENAI_API_KEY=x\nexport HERMES_KERNEL_URL={OTHER}\nLAST=2\n"
+    (rig.home / ".env").write_text(original)
+    result = hosted(rig)
+    assert result.returncode == 0, result.stderr
+    warning = [line for line in result.stderr.splitlines() if "HERMES_KERNEL_URL" in line]
+    assert len(warning) == 1, result.stderr
+    assert str(rig.home / ".env") in warning[0] and "prefers it" in warning[0] and "Remove" in warning[0]
+    lines = (rig.home / ".env").read_text().splitlines()  # the person's line stays: only they remove it
+    assert lines == [
+        "OPENAI_API_KEY=x",
+        f"export HERMES_KERNEL_URL={OTHER}",
+        "LAST=2",
+        f"HERMES_KERNEL_TOKEN={SENTINEL}",
+    ]
+
+
+def test_a_hermes_kernel_url_that_is_the_url_written_is_not_warned_about(rig):
+    (rig.home / ".env").write_text(f"HERMES_KERNEL_URL={URL}/\n")
+    result = hosted(rig, env={"HERMES_KERNEL_URL": URL})
+    assert result.returncode == 0, result.stderr
+    assert "HERMES_KERNEL_URL" not in result.stderr

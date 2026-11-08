@@ -32,6 +32,7 @@ export HERMES_HOME
 UPDATED=""
 
 say() { printf '%s\n' "$*"; }
+warn() { printf 'install.sh: warning: %s\n' "$*" >&2; }
 die() {
   printf 'install.sh: %s\n' "$*" >&2
   exit 1
@@ -443,8 +444,8 @@ check_service() {
   HK_CFG=""
   case "$_code" in
     200) ;;
-    401) die "the service refused this key: it is not a key it knows. Check that you copied all of it.$(detail_of)" ;;
-    403) die "the service will not take this key$(detail_of)" ;;
+    401) die "the service at $1 refused this key: it is not a key it knows. Check that you copied all of it.$(detail_of)" ;;
+    403) die "the service at $1 will not take this key$(detail_of)" ;;
     000 | 5??) die "the service at $1 cannot be reached or is away just now (answer: $_code$(err_of)). Your key was not refused. Try again in a minute.$(detail_of)" ;;
     *) die "the service at $1 answered $_code, which this script does not know.$(detail_of)" ;;
   esac
@@ -453,9 +454,23 @@ check_service() {
   [ -n "$_want" ] || die "could not read the plugin's version from $ROOT/plugin/plugin.yaml."
   _mm=$(printf '%s' "$_have" | sed -n 's/^\([0-9][0-9]*\.[0-9][0-9]*\)\([^0-9].*\)\{0,1\}$/\1/p')
   if [ -z "$_mm" ] || [ "$_mm" != "$_want" ]; then
-    die "the service is version \"${_have:-unknown}\" and this plugin is version \"$_want\"; they must share major.minor. Nothing was written."
+    die "the service at $1 is version \"${_have:-unknown}\" and this plugin is version \"$_want\"; they must share major.minor. Nothing was written."
   fi
   say "the service at $1 took the key (version $_have)"
+}
+
+# warn_url_override URL: the plugin reads HERMES_KERNEL_URL before hermes-kernel.json, so one that names another service
+# silently wins over the URL just written. Say so, and how to remove it; never edit the person's environment or file.
+# The other value is not echoed: only the URL written here passed check_url.
+warn_url_override() {
+  _set=$(printf '%s' "${HERMES_KERNEL_URL:-}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+  if [ -n "$_set" ] && [ "${_set%/}" != "$1" ]; then
+    warn "HERMES_KERNEL_URL is set in your environment to another URL, and the plugin prefers it to $1, the URL written here. Remove it: run \"unset HERMES_KERNEL_URL\" and take it out of your shell profile, then restart Hermes."
+  fi
+  _set=$(env_get "$HERMES_HOME/.env" HERMES_KERNEL_URL)
+  if [ -n "$_set" ] && [ "${_set%/}" != "$1" ]; then
+    warn "$HERMES_HOME/.env sets HERMES_KERNEL_URL to another URL, and the plugin prefers it to $1, the URL written here. Remove that line from $HERMES_HOME/.env, then restart Hermes."
+  fi
 }
 
 run_hosted() {
@@ -472,6 +487,7 @@ run_hosted() {
   "$HERMES_BIN" config set memory.provider hermes-kernel
   # Last, so a running gateway reloads its plugins and finds the token already there.
   "$HERMES_BIN" plugins enable hermes-kernel
+  warn_url_override "$_url"
   finish
 }
 
