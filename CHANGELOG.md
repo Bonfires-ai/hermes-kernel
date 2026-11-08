@@ -44,3 +44,7 @@ that make memory-kernel a person's own Hermes memory and turn reader.
 - The turn service can serve many bonfires: with `KT_AUTH_URL` and `KT_HANDOFF_URL` set, each key names its bonfire and
   closed sessions are handed over to be built; with neither set it is the local service as before. A test calls every
   route with one customer's key on another's ids, and fails for a new route until the route has a probe.
+- Hosted: a key check that fails says only "the key check is unavailable" and logs one `kernel_turns.key_check_failed`
+  warning with its status; a 404 is an unknown key only when it is the key check's own `api_keys.not_found`, so a wrong
+  URL is never "your key is bad"; a hand-off 401 or 403 logs `kernel_turns.handoff_token_rejected`; a blank
+  `KT_AUTH_TOKEN` or `KT_HANDOFF_TOKEN` refuses to start, and a refused start never prints the values it was given.

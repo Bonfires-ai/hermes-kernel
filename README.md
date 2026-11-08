@@ -345,8 +345,8 @@ the one bonfire of a local stack or the bonfire each key names:
 |---|---|
 | `KT_PORT` | the port it listens on (8000) |
 | `KT_BONFIRE_ID` | local: the one bonfire every conversation speaks to. Required unless both URLs below are set, refused if they are |
-| `KT_AUTH_URL`, `KT_AUTH_TOKEN` | hosted: where a key is checked, and the bearer sent there |
-| `KT_HANDOFF_URL`, `KT_HANDOFF_TOKEN` | hosted: where closed sessions go and each bonfire's worker status is read, and the bearer sent there |
+| `KT_AUTH_URL`, `KT_AUTH_TOKEN` | hosted: where a key is checked, and the bearer sent there (a blank token refuses to start) |
+| `KT_HANDOFF_URL`, `KT_HANDOFF_TOKEN` | hosted: where closed sessions go and each bonfire's worker status is read, and the bearer sent there (a blank token refuses to start) |
 | `KT_HANDOFF_EVERY_S` | seconds between hand-off passes (15) |
 | `KT_RETENTION_DAYS` | turn and ledger rows expire after this many days (at least 1); unset keeps them |
 
@@ -356,14 +356,18 @@ key, and the service talks to the two seams:
 
 - **The key check.** `POST KT_AUTH_URL` with `{"key": "<the caller's bearer>"}` and `Authorization: Bearer
   <KT_AUTH_TOKEN>`. `200 {"bonfire_id", "permission"}` is an answer: `write` or `admin` is served and kept for 60
-  seconds, `read` is a 403. `404` is an unknown or revoked key, a 401. Anything else, or an answer that doesn't parse,
-  is the seam failing: a 503 with `Retry-After`, never a 401.
+  seconds, `read` is a 403. `404` is an unknown or revoked key, a 401, but only when its body is a JSON object whose
+  `error` is `api_keys.not_found`; any other 404 (FastAPI's own `{"detail": "Not Found"}` for a wrong path, a proxy's
+  page) is the seam failing. Anything else, or an answer that doesn't parse, is the seam failing too: a 503 with
+  `Retry-After` that says only "the key check is unavailable", never a 401, and one `kernel_turns.key_check_failed`
+  warning in the service's log naming the status.
 - **The hand-off.** Under the base URL `KT_HANDOFF_URL`, with `Authorization: Bearer <KT_HANDOFF_TOKEN>`:
   - `POST {url}/bonfires/{bonfire_id}/sessions` takes each bonfire's oldest closed session, as `{conversation_id,
     messages: [{message_id, speaker, text, timestamp, addressees}], agent_handles: ["hermes"]}`. A 2xx hands it over and
     its text is removed here. A 400, 409, 413 or 422 refuses it: the session fails with the answer's `message` or
     `detail` and keeps its text for `POST /v1/sessions/{id}/retry`. Anything else, a 404 included, means it waits and is
-    sent again with the same body.
+    sent again with the same body. A 401 or 403, here or on the status read below, also logs
+    `kernel_turns.handoff_token_rejected`: the seam did not take `KT_HANDOFF_TOKEN`.
   - `GET {url}/bonfires/{bonfire_id}/status` answers `{engine, agent_handles, waiting, failed: [{key, conversation_id,
     reason, attempts}], held, last_built_at}`. It's read for `/v1/status`, and the first time a bonfire's key is used:
     only a bonfire with `engine` `kernel` and `agent_handles` exactly `["hermes"]` is served, and any other key gets a

@@ -388,4 +388,5 @@ def test_a_key_is_refused_by_what_is_wrong_with_it(mk: FakeMk) -> None:
     assert answers["read-only"].status_code == 403
     assert answers["read-only"].json() == {"detail": "this key is read-only"}
     assert answers["away"].status_code == 503 and answers["away"].headers["Retry-After"] == "5"
-    assert answers["away"].json() == {"detail": "keys cannot be checked right now"}
+    # one fixed sentence, whatever the exception says: a seam's status or words never reach the person
+    assert answers["away"].json() == {"detail": "the key check is unavailable"}

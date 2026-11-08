@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import logging
 import re
 import time
 from collections.abc import Awaitable, Callable
@@ -17,7 +18,15 @@ from dataclasses import dataclass
 import httpx
 
 from kernel_turns.config import BONFIRE_PATTERN
-from kernel_turns.handoff import AGENT_HANDLE, STATUS_TIMEOUT_S, HandoffApi
+from kernel_turns.handoff import AGENT_HANDLE, STATUS_TIMEOUT_S, HandoffApi, WorkerUnreadable
+
+log = logging.getLogger(__name__)
+
+#: what a person is told whenever the key cannot be checked: one sentence, never the seam's status or words
+KEYS_AWAY = "the key check is unavailable"
+#: the ``error`` of the key check's answer for an unknown or revoked key: platform-api's ``api_keys.not_found``. A 404
+#: without it (FastAPI's own ``{"detail": "Not Found"}`` for a wrong path, a proxy's page) is the seam failing
+UNKNOWN_KEY_ERROR = "api_keys.not_found"
 
 
 @dataclass(frozen=True)
@@ -44,6 +53,22 @@ class KeysAway(Exception):
     """The key could not be checked just now: nothing is known about it, so it is not refused."""
 
 
+def _away(status: object) -> KeysAway:
+    """The one warning for a failed check, and the error to raise. ``status`` is a status code, a class name or this
+    module's own words: never the key, the token, or what the seam said."""
+    log.warning("kernel_turns.key_check_failed: status=%s", status)
+    return KeysAway(KEYS_AWAY)
+
+
+def _unknown_key(resp: httpx.Response) -> bool:
+    """Whether a 404 is the check's own answer for a bad key: a JSON object whose ``error`` is ``UNKNOWN_KEY_ERROR``."""
+    try:
+        body = resp.json()
+    except Exception:  # noqa: BLE001 - not JSON: a proxy's page
+        return False
+    return isinstance(body, dict) and body.get("error") == UNKNOWN_KEY_ERROR
+
+
 def token_check(token: str, bonfire_id: str) -> Authenticate:
     """The bearer must be ``token`` (compared in constant time); an empty ``token`` refuses everything."""
     expected = token.encode("utf-8")
@@ -63,9 +88,11 @@ _BONFIRE = re.compile(BONFIRE_PATTERN)
 class KeyCheck:
     """The hosted check: ``POST url`` with ``{"key": key}`` and ``Authorization: Bearer <token>``.
 
-    ``200 {bonfire_id, permission}`` is an answer; ``404`` is an unknown or revoked key. Anything else, and any answer
-    that is not well formed, is the seam failing: ``KeysAway``, never ``Unauthorized``, so a person is not told their
-    key is bad because the seam is. Only ``write`` and ``admin`` answers are kept, for ``ttl_s``, under the key's
+    ``200 {bonfire_id, permission}`` is an answer; a ``404`` whose body is ``{"error": "api_keys.not_found", ...}`` is an
+    unknown or revoked key. Anything else (any other 404 included: a wrong URL is FastAPI's ``{"detail": "Not
+    Found"}``), and any answer that is not well formed, is the seam failing: ``KeysAway``, never ``Unauthorized``, so a
+    person is not told their key is bad because the seam is. Each failure is one warning naming its status, and the
+    person is told only ``KEYS_AWAY``. Only ``write`` and ``admin`` answers are kept, for ``ttl_s``, under the key's
     sha256: a revoked key stops within a minute, an unknown or read-only one is asked again at once. The key is never
     logged, kept, or put in an error message.
     """
@@ -110,16 +137,17 @@ class KeyCheck:
     async def _ask(self, key: str) -> tuple[Caller, str]:
         # The raises sit outside the `except` blocks: inside, the original error rides along as `__context__`, and an
         # error from a transport can quote what it was sent.
+        failure = ""
         try:
             resp = await self._client.post(self._url, json={"key": key}, headers=self._headers, timeout=self._timeout_s)
-        except Exception:  # noqa: BLE001 - transport, timeout, anything: the seam is away
-            resp = None
+        except Exception as exc:  # noqa: BLE001 - transport, timeout, anything: the seam is away; only the class is kept
+            resp, failure = None, type(exc).__name__
         if resp is None:
-            raise KeysAway("the key check did not answer")
-        if resp.status_code == 404:
+            raise _away(failure)
+        if resp.status_code == 404 and _unknown_key(resp):
             raise Unauthorized("unknown or revoked key")
         if resp.status_code != 200:
-            raise KeysAway(f"the key check answered {resp.status_code}")
+            raise _away(resp.status_code)
         bonfire: object = None
         permission: object = None
         try:
@@ -132,7 +160,7 @@ class KeyCheck:
             or _BONFIRE.fullmatch(bonfire) is None  # \x1f joins the store's keys: one would break isolation
             or permission not in ("read", "write", "admin")
         ):
-            raise KeysAway("the key check answered with something unreadable")
+            raise _away("200 (an answer that cannot be read)")
         return Caller(bonfire), permission
 
 
@@ -141,8 +169,8 @@ def bonfire_guard(inner: Authenticate, api: HandoffApi) -> Authenticate:
     service: a key for a Graphiti bonfire, or for a bot's kernel bonfire, is refused (``WrongBonfire``).
 
     A good answer is kept for the life of the process, because a bonfire's engine is immutable and its handles are
-    fixed; the set holds one id per bonfire. A wrong answer is not kept. An unreadable status is ``KeysAway``, so an
-    outage stops only a bonfire not yet seen, and the read happens once per bonfire, not per request.
+    fixed; the set holds one id per bonfire. A wrong answer is not kept. An unreadable status is ``KeysAway``, with one
+    warning, so an outage stops only a bonfire not yet seen, and the read happens once per bonfire, not per request.
     """
     good: set[str] = set()
 
@@ -152,12 +180,15 @@ def bonfire_guard(inner: Authenticate, api: HandoffApi) -> Authenticate:
             return who
         # The raise sits outside the `except`: no chain carries a value.
         status = None
+        problem = ""
         try:
             status = await asyncio.wait_for(api.worker_status(who.bonfire_id), STATUS_TIMEOUT_S)
-        except Exception:  # noqa: BLE001 - nothing is known about the bonfire just now
-            pass
+        except WorkerUnreadable as exc:  # its words are the hand-off client's own: a status code or a class name
+            problem = str(exc)
+        except Exception as exc:  # noqa: BLE001 - nothing is known about the bonfire just now; only the class is kept
+            problem = type(exc).__name__
         if status is None:
-            raise KeysAway("the bonfire could not be checked just now")
+            raise _away(f"worker status: {problem}")
         if status.engine != "kernel" or status.agent_handles != [AGENT_HANDLE]:
             raise WrongBonfire("this key's bonfire is not set up for hermes-kernel")
         good.add(who.bonfire_id)

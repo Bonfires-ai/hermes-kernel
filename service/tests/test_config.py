@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import pytest
-from pydantic import ValidationError
+from pydantic import SecretStr, ValidationError
 
 from kernel_turns.config import Settings
 
@@ -47,8 +47,48 @@ def test_half_hosted_settings_refuse_to_start() -> None:
         Settings()
 
 
+SEAMS = {"auth_url": "http://seam/check", "handoff_url": "http://seam/handoff"}
+TOKENS = {"auth_token": SecretStr("auth-" + "seam-token"), "handoff_token": SecretStr("handoff-" + "seam-token")}
+
+
 def test_hosted_has_no_bonfire_and_local_needs_one() -> None:
-    hosted = Settings(auth_url="http://seam/check", handoff_url="http://seam/handoff")
+    hosted = Settings(**SEAMS, **TOKENS)
     assert hosted.bonfire_id is None and hosted.port == 8000 and hosted.handoff_every_s == 15
     with pytest.raises(ValidationError):  # hosted with a bonfire is two answers to one question
-        Settings(auth_url="http://seam/check", handoff_url="http://seam/handoff", bonfire_id="b")
+        Settings(**SEAMS, **TOKENS, bonfire_id="b")
+
+
+@pytest.mark.parametrize("blank", ["", " ", "\t\n  "])
+@pytest.mark.parametrize(
+    ("field", "variable"), [("auth_token", "KT_AUTH_TOKEN"), ("handoff_token", "KT_HANDOFF_TOKEN")]
+)
+def test_hosted_refuses_to_start_with_a_blank_seam_token(field: str, variable: str, blank: str) -> None:
+    # a blank token would start, then fail every key check or every hand-off with nothing but a 401 at the seam
+    with pytest.raises(ValidationError) as info:
+        Settings(**SEAMS, **{**TOKENS, field: SecretStr(blank)})
+    assert variable in str(info.value)
+    assert all(token.get_secret_value() not in str(info.value) for token in TOKENS.values())
+
+
+@pytest.mark.parametrize("variable", ["KT_AUTH_TOKEN", "KT_HANDOFF_TOKEN"])
+def test_a_seam_token_left_out_of_the_environment_refuses_to_start(
+    monkeypatch: pytest.MonkeyPatch, variable: str
+) -> None:
+    for name, value in {
+        "KT_AUTH_URL": "http://seam/check",
+        "KT_HANDOFF_URL": "http://seam/handoff",
+        "KT_AUTH_TOKEN": "auth-" + "seam-token",
+        "KT_HANDOFF_TOKEN": "handoff-" + "seam-token",
+        "KT_MONGO_URI": "mongodb://user:" + "db-password@mongo:27017",
+    }.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv(variable, "")  # compose's `${VAR:-}`: empty is unset, and unset is the blank default
+    with pytest.raises(ValidationError) as info:
+        Settings()
+    assert variable in str(info.value)
+    for secret in ("auth-" + "seam-token", "handoff-" + "seam-token", "db-password"):
+        assert secret not in str(info.value)  # a refused start prints its error: it holds no other setting's value
+
+
+def test_local_needs_no_seam_token() -> None:
+    assert Settings(bonfire_id="b").auth_token.get_secret_value() == ""

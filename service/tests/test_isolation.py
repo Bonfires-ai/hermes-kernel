@@ -435,8 +435,10 @@ class Seam:
             return httpx.Response(401)
         key = json.loads(request.content)["key"]
         self.keys_asked.append(key)
-        if key not in KEYS:
-            return httpx.Response(404)
+        if key not in KEYS:  # platform-api's answer for every bad key
+            return httpx.Response(
+                404, json={"error": "api_keys.not_found", "message": "API key not found", "context": {}}
+            )
         return httpx.Response(200, json={"bonfire_id": KEYS[key], "permission": "write"})
 
     def worker(self, request: httpx.Request) -> httpx.Response:

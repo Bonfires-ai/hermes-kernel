@@ -24,6 +24,7 @@ from kernel_turns.handoff import (
     HandoffApi,
     HandoffClient,
     Outcome,
+    WorkerUnreadable,
     hand_over_forever,
     hand_over_once,
 )
@@ -621,3 +622,36 @@ async def test_hosted_builds_the_client_from_settings_and_closes_it(monkeypatch:
     (client,) = made
     assert (client.url, client.token) == (URL, SEAM_TOKEN)
     assert client.closed
+
+
+# --- A rejected seam token is visible --------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("status", [401, 403])
+async def test_a_rejected_token_is_one_warning_on_a_send(caplog: pytest.LogCaptureFixture, status: int) -> None:
+    caplog.set_level(logging.DEBUG, logger="kernel_turns")
+    outcome = await client_over(lambda _: httpx.Response(status, json={"message": TEXT})).send(A, {})
+    assert outcome == Outcome("later", f"the hand-off answered {status}")  # it still waits: never a failed session
+    (record,) = [r for r in caplog.records if "handoff_token_rejected" in r.getMessage()]
+    assert record.levelno == logging.WARNING
+    assert record.getMessage() == f"kernel_turns.handoff_token_rejected: status={status}"
+    assert TEXT not in caplog.text and SEAM_TOKEN not in caplog.text
+
+
+@pytest.mark.parametrize("status", [401, 403])
+async def test_a_rejected_token_is_one_warning_on_a_status_read(caplog: pytest.LogCaptureFixture, status: int) -> None:
+    caplog.set_level(logging.DEBUG, logger="kernel_turns")
+    with pytest.raises(WorkerUnreadable):
+        await client_over(lambda _: httpx.Response(status, json={"message": TEXT})).worker_status(A)
+    (record,) = [r for r in caplog.records if "handoff_token_rejected" in r.getMessage()]
+    assert record.getMessage() == f"kernel_turns.handoff_token_rejected: status={status}"
+    assert TEXT not in caplog.text and SEAM_TOKEN not in caplog.text
+
+
+@pytest.mark.parametrize("status", [404, 500, 503])
+async def test_other_failures_are_not_called_a_token_problem(caplog: pytest.LogCaptureFixture, status: int) -> None:
+    caplog.set_level(logging.DEBUG, logger="kernel_turns")
+    await client_over(lambda _: httpx.Response(status)).send(A, {})
+    with pytest.raises(WorkerUnreadable):
+        await client_over(lambda _: httpx.Response(status)).worker_status(A)
+    assert "handoff_token_rejected" not in caplog.text

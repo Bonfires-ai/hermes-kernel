@@ -80,7 +80,7 @@ def test_service_away_says_so_and_writes_nothing(rig):
 
 
 def test_a_503_says_try_again_not_bad_key(rig):
-    body = detail("the key check did not answer")
+    body = detail("the key check is unavailable")
     result = hosted(rig, env={"HK_CURL_CODE": "503", "HK_CURL_BODY": body})
     assert result.returncode != 0
     assert "try again" in result.stderr.lower()

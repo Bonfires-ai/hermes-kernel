@@ -57,6 +57,14 @@ def ok(permission: str = "write", bonfire: str = "b1") -> httpx.Response:
     return httpx.Response(200, json={"bonfire_id": bonfire, "permission": permission})
 
 
+#: platform-api's answer for every bad key (``api_keys.not_found``, through its AppError handler)
+NOT_FOUND = {"error": "api_keys.not_found", "message": "API key not found", "context": {}}
+
+
+def unknown() -> httpx.Response:
+    return httpx.Response(404, json=NOT_FOUND)
+
+
 class Clock:
     def __init__(self) -> None:
         self.now = 1000.0
@@ -106,7 +114,7 @@ async def test_admin_is_cached_too() -> None:
 
 
 async def test_revoked_key_stops_within_a_minute() -> None:
-    answers = iter([ok(), httpx.Response(404)])
+    answers = iter([ok(), unknown()])
     seam, clock = Seam(lambda _: next(answers)), Clock()
     check = check_over(seam, clock)
     assert await check(KEY) == Caller("b1")
@@ -116,7 +124,7 @@ async def test_revoked_key_stops_within_a_minute() -> None:
 
 
 async def test_unknown_key_is_not_cached() -> None:
-    answers = iter([httpx.Response(404), ok()])
+    answers = iter([unknown(), ok()])
     seam = Seam(lambda _: next(answers))
     check = check_over(seam)
     with pytest.raises(Unauthorized):
@@ -173,7 +181,7 @@ async def test_the_key_is_never_logged(caplog: pytest.LogCaptureFixture) -> None
     caplog.set_level(logging.DEBUG)
     failures: list[httpx.Response | Exception] = [
         ok(),
-        httpx.Response(404),
+        unknown(),
         httpx.Response(500),
         httpx.ConnectError(f"cannot reach with {KEY}"),
         httpx.Response(200, content=b"not json"),
@@ -208,3 +216,75 @@ async def test_a_good_answer_for_one_key_is_not_another_keys() -> None:
 async def test_read_only_key_says_what_it_needs() -> None:
     with pytest.raises(ReadOnlyKey, match="needs write permission"):
         await check_over(Seam(lambda _: ok("read")))(KEY)
+
+
+# --- A 404 is an unknown key only when platform-api says so; every other failure is visible and says one thing ------
+
+
+async def test_platform_apis_not_found_is_an_unknown_key() -> None:
+    for body in (NOT_FOUND, {**NOT_FOUND, "correlation_id": "c-1"}):  # prod adds a correlation id
+        with pytest.raises(Unauthorized):
+            await check_over(Seam(lambda _, b=body: httpx.Response(404, json=b)))(KEY)
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        httpx.Response(404, json={"detail": "Not Found"}),  # FastAPI's own: a wrong path or a deploy-order slip
+        httpx.Response(404, text="<html><body>404 Not Found</body></html>"),  # a proxy's page
+        httpx.Response(404),
+        httpx.Response(404, json={"error": "bonfire.not_found", "message": "x", "context": {}}),
+        httpx.Response(404, json=["api_keys.not_found"]),
+        httpx.Response(404, json={"detail": "api_keys.not_found"}),
+    ],
+)
+async def test_any_other_404_is_keys_away(answer: httpx.Response) -> None:
+    with pytest.raises(KeysAway):
+        await check_over(Seam(lambda _: answer))(KEY)
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        httpx.ConnectError("down"),
+        httpx.Response(401),
+        httpx.Response(403),
+        httpx.Response(404, json={"detail": "Not Found"}),
+        httpx.Response(500),
+        httpx.Response(200, content=b"not json"),
+    ],
+)
+async def test_keys_away_says_one_fixed_thing_and_never_the_status(answer: httpx.Response | Exception) -> None:
+    with pytest.raises(KeysAway) as info:
+        await check_over(Seam(lambda _: answer))(KEY)
+    assert str(info.value) == "the key check is unavailable"
+
+
+@pytest.mark.parametrize(
+    ("answer", "status"),
+    [
+        (httpx.Response(401), "401"),
+        (httpx.Response(403), "403"),
+        (httpx.Response(404, json={"detail": "Not Found"}), "404"),
+        (httpx.Response(503), "503"),
+        (httpx.ConnectError(f"cannot reach with {KEY}"), "ConnectError"),
+        (httpx.Response(200, content=b"not json"), "200 (an answer that cannot be read)"),
+    ],
+)
+async def test_a_failed_check_is_one_warning_with_its_status(
+    caplog: pytest.LogCaptureFixture, answer: httpx.Response | Exception, status: str
+) -> None:
+    caplog.set_level(logging.DEBUG, logger="kernel_turns")
+    with pytest.raises(KeysAway):
+        await check_over(Seam(lambda _: answer))(KEY)
+    (record,) = [r for r in caplog.records if "key_check_failed" in r.getMessage()]
+    assert record.levelno == logging.WARNING
+    assert record.getMessage() == f"kernel_turns.key_check_failed: status={status}"
+    assert KEY not in caplog.text and SEAM_TOKEN not in caplog.text
+
+
+async def test_an_unknown_key_logs_no_warning(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.DEBUG, logger="kernel_turns")
+    with pytest.raises(Unauthorized):
+        await check_over(Seam(lambda _: unknown()))(KEY)
+    assert "key_check_failed" not in caplog.text

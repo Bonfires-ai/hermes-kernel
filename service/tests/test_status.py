@@ -188,7 +188,7 @@ from collections.abc import Callable  # noqa: E402
 import httpx  # noqa: E402
 
 from kernel_turns.callers import Caller, KeysAway, WrongBonfire, bonfire_guard  # noqa: E402
-from kernel_turns.handoff import HandoffClient, Outcome, WorkerFailure, WorkerStatus  # noqa: E402
+from kernel_turns.handoff import HandoffClient, Outcome, WorkerFailure, WorkerStatus, WorkerUnreadable  # noqa: E402
 from kernel_turns.status import build_status  # noqa: E402
 
 BUILT = datetime(2026, 11, 7, 1, 0, tzinfo=UTC)
@@ -481,3 +481,28 @@ async def test_nulls_may_be_left_out_of_the_wire() -> None:
     status = await got.worker_status("b1")
     assert status.held is None and status.last_built_at is None
     assert status.failed[0].reason is None and status.failed[0].conversation_id is None
+
+
+# --- Final fix round: the guard's failure is visible and says the one fixed thing -------------------------------------
+
+import logging  # noqa: E402
+
+
+@pytest.mark.parametrize(
+    ("failure", "problem"),
+    [
+        (RuntimeError("down with secret words"), "RuntimeError"),
+        (WorkerUnreadable("the hand-off's status answered 401"), "the hand-off's status answered 401"),
+    ],
+)
+async def test_an_unreadable_bonfire_is_one_warning_and_the_fixed_text(
+    caplog: pytest.LogCaptureFixture, failure: Exception, problem: str
+) -> None:
+    caplog.set_level(logging.DEBUG, logger="kernel_turns")
+    with pytest.raises(KeysAway) as info:
+        await bonfire_guard(_inner(), Worker(failure))("k")  # type: ignore[arg-type]
+    assert str(info.value) == "the key check is unavailable"
+    (record,) = [r for r in caplog.records if "key_check_failed" in r.getMessage()]
+    assert record.levelno == logging.WARNING
+    assert record.getMessage() == f"kernel_turns.key_check_failed: status=worker status: {problem}"
+    assert "secret" not in caplog.text

@@ -8,7 +8,8 @@ and posts it to ``{url}/bonfires/{bonfire}/sessions``, with ``Authorization: Bea
   ``/v1/sessions/{id}/retry``, and it stops holding up the sessions behind it;
 * anything else is ``later``, so a broken seam never fails a session: a wrong seam token, a timeout, and a 404, which the
   route never answers and so means a wrong URL or a deploy-order slip. It stays ``closed`` and waits out ``retry_after``,
-  and the sessions behind it wait too.
+  and the sessions behind it wait too. A 401 or 403, here or on a status read, is also a warning of its own
+  (``handoff_token_rejected``): the seam turned down ``KT_HANDOFF_TOKEN``.
 
 A session that raises (a row that cannot be read, a database blip) waits the same way, with the error's class as its
 reason. A message that cannot be read stops its session until the row is mended: skipping it, as the writer does, would
@@ -45,6 +46,8 @@ Body = dict[str, Any]
 #: body with any other handle is refused for good, so a session's stored handles are not what is sent
 AGENT_HANDLE = "hermes"
 REFUSED_STATUSES = frozenset({400, 409, 413, 422})
+#: what the seam answers a token it does not take
+TOKEN_REJECTED_STATUSES = frozenset({401, 403})
 REASON_MAX_CHARS = 500
 #: the status read is inside the plugin's 5 s for ``/v1/status``, and a first-seen bonfire's guard inside its 3 s
 STATUS_TIMEOUT_S = 2.0
@@ -94,6 +97,11 @@ class HandoffApi(Protocol):
         ...
 
 
+def _note_token_rejected(status: int) -> None:
+    if status in TOKEN_REJECTED_STATUSES:
+        log.warning("kernel_turns.handoff_token_rejected: status=%s", status)
+
+
 def _refusal(resp: httpx.Response) -> str:
     """The answer's own words when they are one plain string, ``message`` or ``detail``. FastAPI's 422 ``detail`` is a list
     whose entries quote their ``input``, which can be the text, so it is never kept."""
@@ -136,6 +144,7 @@ class HandoffClient:
             return Outcome("accepted")
         if resp.status_code in REFUSED_STATUSES:
             return Outcome("refused", _refusal(resp))
+        _note_token_rejected(resp.status_code)
         return Outcome("later", f"the hand-off answered {resp.status_code}")
 
     async def worker_status(self, bonfire_id: str) -> WorkerStatus:
@@ -147,6 +156,7 @@ class HandoffClient:
         try:
             resp = await self._client.get(url, headers=self._headers, timeout=STATUS_TIMEOUT_S)
             if resp.status_code != 200:
+                _note_token_rejected(resp.status_code)
                 problem = f"the hand-off's status answered {resp.status_code}"
             else:
                 status = WorkerStatus.model_validate(resp.json())

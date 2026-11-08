@@ -30,6 +30,7 @@ from pydantic import BaseModel, Field
 from pymongo import AsyncMongoClient
 
 from kernel_turns.callers import (
+    KEYS_AWAY,
     Authenticate,
     Caller,
     KeyCheck,
@@ -120,8 +121,9 @@ def _install_errors(app: FastAPI) -> None:
     async def wrong_bonfire(_: Request, exc: Exception) -> JSONResponse:
         return _error(403, str(exc))
 
-    async def keys_away(_: Request, exc: Exception) -> JSONResponse:
-        return _error(503, str(exc), {"Retry-After": str(KEYS_RETRY_AFTER_S)})
+    async def keys_away(_: Request, __: Exception) -> JSONResponse:
+        # Always the one sentence: what failed, and its status, is in the warning `callers` logged.
+        return _error(503, KEYS_AWAY, {"Retry-After": str(KEYS_RETRY_AFTER_S)})
 
     async def not_found(_: Request, exc: Exception) -> JSONResponse:
         return _error(404, str(exc))

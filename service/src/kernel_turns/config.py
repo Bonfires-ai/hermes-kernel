@@ -21,6 +21,8 @@ class Settings(BaseSettings):
         extra="ignore",
         # compose passes `KT_X: ${VAR:-}`: an empty variable means unset, not "".
         env_ignore_empty=True,
+        # A refused start prints its error: never with the values it was given (a token, the Mongo URI).
+        hide_input_in_errors=True,
     )
 
     # `mk serve`: unauthenticated, reachable on the stack's own network only.
@@ -59,4 +61,8 @@ class Settings(BaseSettings):
             raise ValueError("KT_BONFIRE_ID is required unless KT_AUTH_URL and KT_HANDOFF_URL are set")
         if self.auth_url is not None and self.bonfire_id is not None:
             raise ValueError("KT_BONFIRE_ID is for a local stack: a hosted one takes each bonfire from the key")
+        if self.auth_url is not None:  # blank would start, and then every key check or every hand-off would be a 401
+            for variable, token in (("KT_AUTH_TOKEN", self.auth_token), ("KT_HANDOFF_TOKEN", self.handoff_token)):
+                if not token.get_secret_value().strip():
+                    raise ValueError(f"{variable} is blank: a hosted stack sends it as the bearer to its seam")
         return self
