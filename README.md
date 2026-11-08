@@ -108,12 +108,19 @@ plugin prefers `HERMES_KERNEL_URL` to the URL written, so if it is set, in your 
 another URL, the script warns and says how to remove it; it never edits either itself.
 
 **Where your data goes.** Your messages and your memory are on Bonfires' servers: AWS eu-central-1, MongoDB Atlas and
-Neo4j. When a session is built, its messages go on to OpenRouter and Voyage AI from there; recall queries go to Voyage
+Neo4j Aura (managed). When a session is built, its messages go on to OpenRouter and Voyage AI from there; recall queries go to Voyage
 from the service. Of "What leaves your machine" below, only these still leave your machine under hosted: your normal Hermes chat, a
 phrase's `web_search`, and recalled memory, which the plugin puts into each prompt and so reaches your own chat
 provider just as it does locally; the rest happens on Bonfires' side.
 
-- The turn records the service keeps expire after **30 days**.
+- The turn records the service keeps (`turns`, each message as the kernel read it, and `ledger`, each step a phrase
+  ran) expire after **30 days**.
+- These have **no expiry** on the turn service:
+  - each message's speaker, timestamp, addressees and ids (its text is removed once its session is handed to the build);
+  - a refused session's text, kept so that `/kernel retry` can send it again, and each session's chat id, times and,
+    if it failed, the reason it was given;
+  - `uses`: each run of a taught phrase, with its name, the speaker, the platform, the chat, the time and how it ended;
+  - `catalogues`: the tools your Hermes offered the kernel, for each chat group.
 - A session's text leaves the turn service when it is handed to the build, **but it stays in the build queue's record
   with no expiry, and memory itself holds each message's text with its speaker** (the `Episodic.content` field),
   because recall reads it back to you.
@@ -133,6 +140,9 @@ Known limits, besides the above:
 - **A failed session blocks newer ones.** One failed session that nobody has resolved holds back that key's newer
   sessions; other customers are not affected.
 - **A deploy leaves a short gap.** The turn service is a single task; the plugin's spool covers the gap.
+- **A busy reader reads nothing.** When both of the kernel's reading engines are busy, `/plan` answers "unread": the
+  message is not read for phrases, and Hermes answers it as it would without the kernel. Reading degrades under load
+  instead of failing.
 - One memory per key (not split by chat or person, as at the top).
 - The service is a staging service today.
 - The key is the whole of your access, so keep it out of chats and repositories.
@@ -294,8 +304,10 @@ git pull
 hermes gateway restart --detach
 ```
 
-The script rebuilds, restarts the stack and updates the plugin; it keeps your `.env`. The restart is what loads the new plugin: a running gateway keeps the code it started with. Your memory stays in its
-Docker volumes.
+The script updates the plugin, and the restart is what loads it: a running gateway keeps the code it started with.
+Local: it also rebuilds and restarts the stack and keeps your `.env`, and your memory stays in its Docker volumes.
+Hosted: it asks for your Bonfires key again (or takes it from `HERMES_KERNEL_TOKEN`), checks it, and writes it again;
+your memory is on Bonfires' side and is not touched.
 
 ## Uninstall
 
