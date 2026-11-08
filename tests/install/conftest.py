@@ -32,6 +32,7 @@ if [ "$(basename "$(dirname "$HERMES_HOME")")" != profiles ] && [ -f "$HERMES_HO
 fi
 if [ "$1" = --version ]; then echo "${{HK_HERMES_VERSION:-Hermes Agent v0.23.0 (test)}}"; fi
 if [ "$1" = plugins ] && [ "$2" = install ]; then
+  ls "$TMPDIR"/hk-curl.* >/dev/null 2>&1 && echo present > "$HK_RIG/config_at_install"
   mkdir -p "$HERMES_HOME/plugins/hermes-kernel"
 fi
 if [ "$1" = plugins ] && [ "$2" = enable ]; then
@@ -68,6 +69,7 @@ default='{{"bonfire_id":"b","founded":false,"versions":{{"service":"0.1.0","mk":
 body=${{HK_CURL_BODY-$default}}
 [ -z "$out" ] || printf '%s' "$body" > "$out"
 [ -z "$fmt" ] || printf '%s' "$code"
+[ -z "$HK_CURL_ERR" ] || echo "$HK_CURL_ERR" >&2
 [ "$code" != 000 ] || exit 7
 exit 0
 """
@@ -148,9 +150,9 @@ class Rig:
             "HK_RIG": str(self.base),
             "HK_PROC_MEMINFO": str(self.base / "meminfo"),
             "LANG": "C",
-            # The local tests pass no --mode; tests of the first question set this to "".
-            "HERMES_KERNEL_MODE": "local",
+            "TMPDIR": str(self.base / "tmp"),
         }
+        (self.base / "tmp").mkdir(exist_ok=True)
         child.update(env or {})
         assert Path(child["HERMES_HOME"]).resolve().is_relative_to(self.base.resolve()), "HERMES_HOME escaped"
         for key, value in child.items():
@@ -158,7 +160,12 @@ class Rig:
                 assert Path(value).resolve().is_relative_to(self.base.resolve()), "HERMES_BIN escaped"
         return child
 
-    def run(self, *args: str, env: dict | None = None, input: str | None = None) -> subprocess.CompletedProcess:
+    def run(
+        self, *args: str, env: dict | None = None, input: str | None = None, ask: bool = False
+    ) -> subprocess.CompletedProcess:
+        """`ask` leaves the mode to the script's first question; otherwise a run with no --mode means local."""
+        if not ask and "--mode" not in args:
+            env = {"HERMES_KERNEL_MODE": "local", **(env or {})}
         child = self.child_env(env)
         stdin = {"input": input} if input is not None else {"stdin": subprocess.DEVNULL}
         argv = [str(self.root / "install.sh"), *args]

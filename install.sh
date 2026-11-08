@@ -48,10 +48,12 @@ usage() {
 HK_TMP=""
 HK_CFG=""
 HK_BODY=""
+HK_ERR=""
 cleanup() {
   if [ -n "$HK_TMP" ]; then rm -f "$HK_TMP"; fi
   if [ -n "$HK_CFG" ]; then rm -f "$HK_CFG"; fi
   if [ -n "$HK_BODY" ]; then rm -f "$HK_BODY"; fi
+  if [ -n "$HK_ERR" ]; then rm -f "$HK_ERR"; fi
 }
 trap cleanup EXIT
 trap 'exit 130' INT
@@ -367,11 +369,32 @@ ask_mode() {
 check_url() {
   case "$1" in
     *[!A-Za-z0-9._~:/?#@%+=\&,-]*) die "the URL has characters that do not belong in one." ;;
-    https://*) ;;
-    http://localhost | http://localhost[:/]* | http://127.0.0.1 | http://127.0.0.1[:/]*) ;;
-    http://*) die "refusing $1: your key would travel unencrypted. Use an https:// URL (http:// is allowed only for localhost)." ;;
+    https://*)
+      _scheme=https
+      _rest=${1#https://}
+      ;;
+    http://*)
+      _scheme=http
+      _rest=${1#http://}
+      ;;
     *) die "the URL must start with https:// (got \"$1\")." ;;
   esac
+  _auth=${_rest%%[/?#]*}
+  [ -n "$_auth" ] || die "the URL has no host."
+  case "$_auth" in
+    *@*) die "the URL must not carry a user name or password (an @ before the host)." ;;
+  esac
+  _host=${_auth%%:*}
+  case "${_auth#"$_host"}" in
+    '' | :[0-9]*) ;;
+    *) die "the URL's port is not a number." ;;
+  esac
+  case "${_auth#"$_host"}" in
+    :*[!0-9]*) die "the URL's port is not a number." ;;
+  esac
+  if [ "$_scheme" = http ] && [ "$_host" != localhost ] && [ "$_host" != 127.0.0.1 ]; then
+    die "refusing $1: your key would travel unencrypted. Use an https:// URL (http:// is allowed only for localhost)."
+  fi
 }
 
 resolve_key() {
@@ -381,6 +404,7 @@ resolve_key() {
     read -r -s HK_KEY || true
     printf '\n' >&2
   fi
+  HK_KEY=$(printf '%s' "$HK_KEY" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
   [ -n "$HK_KEY" ] || die "no Bonfires API key. Set HERMES_KERNEL_TOKEN in the environment (it is never taken from the command line) and run again."
   case "$HK_KEY" in
     *[!A-Za-z0-9._~+/=:-]*) die "that key has characters a Bonfires key does not have. Check that you copied all of it and nothing else." ;;
@@ -389,7 +413,7 @@ resolve_key() {
 
 # json_field NAME FILE: the first string value of "NAME" in a one-object JSON file. No jq, no Python.
 json_field() {
-  tr '\n' ' ' <"$2" | sed -n 's/.*"'"$1"'"[[:space:]]*:[[:space:]]*"\(\([^"\\]\|\\.\)*\)".*/\1/p'
+  tr '\n' ' ' <"$2" | sed -n -E 's/.*"'"$1"'"[[:space:]]*:[[:space:]]*"(([^"\\]|\\.)*)".*/\1/p' | tr -d '[:cntrl:]'
 }
 
 # The service's own wording of why it said no, when it gave one.
@@ -398,20 +422,30 @@ detail_of() {
   if [ -n "$_d" ]; then say " ($_d)"; fi
 }
 
+# curl's own one-line reason, when it gave one (it cannot hold the key: the key is only in the config file).
+err_of() {
+  _e=$(head -n 1 "$HK_ERR" 2>/dev/null | tr -d '[:cntrl:]') || true
+  if [ -n "$_e" ]; then printf '; %s' "$_e"; fi
+}
+
 # check_service: GET /v1/status with the key, before anything is written. The key goes to curl in a private config
 # file, never on a command line.
 check_service() {
   command -v curl >/dev/null 2>&1 || die "curl was not found."
   HK_CFG=$(mktemp "${TMPDIR:-/tmp}/hk-curl.XXXXXX") || die "could not create a temporary file."
   HK_BODY=$(mktemp "${TMPDIR:-/tmp}/hk-body.XXXXXX") || die "could not create a temporary file."
-  chmod 600 "$HK_CFG" "$HK_BODY"
+  HK_ERR=$(mktemp "${TMPDIR:-/tmp}/hk-err.XXXXXX") || die "could not create a temporary file."
+  chmod 600 "$HK_CFG" "$HK_BODY" "$HK_ERR"
   printf 'url = "%s/v1/status"\nheader = "Authorization: Bearer %s"\n' "$1" "$HK_KEY" >"$HK_CFG"
-  _code=$(curl -sS --max-time 20 -o "$HK_BODY" -w '%{http_code}' -K "$HK_CFG" 2>/dev/null) || true
+  _code=$(curl -sS --max-time 20 -o "$HK_BODY" -w '%{http_code}' -K "$HK_CFG" 2>"$HK_ERR") || true
+  # The key was only ever in this file: gone before anything else happens.
+  rm -f "$HK_CFG"
+  HK_CFG=""
   case "$_code" in
     200) ;;
     401) die "the service refused this key: it is not a key it knows. Check that you copied all of it.$(detail_of)" ;;
     403) die "the service will not take this key$(detail_of)" ;;
-    000 | 5??) die "the service at $1 cannot be reached or is away just now (answer: $_code). Your key was not refused. Try again in a minute.$(detail_of)" ;;
+    000 | 5??) die "the service at $1 cannot be reached or is away just now (answer: $_code$(err_of)). Your key was not refused. Try again in a minute.$(detail_of)" ;;
     *) die "the service at $1 answered $_code, which this script does not know.$(detail_of)" ;;
   esac
   _have=$(tr '\n' ' ' <"$HK_BODY" | sed -n 's/.*"versions"[[:space:]]*:[[:space:]]*{[^}]*"service"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
@@ -469,6 +503,7 @@ main() {
       *) die "unknown option: $1 (try --help)" ;;
     esac
   done
+  MODE=$(printf '%s' "$MODE" | tr 'A-Z' 'a-z')
   if [ -z "$MODE" ]; then ask_mode; fi
   case "$MODE" in
     local) run_local ;;

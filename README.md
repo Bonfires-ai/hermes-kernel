@@ -25,7 +25,7 @@ messages and runs.
 
 There are two ways to run it, and `./install.sh` asks which (or pass `--mode hosted` or `--mode local`):
 
-- **Hosted** (the first choice): you paste a Bonfires API key and Bonfires runs the memory. No Docker, no OpenRouter or
+- **Hosted**: you paste a Bonfires API key and Bonfires runs the memory. No Docker, no OpenRouter or
   Voyage key, no 10 GiB of RAM. Your messages and memory live on Bonfires' servers; see [Hosted](#hosted).
 - **Local**: a Docker stack on your machine builds and holds the memory. It is the private option: nothing of yours is
   kept anywhere but your machine, apart from the calls to OpenRouter and Voyage listed under "What leaves your machine".
@@ -36,7 +36,7 @@ For the local stack:
 git clone https://github.com/Bonfires-ai/hermes-kernel && cd hermes-kernel
 export OPENROUTER_API_KEY=...   # in a terminal you can leave them out and the script asks, input hidden
 export VOYAGE_API_KEY=...
-./install.sh
+./install.sh --mode local
 ```
 
 `install.sh` sets up the local stack and the plugin in one go. It builds and starts the stack, installs the plugin into
@@ -53,7 +53,7 @@ Run it a second time and nothing is lost: `.env` and your memory stay, the image
 (`hermes plugins update`) rather than installed again.
 
 Options: `--hermes PATH` (the Hermes to use), `--project NAME` (the compose project, default `hermes-kernel`),
-`--compose-file FILE`, `--no-build`, `--plugin-source SOURCE`, `--url URL`; `./install.sh --help` lists them.
+`--mode hosted|local`, `--compose-file FILE`, `--no-build`, `--plugin-source SOURCE`, `--url URL`; `./install.sh --help` lists them.
 
 ### By hand
 
@@ -107,8 +107,9 @@ unless it is `localhost` or `127.0.0.1`, because the key is a bearer.
 
 **Where your data goes.** Your messages and your memory are on Bonfires' servers: AWS eu-central-1, MongoDB Atlas and
 Neo4j. When a session is built, its messages go on to OpenRouter and Voyage AI from there; recall queries go to Voyage
-from the service. Nothing in "What leaves your machine" below applies to hosted except your normal Hermes chat and a
-phrase's `web_search`; the rest happens on Bonfires' side.
+from the service. Of "What leaves your machine" below, only these still leave your machine under hosted: your normal Hermes chat, a
+phrase's `web_search`, and recalled memory, which the plugin puts into each prompt and so reaches your own chat
+provider just as it does locally; the rest happens on Bonfires' side.
 
 - The turn records the service keeps expire after **30 days**.
 - A session's text leaves the turn service when it is handed to the build, **but it stays in the build queue's record
@@ -123,9 +124,18 @@ phrase's `web_search`; the rest happens on Bonfires' side.
 Memory arrives later than local's 2 to 3 minutes; the measured time is added after the first hosted run.
 <!-- TASK16: hosted arrival time -->
 
-Known limits, besides the above: one memory per key (not split by chat or person, as at the top); the service is a
-staging service today; and the key is the whole of your access, so keep it out of chats and repositories. Hosted was
-tested on Linux and under bash 3.2 (the oldest bash a Mac ships); it has not been run on a Mac.
+Known limits, besides the above:
+
+- **One session at a time.** The worker builds one session at a time, so customers queue, and a cold start of its
+  large image delays the first.
+- **A failed session blocks newer ones.** One failed session that nobody has resolved holds back that key's newer
+  sessions; other customers are not affected.
+- **A deploy leaves a short gap.** The turn service is a single task; the plugin's spool covers the gap.
+- One memory per key (not split by chat or person, as at the top).
+- The service is a staging service today.
+- The key is the whole of your access, so keep it out of chats and repositories.
+
+Hosted was tested on Linux and under bash 3.2.
 
 ## How memory arrives
 
@@ -278,7 +288,7 @@ platform gives them, and a Hermes that serves several people shares one memory a
 
 ```bash
 git pull
-./install.sh
+./install.sh --mode local      # or --mode hosted, whichever you installed
 hermes gateway restart --detach
 ```
 

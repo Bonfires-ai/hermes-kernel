@@ -28,7 +28,7 @@ def untouched(rig):
 
 
 def test_first_question_offers_both(rig):
-    result = rig.run(env={"HERMES_KERNEL_MODE": ""}, input=f"hosted\n{SENTINEL}\n")
+    result = rig.run(ask=True, input=f"hosted\n{SENTINEL}\n")
     assert result.returncode == 0, result.stderr
     assert "hosted" in result.stderr and "local" in result.stderr
     assert not any(line.startswith("docker") for line in rig.log)
@@ -36,13 +36,13 @@ def test_first_question_offers_both(rig):
 
 
 def test_first_question_takes_short_and_any_case_and_asks_again(rig):
-    result = rig.run(env={"HERMES_KERNEL_MODE": ""}, input=f"maybe\nH\n{SENTINEL}\n")
+    result = rig.run(ask=True, env=KEY, input=f"maybe\nH\n{SENTINEL}\n")
     assert result.returncode == 0, result.stderr
     assert "please answer" in result.stdout
 
 
 def test_no_mode_and_nothing_to_ask_names_the_flag(rig):
-    result = rig.run(env={"HERMES_KERNEL_MODE": ""})
+    result = rig.run(ask=True)
     assert result.returncode != 0
     assert "--mode" in result.stderr
     untouched(rig)
@@ -205,3 +205,86 @@ def test_no_gnu_or_bash4_only_constructs():
     code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
     for banned in ("mapfile", "readarray", "declare -A", ",,}", "^^}", "realpath -m", "sed -i", "${!", "&>>", "|&"):
         assert banned not in code, banned
+
+
+LOCAL_KEYS = {"OPENROUTER_API_KEY": "a", "VOYAGE_API_KEY": "b"}
+
+
+def test_answering_local_or_l_goes_local(rig):
+    for answer in ("local", "l"):
+        result = rig.run(ask=True, env=LOCAL_KEYS, input=f"{answer}\n")
+        assert result.returncode == 0, result.stderr
+        assert any(line.startswith("docker") for line in rig.log)
+        assert (rig.home / "hermes-kernel.json").read_text().strip() == '{"url": "http://127.0.0.1:8787"}'
+
+
+def test_mode_flag_ignores_case(rig):
+    result = rig.run("--mode", "HOSTED", env=KEY)
+    assert result.returncode == 0, result.stderr
+    assert not any(line.startswith("docker") for line in rig.log)
+
+
+def test_userinfo_and_lookalike_hosts_cannot_pass_the_http_guard(rig):
+    for bad in (
+        "http://localhost:80@evil.example/",
+        "http://127.0.0.1:1@evil.example",
+        "https://a@kernel.example",
+        "http://localhost.evil.example",
+        "http://127.0.0.1.evil.example",
+        "http://localhost:80x/",
+        "http://localhost@evil.example",
+    ):
+        result = hosted(rig, "--url", bad)
+        assert result.returncode != 0, bad
+    assert not any(line.startswith("curl") for line in rig.log)
+    untouched(rig)
+    assert hosted(rig, "--url", "http://localhost:8020/").returncode == 0
+
+
+def test_every_sed_without_dash_E_is_basic_regex_safe():
+    text = (REPO / "install.sh").read_text()
+    for line in text.splitlines():
+        if line.lstrip().startswith("#") or "sed " not in line:
+            continue
+        if re.search(r"sed (-[a-zA-Z]+ )*-[a-zA-Z]*E", line):
+            continue
+        for banned in ("\\|", "\\+", "\\?", "\\s"):
+            assert banned not in line.replace("\\\\", ""), (banned, line)
+
+
+def test_403_detail_reaches_the_person_with_json_escapes_in_it(rig):
+    body = detail("this key is read-only: it needs write permission")
+    result = hosted(rig, env={"HK_CURL_CODE": "403", "HK_CURL_BODY": body})
+    assert "needs write permission" in result.stderr
+
+
+def test_the_curl_config_is_gone_before_anything_is_installed(rig):
+    result = hosted(rig)
+    assert result.returncode == 0, result.stderr
+    assert not (rig.base / "config_at_install").exists()
+    assert list((rig.base / "tmp").iterdir()) == []
+
+
+def test_unreachable_says_why(rig):
+    err = "curl: (6) Could not resolve host: kernel.example.test"
+    result = hosted(rig, env={"HK_CURL_CODE": "000", "HK_CURL_BODY": "", "HK_CURL_ERR": err})
+    assert result.returncode != 0
+    assert "Could not resolve host" in result.stderr
+    assert SENTINEL not in result.stderr
+
+
+def test_control_characters_in_a_detail_are_stripped(rig):
+    body = '{"detail": "bad\x1b[31m red\x07 text"}'
+    result = hosted(rig, env={"HK_CURL_CODE": "403", "HK_CURL_BODY": body})
+    assert result.returncode != 0
+    assert "bad[31m red text" in result.stderr
+    assert "\x1b" not in result.stderr and "\x07" not in result.stderr
+
+
+def test_a_pasted_key_is_trimmed(rig):
+    result = rig.run("--mode", "hosted", input=f"   {SENTINEL}\t \n")
+    assert result.returncode == 0, result.stderr
+    assert (rig.home / ".env").read_text().strip() == f"HERMES_KERNEL_TOKEN={SENTINEL}"
+    result = hosted(rig, env={"HERMES_KERNEL_TOKEN": f"  {SENTINEL} "})
+    assert result.returncode == 0, result.stderr
+    assert f'Bearer {SENTINEL}"\n' in (rig.base / "curl_config").read_text()

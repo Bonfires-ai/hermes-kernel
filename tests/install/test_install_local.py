@@ -360,7 +360,7 @@ def test_interrupt_between_awk_and_mv_leaves_no_copy_of_env(rig):
     proc = subprocess.Popen(
         [str(rig.root / "install.sh")],
         cwd=str(rig.root),
-        env=rig.child_env(KEYS),
+        env=rig.child_env({**KEYS, "HERMES_KERNEL_MODE": "local"}),
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
