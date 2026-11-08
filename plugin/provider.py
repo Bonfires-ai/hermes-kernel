@@ -122,11 +122,13 @@ class KernelMemory(MemoryProvider):
     # recall
 
     def system_prompt_block(self) -> str:
+        # TASK16: hosted arrival time. Mode-neutral until the first hosted run gives a measured number.
         return (
             "Long-term memory from past conversations is added to your context when the memory service is "
-            "reachable, and the search_memory tool looks further. A conversation is built into memory after its "
-            "session closes, up to about 5 minutes later; one that just goes quiet closes after 30 minutes, so the "
-            "wait can be about 35. A new fact needs no restart. Phrases are read-only here: run_phrase runs one, "
+            "reachable, and the search_memory tool looks further. A conversation is built into memory a few minutes "
+            "after its session closes; on hosted memory the first can take longer while the builder starts. One "
+            "that just goes quiet closes after 30 minutes. /kernel shows what is waiting. A new fact needs no "
+            "restart. Phrases are read-only here: run_phrase runs one, "
             "offer_phrase, teach_phrase and confirm_phrase propose, draft and keep one, and phrase_continue goes "
             "on when one is waiting. Load the hermes-kernel skill for how."
         )

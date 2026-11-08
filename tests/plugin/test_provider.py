@@ -206,7 +206,9 @@ def test_the_block_is_true_with_the_service_up_or_down(env):
     assert "when the memory service is reachable" in block
     for name in ("run_phrase", "offer_phrase", "teach_phrase", "confirm_phrase", "phrase_continue", "search_memory"):
         assert name in block
-    assert "5 minutes" in block and "30 minutes" in block
+    assert "30 minutes" in block and "/kernel" in block
+    # true on hosted too, where the first build waits for the builder to start: no fixed number of minutes is promised
+    assert "5 minutes" not in block and "a few minutes" in block and "longer" in block
 
 
 def test_the_suite_never_runs_on_the_real_hermes_home(env):
