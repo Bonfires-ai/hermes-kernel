@@ -101,6 +101,9 @@ def _detail(response: httpx.Response) -> str:
         return detail
     if isinstance(detail, list) and detail:  # FastAPI's 422: a list of problems
         return "; ".join(str(d.get("msg", d)) if isinstance(d, dict) else str(d) for d in detail)
+    message = body.get("message") if isinstance(body, dict) else None
+    if isinstance(message, str) and message:  # a front that is not the service itself (Bonfires' API) says why here
+        return message
     return response.text[:500] or f"HTTP {response.status_code}"
 
 

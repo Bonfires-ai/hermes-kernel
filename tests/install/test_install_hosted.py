@@ -5,7 +5,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 SENTINEL = "bf-SENTINEL-key-0123456789"
-URL = "https://kernel.staging-bonfires.dev"
+URL = "https://api.staging-bonfires.dev/kernel"
 KEY = {"HERMES_KERNEL_TOKEN": SENTINEL}
 
 
@@ -250,6 +250,15 @@ def test_every_sed_without_dash_E_is_basic_regex_safe():
             continue
         for banned in ("\\|", "\\+", "\\?", "\\s"):
             assert banned not in line.replace("\\\\", ""), (banned, line)
+
+
+def test_the_front_doors_403_reaches_the_person_in_its_own_words(rig):
+    # Bonfires' API, in front of the hosted service, refuses an unknown key itself, as {"error", "message"}.
+    body = json.dumps({"error": "auth.api_key_invalid", "message": "API key invalid", "context": {}})
+    result = hosted(rig, env={"HK_CURL_CODE": "403", "HK_CURL_BODY": body})
+    assert result.returncode != 0
+    assert "(API key invalid)" in result.stderr
+    untouched(rig)
 
 
 def test_403_detail_reaches_the_person_with_json_escapes_in_it(rig):

@@ -92,6 +92,28 @@ def test_a_wrong_token_is_its_own_error():
     assert not issubclass(Unauthorized, Refused)
 
 
+def test_a_front_doors_message_is_the_detail():
+    # Bonfires' API, in front of the hosted service, answers a key it refuses as {"error", "message"}, not "detail".
+    body = {"error": "auth.api_key_invalid", "message": "API key invalid", "context": {}}
+    client, breaker, _, _ = make(lambda request: httpx.Response(403, json=body))
+    with pytest.raises(Unauthorized) as info:
+        client.begin({})
+    assert info.value.detail == "API key invalid"
+    assert breaker.allow()
+
+
+def test_a_path_in_the_service_url_is_kept():
+    paths: list[str] = []
+
+    def ok(request):
+        paths.append(request.url.path)
+        return httpx.Response(200, json={"versions": {"service": "0.1.0"}})
+
+    client = ServiceClient("https://api.example/kernel/", "tok", transport=httpx.MockTransport(ok))
+    client.status()
+    assert paths == ["/kernel/v1/status"]
+
+
 def test_the_bearer_and_the_routes():
     def ok(request):
         assert request.headers["authorization"] == "Bearer tok"

@@ -18,7 +18,7 @@ ROOT=$(cd "$(dirname "$0")" && pwd)
 
 WANT_HERMES="v0.23.0"
 LOCAL_URL="http://127.0.0.1:8787"
-HOSTED_URL="https://kernel.staging-bonfires.dev"
+HOSTED_URL="https://api.staging-bonfires.dev/kernel"
 
 MODE=${HERMES_KERNEL_MODE:-}
 HERMES_BIN=${HERMES_BIN:-hermes}
@@ -420,6 +420,8 @@ json_field() {
 # The service's own wording of why it said no, when it gave one.
 detail_of() {
   _d=$(json_field detail "$HK_BODY")
+  # A front that is not the service itself (Bonfires' API, before the hosted service) says why in "message".
+  [ -n "$_d" ] || _d=$(json_field message "$HK_BODY")
   if [ -n "$_d" ]; then say " ($_d)"; fi
 }
 

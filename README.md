@@ -96,13 +96,14 @@ export HERMES_KERNEL_TOKEN=...   # your Bonfires API key; in a terminal you can 
 ```
 
 You need Hermes v0.23.0 and a Bonfires API key that may write, for a bonfire set up for hermes-kernel. The script checks
-the key against the service **before it writes anything**, and says plainly if the key is not known (401), is read-only
-or belongs to the wrong kind of bonfire (403, with the service's own words), or if the key check is away just now (try
+the key against the service **before it writes anything**, and says plainly if the key is not known (401; the hosted
+service's front door answers a key it does not know with a 403, "API key invalid"), is read-only or belongs to the wrong
+kind of bonfire (403, with the service's own words), or if the key check is away just now (try
 again in a minute: that is not a bad key). It also stops if the service and the plugin do not share a major.minor
 version. Then it installs the plugin, writes the key to `HERMES_KERNEL_TOKEN` in your Hermes `.env` (mode 0600, every
 other line kept) and the URL to `hermes-kernel.json`, and enables the plugin. It never writes a `.env` in this
 repository, needs no Docker, and passes the key to `curl` in a private temporary config file, never on a command line.
-`--url` points it at another service (default `https://kernel.staging-bonfires.dev`); a plain `http://` URL is refused
+`--url` points it at another service (default `https://api.staging-bonfires.dev/kernel`); a plain `http://` URL is refused
 unless it is `localhost` or `127.0.0.1`, because the key is a bearer. Every message about the service names its URL. The
 plugin prefers `HERMES_KERNEL_URL` to the URL written, so if it is set, in your environment or in your Hermes `.env`, to
 another URL, the script warns and says how to remove it; it never edits either itself.
