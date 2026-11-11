@@ -24,9 +24,13 @@ would then stop at its first stage. ``KT_LIVE_FOUND_A=yes`` lets it found A anyw
 
 The answers come through Bonfires' API, in front of the turn service. Where the in-process test refuses B (404, in the
 words for an id that never existed), the live answer must be that refusal; the gateway may add its own fields, or carry
-the text in ``message`` instead of ``detail``. If the gateway refuses on its own instead (a 401 or 403 the service never
-gives B here, or other words), the probe asserts only that B was refused and that nothing of A's is in the body, and warns.
-Everywhere else the in-process check holds as it is.
+the text in ``message`` instead of ``detail``. If the gateway refuses on its own instead (a 401 or 403, which the service
+never gives B here), the probe asserts only that B was refused and that nothing of A's is in the body, and warns. A 404
+in other words fails: it is what a gateway that does not pass the path on answers, so B's request never reached the
+service. Everywhere else the in-process check holds as it is.
+
+A's turn and message are dated now, as Hermes would send them: the bonfire already holds the e2e's sessions, and an
+append older than them is not what this probes. B's are dated as ``PROBES`` dates them.
 """
 
 from __future__ import annotations
@@ -37,12 +41,13 @@ import uuid
 import warnings
 from collections.abc import Iterator
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
 import pytest
 
-from tests.test_isolation import AT, PROBES, Ids, Probe
+from tests.test_isolation import PROBES, Ids, Probe
 
 URL = os.environ.get("KT_LIVE_URL", "")
 KEY_A_FILE, KEY_B_FILE = "KT_LIVE_KEY_A_FILE", "KT_LIVE_KEY_B_FILE"
@@ -52,8 +57,8 @@ needs_live = pytest.mark.skipif(
 )
 
 Route = tuple[str, str]
-#: what a refusal of B can be, live
-REFUSED = frozenset({401, 403, 404})
+#: what the gateway may answer B on its own, before the turn service sees the request
+GATEWAY_REFUSED = frozenset({401, 403})
 PLATFORM = "telegram"
 
 
@@ -137,10 +142,14 @@ def check_live(route: Route, probe: Probe, answer: httpx.Response, ids: Ids) -> 
             raise
     if _in_the_service_s_words(probe, answer, ids):
         return
-    # The gateway can refuse before the turn service sees the request (a 401 or 403 the service never gives B here), or
-    # word a refusal its own way. Then the live assertion is: refused, and no data of A's in the body. The service's
-    # own answer is pinned in-process.
-    assert answer.status_code in REFUSED, (
+    # The gateway can refuse before the turn service sees the request: a 401 or 403, which the service never gives B
+    # here. Then the live assertion is: refused, and no data of A's in the body. The service's own answer is pinned
+    # in-process. A 404 in other words is not let through: a gateway that does not pass the path on answers that, and
+    # then B's request never reached the service.
+    assert answer.status_code != 404, (
+        f"{_name(route)}: 404, not in the service's words: the gateway may not pass this path on: {answer.text}"
+    )
+    assert answer.status_code in GATEWAY_REFUSED, (
         f"{_name(route)}: B was answered {answer.status_code}, not refused: {answer.text}"
     )
     _nothing_of_theirs_beyond_what_was_sent(answer, ids)
@@ -199,17 +208,17 @@ def seed(client: httpx.Client, key_a: Key, key_b: Key, *, found_a: bool = False)
     assert _text(theirs, "bonfire_id") != bonfire, "both keys are of one bonfire: the probe needs two customers"
     if _field(mine, "founded") is not True and not found_a:
         pytest.fail(NOT_FOUNDED)
-    run = uuid.uuid4().hex[:12]
+    run, now = uuid.uuid4().hex[:12], datetime.now(UTC).isoformat()
     group, speaker = f"kt-live-{run}", f"kt-live-speaker-{run}"
     turn_message, text = f"m-{run}-turn", f"kt-live {run}: a turn only customer A began"
     conversation, message = f"kt-live-conv-{run}", f"m-{run}-said"
     said = f"kt-live {run}: a message only customer A sent"
     body: dict[str, object] = {"platform": PLATFORM, "group": group, "chat": group, "speaker": speaker}
-    body |= {"message_id": turn_message, "text": text, "at": AT, "participants": [speaker]}
+    body |= {"message_id": turn_message, "text": text, "at": now, "participants": [speaker]}
     begun = client.post("/v1/turns", json=body, headers=_auth(key_a))
     assert begun.status_code == 200, f"key A: POST /v1/turns answered {begun.status_code}: {begun.text}"
     turn = _text(begun, "turn_id")
-    sent = {"conversation_id": conversation, "message_id": message, "speaker": speaker, "text": said, "timestamp": AT}
+    sent = {"conversation_id": conversation, "message_id": message, "speaker": speaker, "text": said, "timestamp": now}
     posted = client.post("/v1/messages", json={"messages": [sent]}, headers=_auth(key_a))
     assert posted.status_code == 200 and posted.json() == {"accepted": 1, "duplicates": 0}, posted.text
     ids = Ids(
@@ -311,10 +320,18 @@ def test_the_service_s_refusal_passes_quietly(body: object) -> None:
         check_live(GET_TURN, PROBES[GET_TURN], _answer(404, body), SAMPLE)
 
 
-@pytest.mark.parametrize("status", sorted(REFUSED))
+@pytest.mark.parametrize("status", sorted(GATEWAY_REFUSED))
 def test_the_gateway_s_own_refusal_passes_with_a_warning(status: int) -> None:
     with pytest.warns(GatewayRefusal):
         check_live(GET_TURN, PROBES[GET_TURN], _answer(status, {"message": "Forbidden"}), SAMPLE)
+
+
+def test_a_404_in_other_words_fails() -> None:
+    """What a gateway that does not pass the path on answers: B's request never reached the service."""
+    with pytest.raises(AssertionError, match="may not pass this path on"):
+        check_live(GET_TURN, PROBES[GET_TURN], _answer(404, {"message": "Not Found"}), SAMPLE)
+    with pytest.raises(AssertionError, match="may not pass this path on"):
+        check_live(GET_TURN, PROBES[GET_TURN], _answer(404, {"detail": "Not Found"}), SAMPLE)
 
 
 def test_a_refusal_holding_their_data_fails() -> None:
