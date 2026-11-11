@@ -131,8 +131,10 @@ provider just as it does locally; the rest happens on Bonfires' side.
 - **Spend:** the ceiling is **$5** and founding the memory (the first session) is capped at **$1**. Hitting the ceiling
   means asking Bonfires to raise it; you cannot change it yourself.
 
-Memory arrives later than local's 2 to 3 minutes; the measured time is added after the first hosted run.
-<!-- TASK16: hosted arrival time -->
+Memory arrives a little later than local's 2 to 3 minutes. In the first hosted end-to-end run (2026-11-10, short
+sessions), recall returned the first session's content 227 seconds after it closed, and the second session was built
+150 seconds after it closed; each wait includes the worker's start when it was cold. That run was charged about $0.10
+for the kernel, of which founding the memory was about $0.001.
 
 Known limits, besides the above:
 
